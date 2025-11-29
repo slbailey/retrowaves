@@ -34,7 +34,15 @@ HOLIDAY_BOOST: Final[float] = 1.5  # Weight multiplier for holiday songs during 
 # All YouTube settings must be configured via environment variables
 # Get your stream key from: YouTube Studio > Go Live > Stream Settings
 YOUTUBE_STREAM_KEY: Final[str] = os.environ.get('YOUTUBE_STREAM_KEY', '').strip()
-YOUTUBE_ENABLED: Final[bool] = os.environ.get('YOUTUBE_ENABLED', 'false').lower() == 'true' or bool(YOUTUBE_STREAM_KEY)
+# Check if YOUTUBE_ENABLED is explicitly set
+_youtube_enabled_env = os.environ.get('YOUTUBE_ENABLED', '').strip().lower()
+if _youtube_enabled_env:
+    # Explicitly set - respect the setting
+    _youtube_enabled = _youtube_enabled_env == 'true'
+else:
+    # Not explicitly set - auto-enable if stream key is present
+    _youtube_enabled = bool(YOUTUBE_STREAM_KEY)
+YOUTUBE_ENABLED: Final[bool] = _youtube_enabled
 YOUTUBE_AUDIO_DEVICE: Final[str] = os.environ.get('YOUTUBE_AUDIO_DEVICE', 'default').strip()
 YOUTUBE_AUDIO_FORMAT: Final[str] = os.environ.get('YOUTUBE_AUDIO_FORMAT', 'pulse').strip().lower()  # 'pulse' for PulseAudio, 'alsa' for ALSA
 # Validate and parse sample rate
