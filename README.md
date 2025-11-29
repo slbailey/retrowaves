@@ -31,23 +31,23 @@ An intelligent music player with smart playlist management, holiday season aware
 
 ### Directory Paths
 
-Music directory paths can be configured via environment variables in your `.env` file (recommended) or by editing `radio/constants.py`:
+**All configuration should be done via the `.env` file.** This keeps your settings separate from the codebase and makes it easy to manage different configurations.
 
-**Via `.env` file (recommended):**
+1. Copy the example file:
+```bash
+cp env.example .env
+```
+
+2. Edit `.env` and set your music directory paths:
 ```bash
 REGULAR_MUSIC_PATH=~/source/appalachia-radio/songs
 HOLIDAY_MUSIC_PATH=~/source/appalachia-radio/holiday_songs
 DJ_PATH=~/source/appalachia-radio/julie
 ```
 
-**Or edit `radio/constants.py` directly:**
-```python
-REGULAR_MUSIC_PATH = os.path.expanduser('~/radio/songs')
-HOLIDAY_MUSIC_PATH = os.path.expanduser('~/radio/holiday_songs')
-DJ_PATH = os.path.expanduser('~/radio/julie')
-```
+Paths can use `~` for home directory expansion. If not set in `.env`, default values are used.
 
-Paths can use `~` for home directory expansion. If not set, defaults are used.
+**Note:** Editing `radio/constants.py` directly is not recommended. All configuration should be done through the `.env` file.
 
 ### Tuning Parameters
 
@@ -124,7 +124,7 @@ appalachia-radio/
 ├── radio/
 │   ├── __init__.py
 │   ├── audio_player.py      # Audio playback handling
-│   ├── constants.py         # Configuration constants
+│   ├── constants.py         # Configuration constants (reads from .env file)
 │   ├── dj_manager.py        # Intro/outro file management (with caching)
 │   ├── file_manager.py      # File operations with directory caching
 │   ├── playlist_manager.py  # Playlist logic and probabilities

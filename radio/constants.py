@@ -4,7 +4,8 @@ import os
 from typing import Final
 
 # Directory paths (expands ~ to full home directory path)
-# These can be configured via environment variables, with defaults shown below
+# These should be configured via environment variables in .env file
+# Defaults are provided as fallback, but .env configuration is recommended
 REGULAR_MUSIC_PATH: Final[str] = os.path.expanduser(
     os.environ.get('REGULAR_MUSIC_PATH', '~/source/appalachia-radio/songs')
 )

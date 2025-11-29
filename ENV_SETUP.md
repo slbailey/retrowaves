@@ -1,6 +1,6 @@
 # Environment Configuration Setup
 
-This guide shows how to configure YouTube streaming secrets without hardcoding them in the codebase.
+This guide shows how to configure the application settings (including YouTube streaming and music directory paths) via environment variables without hardcoding them in the codebase.
 
 ## Option 1: .env File (Recommended)
 
@@ -19,6 +19,12 @@ nano .env
 
 3. Fill in your configuration:
 ```bash
+# Music Directory Paths
+REGULAR_MUSIC_PATH=~/source/appalachia-radio/songs
+HOLIDAY_MUSIC_PATH=~/source/appalachia-radio/holiday_songs
+DJ_PATH=~/source/appalachia-radio/julie
+
+# YouTube Streaming Configuration
 YOUTUBE_STREAM_KEY=your-actual-stream-key-here
 YOUTUBE_ENABLED=true
 YOUTUBE_VIDEO_SOURCE=video
@@ -53,11 +59,18 @@ sudo systemctl restart appalachia-radio.service
 
 ## Option 2: Environment Variables in Systemd Service
 
+**Note:** Using the `.env` file (Option 1) is recommended. This option is for cases where you cannot use a `.env` file.
+
 Edit `appalachia-radio.service` and uncomment/add the environment variables:
 
 ```ini
 [Service]
 # ... other settings ...
+
+# Music Directory Paths
+Environment="REGULAR_MUSIC_PATH=~/source/appalachia-radio/songs"
+Environment="HOLIDAY_MUSIC_PATH=~/source/appalachia-radio/holiday_songs"
+Environment="DJ_PATH=~/source/appalachia-radio/julie"
 
 # YouTube Streaming Configuration
 Environment="YOUTUBE_STREAM_KEY=your-actual-stream-key-here"
@@ -79,6 +92,12 @@ sudo systemctl restart appalachia-radio.service
 For local testing, you can export variables in your shell:
 
 ```bash
+# Music Directory Paths
+export REGULAR_MUSIC_PATH="~/source/appalachia-radio/songs"
+export HOLIDAY_MUSIC_PATH="~/source/appalachia-radio/holiday_songs"
+export DJ_PATH="~/source/appalachia-radio/julie"
+
+# YouTube Streaming Configuration
 export YOUTUBE_STREAM_KEY="your-stream-key"
 export YOUTUBE_ENABLED="true"
 export YOUTUBE_VIDEO_SOURCE="video"
@@ -87,6 +106,13 @@ python main.py
 ```
 
 ## Available Environment Variables
+
+### Music Directory Paths:
+- `REGULAR_MUSIC_PATH` - Path to regular music directory (default: `~/source/appalachia-radio/songs`)
+- `HOLIDAY_MUSIC_PATH` - Path to holiday music directory (default: `~/source/appalachia-radio/holiday_songs`)
+- `DJ_PATH` - Path to DJ intro/outro files directory (default: `~/source/appalachia-radio/julie`)
+
+Paths can use `~` for home directory expansion.
 
 ### Required for YouTube Streaming:
 - `YOUTUBE_STREAM_KEY` - Your YouTube stream key (from YouTube Studio)
