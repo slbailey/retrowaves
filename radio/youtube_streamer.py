@@ -347,6 +347,41 @@ class YouTubeStreamer:
             logger.warning(f"Error finding PulseAudio monitor source: {e}")
             return None
     
+    def _verify_sink_available(self, sink_name: str) -> bool:
+        """
+        Verify that a PulseAudio sink exists and is available.
+        
+        Args:
+            sink_name: The sink name to verify (e.g., "alsa_output...analog-stereo")
+            
+        Returns:
+            True if the sink is available, False otherwise.
+        """
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode != 0:
+                logger.warning("Failed to list PulseAudio sinks for verification")
+                return False
+            
+            # Check if the sink is in the list
+            for line in result.stdout.split('\n'):
+                if sink_name in line:
+                    # Check if it's not suspended
+                    if 'SUSPENDED' in line:
+                        logger.debug(f"Sink '{sink_name}' is suspended")
+                    return True
+            
+            logger.warning(f"Sink '{sink_name}' not found in sink list")
+            return False
+        except Exception as e:
+            logger.warning(f"Error verifying sink '{sink_name}': {e}")
+            return False
+    
     def _verify_pulse_monitor_source(self, monitor_name: str) -> bool:
         """
         Verify that a PulseAudio monitor source exists and is accessible.
@@ -528,13 +563,39 @@ class YouTubeStreamer:
                     # Use @DEFAULT_SINK@.monitor which is a PulseAudio alias that always resolves
                     audio_input = "@DEFAULT_SINK@.monitor"
             elif audio_input.endswith('.monitor'):
-                # User explicitly set a monitor source - verify and activate it if needed
-                logger.info(f"Using explicitly configured PulseAudio monitor source: {audio_input}")
-                if self._verify_pulse_monitor_source(audio_input):
-                    logger.info(f"Monitor source '{audio_input}' verified and ready")
+                # User explicitly set a monitor source
+                # Extract the sink name and set it as default, then use @DEFAULT_SINK@.monitor
+                # This is more reliable than using the explicit monitor name, especially for ALSA sinks
+                sink_name = audio_input.replace('.monitor', '')
+                logger.info(f"Monitor source configured: {audio_input}")
+                
+                # Check if this is an ALSA sink - these often have issues with explicit monitor names
+                is_alsa_sink = sink_name.startswith('alsa_output.')
+                if is_alsa_sink:
+                    logger.info("Detected ALSA sink - using @DEFAULT_SINK@.monitor for better compatibility")
+                
+                # Verify sink exists and set it as default
+                if self._verify_sink_available(sink_name):
+                    result = subprocess.run(
+                        ["pactl", "set-default-sink", sink_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"Successfully set sink '{sink_name}' as default")
+                        time.sleep(0.5)  # Give it a moment to activate
+                        # Always use the PulseAudio alias which is more reliable
+                        # ALSA monitor sources often show as "No such process" until audio is actively playing
+                        audio_input = "@DEFAULT_SINK@.monitor"
+                        logger.info("Using @DEFAULT_SINK@.monitor (will point to the default sink we just set)")
+                    else:
+                        logger.warning(f"Could not set sink as default: {result.stderr.strip()}")
+                        logger.warning("Falling back to @DEFAULT_SINK@.monitor anyway")
+                        audio_input = "@DEFAULT_SINK@.monitor"
                 else:
-                    logger.warning(f"Monitor source '{audio_input}' may not be accessible, but attempting to use it anyway")
-                    logger.warning("If this fails, try using @DEFAULT_SINK@.monitor instead")
+                    logger.warning(f"Sink '{sink_name}' not found, using @DEFAULT_SINK@.monitor")
+                    audio_input = "@DEFAULT_SINK@.monitor"
         
         # Build video input based on video_source type
         video_input_args = []
