@@ -84,9 +84,9 @@ class AudioPlayer:
         
         # Use ALSA directly for FM transmitter playback
         # Note: PulseAudio is used separately for YouTube streaming monitoring
-        if 'SDL_AUDIODRIVER' not in os.environ:
-            os.environ['SDL_AUDIODRIVER'] = 'alsa'
-            logger.debug("Configured pygame to use ALSA for FM transmitter playback")
+        # Force ALSA (override any existing setting, e.g., from systemd service)
+        os.environ['SDL_AUDIODRIVER'] = 'alsa'
+        logger.debug("Configured pygame to use ALSA for FM transmitter playback")
         
         max_retries = 3
         retry_delay = 1.0  # seconds
