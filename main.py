@@ -31,6 +31,7 @@ Example:
 
 import argparse
 import logging
+import logging.handlers
 import os
 import select
 import signal
@@ -197,7 +198,7 @@ def setup_logging(interactive: bool = False, log_file: Path = None):
     Setup logging with appropriate formatters for the application.
     
     This function configures Python's logging system with:
-    - File handler (if log_file provided): Standard format with timestamps
+    - File handler (if log_file provided): Standard format with timestamps, with rotation
     - Console handler: Colored output in interactive mode, standard in headless
     
     Args:
@@ -211,12 +212,25 @@ def setup_logging(interactive: bool = False, log_file: Path = None):
         - File logs always use standard format (with timestamps)
         - Console logs use colored format in interactive mode
         - Creates log directory if it doesn't exist
+        - Log rotation: Files rotate at 10MB, keeping 5 backup files
+          (e.g., radio.log, radio.log.1, ..., radio.log.5)
     """
     handlers = []
     
-    # File handler (always, with standard format)
+    # File handler with rotation (always, with standard format)
     if log_file:
-        file_handler = logging.FileHandler(log_file)
+        # Use RotatingFileHandler to prevent log files from growing too large
+        # Max size: 10MB, keep 5 backup files (radio.log, radio.log.1, ..., radio.log.5)
+        # When radio.log reaches 10MB, it rotates to radio.log.1, etc.
+        # Oldest backup (radio.log.5) is deleted when rotation occurs
+        max_bytes = 10 * 1024 * 1024  # 10MB
+        backup_count = 5
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         ))
