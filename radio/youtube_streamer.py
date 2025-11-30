@@ -347,6 +347,116 @@ class YouTubeStreamer:
             logger.warning(f"Error finding PulseAudio monitor source: {e}")
             return None
     
+    def _verify_pulse_monitor_source(self, monitor_name: str) -> bool:
+        """
+        Verify that a PulseAudio monitor source exists and is accessible.
+        
+        This method checks if the monitor source is actually available and tries
+        to activate it if it's suspended. Some monitor sources may appear in the
+        list but not be accessible until explicitly activated.
+        
+        Args:
+            monitor_name: The monitor source name to verify (e.g., "alsa_output...monitor")
+            
+        Returns:
+            True if the monitor source is verified and accessible, False otherwise.
+            
+        Note:
+            This method attempts to resume the source if it's suspended, which
+            may help with sources that are detected but not accessible.
+        """
+        try:
+            # First, verify the source exists in the current source list
+            result = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode != 0:
+                logger.warning("Failed to list PulseAudio sources for verification")
+                return False
+            
+            # Check if the monitor is in the list
+            found = False
+            is_suspended = False
+            for line in result.stdout.split('\n'):
+                if monitor_name in line:
+                    found = True
+                    if 'SUSPENDED' in line:
+                        is_suspended = True
+                    break
+            
+            if not found:
+                logger.warning(f"Monitor source '{monitor_name}' not found in current source list")
+                return False
+            
+            # If suspended, try to resume it
+            if is_suspended:
+                logger.info(f"Monitor source '{monitor_name}' is suspended, attempting to activate...")
+                
+                # Extract the sink name from the monitor name (remove .monitor suffix)
+                sink_name = monitor_name.replace('.monitor', '')
+                
+                # Try to set the sink as default, which should activate its monitor
+                result = subprocess.run(
+                    ["pactl", "set-default-sink", sink_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    logger.info(f"Set sink '{sink_name}' as default to activate monitor")
+                    time.sleep(0.5)  # Give it a moment to activate
+                else:
+                    logger.debug(f"Could not set sink as default (may already be default): {result.stderr.strip()}")
+                
+                # Also try to resume the source directly
+                result = subprocess.run(
+                    ["pactl", "suspend-source", monitor_name, "0"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    logger.info(f"Successfully resumed monitor source: {monitor_name}")
+                    time.sleep(0.5)
+                else:
+                    logger.debug(f"Could not resume monitor source directly: {result.stderr.strip()}")
+                    logger.info("Monitor source is suspended, but FFmpeg may be able to activate it when capturing starts")
+                    # Still return True - FFmpeg might be able to use it even if suspended
+                    # The monitor will activate when FFmpeg starts reading from it
+            
+            # Verify it's still in the source list after resume attempt
+            result = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0 and monitor_name in result.stdout:
+                # Check if it's still suspended
+                still_suspended = False
+                for line in result.stdout.split('\n'):
+                    if monitor_name in line:
+                        if 'SUSPENDED' in line:
+                            still_suspended = True
+                            logger.info(f"Monitor source '{monitor_name}' is still suspended, but will attempt to use it")
+                            logger.info("FFmpeg may be able to activate it when capturing starts")
+                        else:
+                            logger.debug(f"Monitor source '{monitor_name}' is active")
+                        break
+                logger.debug(f"Monitor source '{monitor_name}' verified in source list")
+                # Return True even if suspended - FFmpeg can often activate suspended monitors
+                return True
+            else:
+                logger.warning(f"Monitor source '{monitor_name}' not found in source list after verification")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error verifying PulseAudio monitor source '{monitor_name}': {e}")
+            return False
+    
     def start(self) -> bool:
         """
         Start streaming to YouTube Live.
@@ -395,23 +505,36 @@ class YouTubeStreamer:
         # This captures audio from PulseAudio/ALSA and streams to YouTube
         # Note: For PulseAudio, we need to capture from a monitor source, not the default sink
         audio_input = self.audio_device
-        if self.audio_format == "pulse" and audio_input == "default":
-            # Try to find the actual monitor source
-            monitor_source = self._find_pulse_monitor_source()
-            if monitor_source:
-                audio_input = monitor_source
-                logger.info(f"Using PulseAudio monitor source: {audio_input}")
-            else:
-                # Fallback to common monitor source names
-                logger.warning("Could not auto-detect monitor source. To find available monitors, run:")
-                logger.warning("  pactl list short sources | grep monitor")
-                logger.warning("Then set YOUTUBE_AUDIO_DEVICE in your .env file to the monitor name.")
-                logger.warning("Trying fallback patterns...")
-                # Try common monitor source patterns
-                for pattern in ["@DEFAULT_SINK@.monitor", "pulse", "default"]:
-                    audio_input = pattern
-                    logger.debug(f"Trying monitor source: {audio_input}")
-                    break
+        if self.audio_format == "pulse":
+            if audio_input == "default":
+                # Try to find the actual monitor source
+                monitor_source = self._find_pulse_monitor_source()
+                if monitor_source:
+                    # Verify the monitor source is accessible before using it
+                    if self._verify_pulse_monitor_source(monitor_source):
+                        audio_input = monitor_source
+                        logger.info(f"Using PulseAudio monitor source: {audio_input}")
+                    else:
+                        logger.warning(f"Monitor source '{monitor_source}' found but not accessible")
+                        logger.warning("Trying @DEFAULT_SINK@.monitor as fallback (PulseAudio alias)...")
+                        # Use @DEFAULT_SINK@.monitor which is a PulseAudio alias that always resolves
+                        audio_input = "@DEFAULT_SINK@.monitor"
+                else:
+                    # Fallback to @DEFAULT_SINK@.monitor which is more reliable
+                    logger.warning("Could not auto-detect monitor source. To find available monitors, run:")
+                    logger.warning("  pactl list short sources | grep monitor")
+                    logger.warning("Then set YOUTUBE_AUDIO_DEVICE in your .env file to the monitor name.")
+                    logger.warning("Trying @DEFAULT_SINK@.monitor as fallback (PulseAudio alias)...")
+                    # Use @DEFAULT_SINK@.monitor which is a PulseAudio alias that always resolves
+                    audio_input = "@DEFAULT_SINK@.monitor"
+            elif audio_input.endswith('.monitor'):
+                # User explicitly set a monitor source - verify and activate it if needed
+                logger.info(f"Using explicitly configured PulseAudio monitor source: {audio_input}")
+                if self._verify_pulse_monitor_source(audio_input):
+                    logger.info(f"Monitor source '{audio_input}' verified and ready")
+                else:
+                    logger.warning(f"Monitor source '{audio_input}' may not be accessible, but attempting to use it anyway")
+                    logger.warning("If this fails, try using @DEFAULT_SINK@.monitor instead")
         
         # Build video input based on video_source type
         video_input_args = []
