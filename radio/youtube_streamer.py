@@ -231,9 +231,11 @@ class YouTubeStreamer:
         
         This method attempts to automatically detect the correct PulseAudio monitor
         source by:
-        1. Getting the default sink and appending ".monitor"
-        2. Listing all sources and finding an active monitor
-        3. Falling back to a suspended monitor if no active one is found
+        1. Getting the default sink name
+        2. Listing all available sources and finding monitors
+        3. Matching the default sink's monitor specifically (if it exists)
+        4. Falling back to any active monitor if default sink's monitor not found
+        5. Falling back to any suspended monitor as last resort
         
         Returns:
             Monitor source name (e.g., "RDPSink.monitor") or None if not found.
@@ -247,7 +249,8 @@ class YouTubeStreamer:
             No exceptions are raised. Errors are logged and None is returned.
         """
         try:
-            # Try to get the default sink's monitor
+            # Get the default sink name
+            default_sink = None
             result = subprocess.run(
                 ["pactl", "get-default-sink"],
                 capture_output=True,
@@ -257,43 +260,88 @@ class YouTubeStreamer:
             if result.returncode == 0:
                 default_sink = result.stdout.strip()
                 if default_sink:
-                    monitor_name = f"{default_sink}.monitor"
-                    logger.debug(f"Found default sink: {default_sink}, using monitor: {monitor_name}")
-                    return monitor_name
+                    logger.debug(f"Default sink: {default_sink}")
             
-            # Fallback: list all sources and find a monitor
+            # List all sources to find available monitors
             result = subprocess.run(
                 ["pactl", "list", "short", "sources"],
                 capture_output=True,
                 text=True,
                 timeout=2
             )
-            if result.returncode == 0:
-                # Prefer non-suspended monitors, but accept suspended ones too
-                preferred_monitor = None
-                fallback_monitor = None
+            if result.returncode != 0:
+                logger.warning("Failed to list PulseAudio sources")
+                return None
+            
+            # Collect all monitors, categorized by state and relationship to default sink
+            default_sink_monitor = None
+            default_sink_monitor_suspended = None
+            active_monitors = []
+            suspended_monitors = []
+            
+            for line in result.stdout.split('\n'):
+                if not line.strip() or '.monitor' not in line:
+                    continue
                 
-                for line in result.stdout.split('\n'):
-                    if not line.strip() or '.monitor' not in line:
-                        continue
-                    
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    
-                    monitor_name = parts[1]
-                    if 'SUSPENDED' not in line:
-                        preferred_monitor = monitor_name
-                        logger.debug(f"Found active monitor source: {monitor_name}")
-                        break
-                    elif fallback_monitor is None:
-                        fallback_monitor = monitor_name
-                        logger.debug(f"Found monitor source (suspended): {monitor_name}")
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
                 
-                # Return preferred if found, otherwise fallback
-                return preferred_monitor or fallback_monitor
+                monitor_name = parts[1]
+                is_suspended = 'SUSPENDED' in line
+                
+                # Check if this monitor matches the default sink
+                if default_sink and monitor_name == f"{default_sink}.monitor":
+                    if is_suspended:
+                        default_sink_monitor_suspended = monitor_name
+                        logger.debug(f"Found default sink's monitor (suspended): {monitor_name}")
+                    else:
+                        default_sink_monitor = monitor_name
+                        logger.debug(f"Found default sink's monitor (active): {monitor_name}")
+                else:
+                    # Other monitors
+                    if is_suspended:
+                        suspended_monitors.append(monitor_name)
+                    else:
+                        active_monitors.append(monitor_name)
+            
+            # Log all found monitors for debugging
+            if default_sink_monitor or default_sink_monitor_suspended or active_monitors or suspended_monitors:
+                logger.debug(f"Available monitors - Default sink's: {default_sink_monitor or default_sink_monitor_suspended or 'none'}, "
+                           f"Other active: {len(active_monitors)}, Other suspended: {len(suspended_monitors)}")
+            
+            # Priority order:
+            # 1. Default sink's monitor (active)
+            # 2. Default sink's monitor (suspended)
+            # 3. Any active monitor
+            # 4. Any suspended monitor
+            
+            if default_sink_monitor:
+                logger.info(f"Using default sink's monitor: {default_sink_monitor}")
+                return default_sink_monitor
+            
+            if default_sink_monitor_suspended:
+                logger.info(f"Using default sink's monitor (suspended): {default_sink_monitor_suspended}")
+                return default_sink_monitor_suspended
+            
+            if active_monitors:
+                selected = active_monitors[0]
+                logger.info(f"Using active monitor (default sink's monitor not found): {selected}")
+                if len(active_monitors) > 1:
+                    logger.warning(f"Multiple active monitors found: {active_monitors}. Using: {selected}")
+                return selected
+            
+            if suspended_monitors:
+                selected = suspended_monitors[0]
+                logger.info(f"Using suspended monitor (no active monitors found): {selected}")
+                if len(suspended_monitors) > 1:
+                    logger.warning(f"Multiple suspended monitors found: {suspended_monitors}. Using: {selected}")
+                return selected
             
             logger.warning("No PulseAudio monitor source found")
+            if default_sink:
+                logger.warning(f"Default sink is '{default_sink}', but no monitor source found. "
+                             f"Try setting YOUTUBE_AUDIO_DEVICE explicitly in .env file.")
             return None
         except Exception as e:
             logger.warning(f"Error finding PulseAudio monitor source: {e}")
@@ -355,7 +403,10 @@ class YouTubeStreamer:
                 logger.info(f"Using PulseAudio monitor source: {audio_input}")
             else:
                 # Fallback to common monitor source names
-                logger.warning("Could not auto-detect monitor source, trying common names...")
+                logger.warning("Could not auto-detect monitor source. To find available monitors, run:")
+                logger.warning("  pactl list short sources | grep monitor")
+                logger.warning("Then set YOUTUBE_AUDIO_DEVICE in your .env file to the monitor name.")
+                logger.warning("Trying fallback patterns...")
                 # Try common monitor source patterns
                 for pattern in ["@DEFAULT_SINK@.monitor", "pulse", "default"]:
                     audio_input = pattern
