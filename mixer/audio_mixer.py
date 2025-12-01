@@ -31,7 +31,8 @@ class AudioMixer:
         sample_rate: int = 48000,
         channels: int = 2,
         frame_size: int = 4096,
-        master_clock = None
+        master_clock = None,
+        debug: bool = False
     ) -> None:
         """
         Initialize the audio mixer.
@@ -45,11 +46,12 @@ class AudioMixer:
         self.sample_rate = sample_rate
         self.channels = channels
         self.frame_size = frame_size
+        self.debug = debug
         self.sinks = []
         self.fm_sink = None  # Primary sink
         
         # Clock-driven decoder (one frame per tick)
-        self.decoder = AudioDecoder(sample_rate, channels, frame_size)
+        self.decoder = AudioDecoder(sample_rate, channels, frame_size, debug=debug)
         self._decoder_lock = threading.Lock()
         
         # Small buffer (max 10 frames) for smoothing
@@ -191,12 +193,14 @@ class AudioMixer:
                 # First valid PCM frame received - mixer is now ready
                 if not self.ready:
                     self.ready = True
-                    logger.info("[Mixer] First PCM frame received - mixer ready")
+                    if self.debug:
+                        logger.info("[Mixer] First PCM frame received - mixer ready")
                 
                 # Check if buffer has reached warm-start threshold
                 if not self._buffer_ready and len(self._frame_buffer) >= self._min_buffer_frames:
                     self._buffer_ready = True
-                    logger.info("[Mixer] Buffer warmed — playback live")
+                    if self.debug:
+                        logger.info("[Mixer] Buffer warmed — playback live")
             
             # Check if we should deliver frames (only if buffer is warmed)
             buffer_size = len(self._frame_buffer)
@@ -234,7 +238,8 @@ class AudioMixer:
             if self.fm_sink:
                 try:
                     self.fm_sink.write_frame(deliver_frame)
-                    logger.debug(f"[Mixer] → FM {len(deliver_frame)} bytes (tick {frame_index})")
+                    if self.debug:
+                        logger.debug(f"[Mixer] → FM {len(deliver_frame)} bytes (tick {frame_index})")
                 except Exception as e:
                     # FM sink failure is critical
                     if not sys.is_finalizing():
@@ -247,12 +252,13 @@ class AudioMixer:
                 if sink is not self.fm_sink:
                     try:
                         sink.write_frame(deliver_frame)
-                        # Log YouTube sink writes for debugging
-                        from outputs.youtube_sink import YouTubeSink
-                        if isinstance(sink, YouTubeSink):
-                            logger.debug(
-                                f"[Mixer] → YouTube {len(deliver_frame)} bytes (tick {frame_index})"
-                            )
+                        # Log YouTube sink writes for debugging (only if debug enabled)
+                        if self.debug:
+                            from outputs.youtube_sink import YouTubeSink
+                            if isinstance(sink, YouTubeSink):
+                                logger.debug(
+                                    f"[Mixer] → YouTube {len(deliver_frame)} bytes (tick {frame_index})"
+                                )
                     except Exception as e:
                         # Non-FM sink failures are non-critical
                         if not sys.is_finalizing():

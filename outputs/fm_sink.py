@@ -90,7 +90,7 @@ class FMSink(SinkBase):
             
             # Log the FULL command
             cmd_str = " ".join(cmd)
-            logger.info(f"[FMSink] Starting FMSink: {cmd_str}")
+            logger.debug(f"[FMSink] Starting FMSink: {cmd_str}")
             
             # Spawn aplay process
             self._process = subprocess.Popen(
@@ -131,7 +131,7 @@ class FMSink(SinkBase):
             )
             self._worker.start()
             
-            logger.info("FMSink started successfully")
+            logger.debug("FMSink started successfully")
             return True
             
         except FileNotFoundError:
@@ -185,7 +185,7 @@ class FMSink(SinkBase):
                     if current_time - self._last_queue_log_time >= 5.0:
                         with self._queue_lock:
                             queue_size = len(self._queue)
-                        logger.info(f"[FMSink] Queue status: {queue_size} frames")
+                        logger.debug(f"[FMSink] Queue status: {queue_size} frames")
                         self._last_queue_log_time = current_time
                     continue
                 
@@ -324,7 +324,7 @@ class FMSink(SinkBase):
                 return False
             
             self._frames_written = 0
-            logger.info("[FMSink] aplay process restarted successfully")
+            logger.debug("[FMSink] aplay process restarted successfully")
             return True
             
         except Exception as e:
@@ -371,4 +371,4 @@ class FMSink(SinkBase):
             finally:
                 self._process = None
         
-        logger.info("FMSink stopped")
+        logger.debug("FMSink stopped")

@@ -4,9 +4,12 @@ Thread-safe queue for audio events.
 Provides EventQueue class for managing AudioEvent objects in a thread-safe manner.
 """
 
+import logging
 import queue
 from dataclasses import dataclass
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,6 +46,7 @@ class EventQueue:
             event: AudioEvent to add
         """
         self._queue.put(event)
+        logger.info(f"[EVENT] Pushed: {event.type} - {event.path}")
     
     def get(self, block: bool = True, timeout: float | None = None) -> AudioEvent:
         """
@@ -58,7 +62,9 @@ class EventQueue:
         Raises:
             queue.Empty: If block=False and queue is empty
         """
-        return self._queue.get(block=block, timeout=timeout)
+        event = self._queue.get(block=block, timeout=timeout)
+        logger.info(f"[EVENT] Pulled: {event.type} - {event.path}")
+        return event
     
     def empty(self) -> bool:
         """

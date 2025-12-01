@@ -59,7 +59,7 @@ class MasterClock:
         # For dev mode, we can speed up timing
         self.dev_mode = dev_mode
         if dev_mode:
-            logger.info("MasterClock: Dev mode enabled (faster timing)")
+            logger.debug("MasterClock: Dev mode enabled (faster timing)")
         
         # Callback registry
         self._callbacks: List[Callable[[int], None]] = []
@@ -74,7 +74,7 @@ class MasterClock:
         self._frame_index = 0
         self._next_tick_time: Optional[float] = None
         
-        logger.info(
+        logger.debug(
             f"MasterClock initialized: {sample_rate}Hz, "
             f"frame_size={frame_size} bytes, "
             f"tick_interval={self._tick_interval_sec*1000:.2f}ms"
@@ -121,7 +121,7 @@ class MasterClock:
         
         self._thread = threading.Thread(target=self._clock_loop, daemon=True, name="MasterClock")
         self._thread.start()
-        logger.info("MasterClock started")
+        logger.debug("MasterClock started")
     
     def stop(self) -> None:
         """
@@ -141,7 +141,7 @@ class MasterClock:
                 logger.warning("MasterClock thread did not stop in time")
         
         self._thread = None
-        logger.info("MasterClock stopped")
+        logger.debug("MasterClock stopped")
     
     def is_running(self) -> bool:
         """

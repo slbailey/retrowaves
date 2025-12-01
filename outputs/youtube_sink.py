@@ -35,7 +35,8 @@ class YouTubeSink(SinkBase):
         video_file: str | None = None,
         video_size: str = "1280x720",
         video_fps: int = 2,
-        video_bitrate: str = "4000k"
+        video_bitrate: str = "4000k",
+        debug: bool = False
     ) -> None:
         """
         Initialize the YouTube sink.
@@ -63,6 +64,7 @@ class YouTubeSink(SinkBase):
         self.video_size = video_size
         self.video_fps = video_fps
         self.video_bitrate = video_bitrate
+        self.debug = debug
         
         # Calculate tick interval for pacing
         samples_per_frame = frame_size // (2 * channels)  # 2 bytes per sample
@@ -113,7 +115,8 @@ class YouTubeSink(SinkBase):
             # Attempt initial FFmpeg connection
             self._ensure_ffmpeg_running()
             
-            logger.info("YouTubeSink started (worker thread pacing)")
+            if self.debug:
+                logger.info("YouTubeSink started (worker thread pacing)")
             return True
             
         except Exception as e:
@@ -148,7 +151,8 @@ class YouTubeSink(SinkBase):
         Writes exactly one frame per tick_interval to maintain continuous
         audio stream. Handles reconnection if FFmpeg dies.
         """
-        logger.debug("[YouTubeSink] Worker thread started")
+        if self.debug:
+            logger.debug("[YouTubeSink] Worker thread started")
         
         flush_counter = 0
         next_write_time = None
@@ -199,11 +203,12 @@ class YouTubeSink(SinkBase):
                                 flush_counter = 0
                             
                             if not self._is_connected:
-                                logger.info("YouTube stream connected")
-                                logger.info(
-                                    "[YouTubeSink] First frame written to FFmpeg: %d bytes",
-                                    len(frame)
-                                )
+                                if self.debug:
+                                    logger.info("YouTube stream connected")
+                                    logger.info(
+                                        "[YouTubeSink] First frame written to FFmpeg: %d bytes",
+                                        len(frame)
+                                    )
                             self._is_connected = True
                 
                 except BrokenPipeError:
@@ -218,24 +223,26 @@ class YouTubeSink(SinkBase):
                     logger.exception("[YouTubeSink] worker write error")
                     next_write_time = None  # Reset timing on error
                 
-                # Periodic logging (every ~5 seconds)
-                log_now = time.time()
-                if log_now - self._last_log_time >= 5.0:
-                    with self._queue_lock:
-                        queue_size = len(self._queue)
-                    logger.info(
-                        "[YT] buffer=%d frames_written=%d",
-                        queue_size,
-                        self._frames_written
-                    )
-                    self._last_log_time = log_now
+                # Periodic logging (every ~5 seconds, only if debug enabled)
+                if self.debug:
+                    log_now = time.time()
+                    if log_now - self._last_log_time >= 5.0:
+                        with self._queue_lock:
+                            queue_size = len(self._queue)
+                        logger.info(
+                            "[YT] buffer=%d frames_written=%d",
+                            queue_size,
+                            self._frames_written
+                        )
+                        self._last_log_time = log_now
             
             except Exception as e:
                 logger.error(f"[YouTubeSink] drain_loop error: {e}", exc_info=True)
                 next_write_time = None  # Reset timing on exception
                 time.sleep(0.1)
         
-        logger.debug("[YouTubeSink] Worker thread stopped")
+        if self.debug:
+            logger.debug("[YouTubeSink] Worker thread stopped")
     
     def _ensure_ffmpeg_running(self) -> bool:
         """
@@ -279,7 +286,8 @@ class YouTubeSink(SinkBase):
                     "-stream_loop", "-1",
                     "-i", self.video_file,
                 ]
-                logger.info(f"Using video file: {self.video_file}")
+                if self.debug:
+                    logger.info(f"Using video file: {self.video_file}")
             elif self.video_source == "image":
                 if not self.video_file:
                     logger.error("video_source is 'image' but no video_file provided")
@@ -293,7 +301,8 @@ class YouTubeSink(SinkBase):
                     "-framerate", str(self.video_fps),
                     "-i", self.video_file
                 ]
-                logger.info(f"Using image file: {self.video_file}")
+                if self.debug:
+                    logger.info(f"Using image file: {self.video_file}")
             elif self.video_source == "color":
                 video_input = [
                     "-f", "lavfi",
@@ -322,9 +331,12 @@ class YouTubeSink(SinkBase):
             # Output encoding settings
             if self.video_source == "video":
                 # Video passthrough (copy) - no re-encoding
+                # Pi cannot handle live video encoding, must use copy
                 # Note: Keyframe frequency is determined by source video file
-                # If YouTube complains about keyframes, the source file needs to be re-encoded
-                # with smaller GOP size (but we can't do that here without re-encoding)
+                # If YouTube complains about keyframes, the source file needs to be
+                # pre-encoded with smaller GOP size (4 seconds or less)
+                # Note: YouTube may warn about low bitrate when using -c:v copy
+                # This is expected for static/looping video and is acceptable
                 cmd.extend([
                     "-c:v", "copy",  # Copy video codec (no re-encoding)
                     "-c:a", "aac",   # Encode audio to AAC
@@ -372,7 +384,8 @@ class YouTubeSink(SinkBase):
                 self.rtmp_url
             ])
             
-            logger.info(f"Starting FFmpeg for YouTube stream: {self.rtmp_url[:50]}...")
+            if self.debug:
+                logger.info(f"Starting FFmpeg for YouTube stream: {self.rtmp_url[:50]}...")
             
             # Spawn FFmpeg process
             self._process = subprocess.Popen(
@@ -404,7 +417,8 @@ class YouTubeSink(SinkBase):
                 self._process = None
                 return False
             
-            logger.info("FFmpeg process started successfully")
+            if self.debug:
+                logger.info("FFmpeg process started successfully")
             # Reset frame counter for new process
             self._frames_written = 0
             return True
@@ -456,10 +470,11 @@ class YouTubeSink(SinkBase):
                 logger.warning("YouTubeSink worker thread did not stop in time")
         
         self._worker = None
-        if self._is_connected:
+        if self._is_connected and self.debug:
             logger.info("YouTube stream disconnected (shutdown)")
         self._is_connected = False
-        logger.info("YouTubeSink stopped")
+        if self.debug:
+            logger.info("YouTubeSink stopped")
     
     def is_connected(self) -> bool:
         """Check if YouTube stream is currently connected."""

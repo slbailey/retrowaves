@@ -28,7 +28,8 @@ class AudioDecoder:
         self,
         sample_rate: int = 48000,
         channels: int = 2,
-        frame_size: int = 4096
+        frame_size: int = 4096,
+        debug: bool = False
     ) -> None:
         """
         Initialize the audio decoder.
@@ -41,6 +42,7 @@ class AudioDecoder:
         self.sample_rate = sample_rate
         self.channels = channels
         self.frame_size = frame_size
+        self.debug = debug
         self._process: Optional[subprocess.Popen] = None
         self._current_event: Optional[AudioEvent] = None
         self._first_frame = True
@@ -75,7 +77,8 @@ class AudioDecoder:
         ]
         
         try:
-            logger.info(f"[DECODER] Starting FFmpeg decoder for: {event.path}")
+            if self.debug:
+                logger.info(f"[DECODER] Starting FFmpeg decoder for: {event.path}")
             
             # Spawn FFmpeg process
             self._process = subprocess.Popen(
@@ -197,7 +200,8 @@ class AudioDecoder:
         self._frame_count += 1
         
         if self._first_frame:
-            logger.info(f"[DECODER] First frame received: {len(frame)} bytes from {self._current_event.path}")
+            if self.debug:
+                logger.info(f"[DECODER] First frame received: {len(frame)} bytes from {self._current_event.path}")
             self._first_frame = False
         
         return frame

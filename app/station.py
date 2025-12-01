@@ -36,7 +36,8 @@ class Station:
         dj_engine: DJEngine,
         playout_engine: PlayoutEngine,
         shutdown_event: threading.Event,
-        now_playing_writer: Optional[NowPlayingWriter] = None
+        now_playing_writer: Optional[NowPlayingWriter] = None,
+        debug: bool = False
     ) -> None:
         """
         Initialize the station.
@@ -48,6 +49,7 @@ class Station:
             playout_engine: PlayoutEngine instance
             shutdown_event: threading.Event for graceful shutdown
             now_playing_writer: Optional NowPlayingWriter for metadata
+            debug: Enable debug logging
         """
         self.library_manager = library_manager
         self.playlist_manager = playlist_manager
@@ -56,6 +58,7 @@ class Station:
         self.shutdown_event = shutdown_event
         self.now_playing_writer = now_playing_writer
         self._running = False
+        self.debug = debug
     
     def run(self) -> None:
         """
@@ -65,7 +68,8 @@ class Station:
         Matches Phase 7 spec: wait until playout is idle, then select next song.
         """
         self._running = True
-        logger.info("Station started")
+        if self.debug:
+            logger.info("Station started")
         
         try:
             while self._running and not self.shutdown_event.is_set():
@@ -118,8 +122,9 @@ class Station:
                     except Exception as e:
                         logger.error(f"Failed to write now-playing metadata: {e}")
                 
-                # Log song start with DJ usage
-                logger.info(f"Now playing: {filename} (intro={intro_used}, outro={outro_used})")
+                # Log song start with DJ usage (only in debug mode, events are logged separately)
+                if self.debug:
+                    logger.info(f"Now playing: {filename} (intro={intro_used}, outro={outro_used})")
                 
                 # Queue all events (Phase 7 spec: for ev in events: playout.queue_event(ev))
                 for ev in events:
@@ -128,7 +133,8 @@ class Station:
                 # Playout engine runs in its own thread, so events will be processed automatically
                 
         except KeyboardInterrupt:
-            logger.info("Received interrupt signal, shutting down...")
+            if self.debug:
+                logger.info("Received interrupt signal, shutting down...")
         except Exception as e:
             logger.error(f"Station error: {e}", exc_info=True)
         finally:
@@ -138,9 +144,11 @@ class Station:
         """Stop the station."""
         self._running = False
         try:
-            logger.info("Stopping station...")
+            if self.debug:
+                logger.info("Stopping station...")
         except (OSError, ValueError):
             # Ignore logging errors during shutdown
             pass
-        logger.info("Station stopped")
+        if self.debug:
+            logger.info("Station stopped")
 

@@ -23,19 +23,21 @@ class PlayoutEngine:
     Actual decoding happens one frame per clock tick in the mixer.
     """
     
-    def __init__(self, mixer, stop_event: Optional[threading.Event] = None) -> None:
+    def __init__(self, mixer, stop_event: Optional[threading.Event] = None, debug: bool = False) -> None:
         """
         Initialize the playout engine.
         
         Args:
             mixer: AudioMixer instance for audio processing
             stop_event: Optional threading.Event for graceful shutdown
+            debug: Enable debug logging
         """
         self.mixer = mixer
         self.event_queue = EventQueue()
         self.state_machine = StateMachine()
         self._running = False
         self._stop_event = stop_event if stop_event is not None else threading.Event()
+        self.debug = debug
         
         # Set up event completion callback
         self.mixer.set_event_complete_callback(self._on_event_complete)
@@ -48,7 +50,8 @@ class PlayoutEngine:
             event: AudioEvent to add to queue
         """
         self.event_queue.put(event)
-        logger.debug(f"Queued event: {event.path} ({event.type})")
+        if self.debug:
+            logger.debug(f"Queued event: {event.path} ({event.type})")
     
     def current_state(self) -> PlaybackState:
         """
@@ -85,7 +88,8 @@ class PlayoutEngine:
         """
         if not self._running:
             self._running = True
-            logger.info("PlayoutEngine started (clock-driven decoding)")
+            if self.debug:
+                logger.info("PlayoutEngine started (clock-driven decoding)")
         
         # Main loop - runs until stop_event is set
         while self._running and not self._stop_event.is_set():
@@ -106,7 +110,7 @@ class PlayoutEngine:
                 
                 self.state_machine.set_current_event(event)
                 
-                # Log "Now playing" when event starts
+                # Log "Now playing" when event starts (always visible)
                 logger.info(f"[ENGINE] Now playing {event.path} ({event.type})")
                 
                 # Start decoder for this event (decoding happens per clock tick)
@@ -139,7 +143,8 @@ class PlayoutEngine:
         
         # Loop exited - mark as stopped
         self._running = False
-        logger.info("PlayoutEngine stopped")
+        if self.debug:
+            logger.info("PlayoutEngine stopped")
     
     def _on_event_complete(self, event: AudioEvent) -> None:
         """
@@ -161,7 +166,8 @@ class PlayoutEngine:
             self.state_machine.set_current_event(None)
         else:
             # Still playing (buffer has frames) - state will transition when buffer empties
-            logger.debug(f"[ENGINE] Event completed, but buffer still has {self.mixer.get_buffer_size()} frames")
+            if self.debug:
+                logger.debug(f"[ENGINE] Event completed, but buffer still has {self.mixer.get_buffer_size()} frames")
     
     def stop(self) -> None:
         """
@@ -171,4 +177,5 @@ class PlayoutEngine:
         """
         self._stop_event.set()
         self._running = False
-        logger.info("PlayoutEngine stopped")
+        if self.debug:
+            logger.info("PlayoutEngine stopped")

@@ -41,7 +41,8 @@ def build_engine(
     video_file: str | None = None,
     video_size: str = "1280x720",
     video_fps: int = 2,
-    video_bitrate: str = "4000k"
+    video_bitrate: str = "4000k",
+    debug: bool = False
 ) -> tuple[AudioMixer, PlayoutEngine, DJEngine, MasterClock]:
     """
     Build and wire up the audio engine components.
@@ -77,7 +78,8 @@ def build_engine(
         sample_rate=sample_rate,
         channels=2,
         frame_size=frame_size,
-        master_clock=master_clock
+        master_clock=master_clock,
+        debug=debug
     )
     
     # Create FM sink (always active)
@@ -100,12 +102,13 @@ def build_engine(
                 video_file=video_file,
                 video_size=video_size,
                 video_fps=video_fps,
-                video_bitrate=video_bitrate
+                video_bitrate=video_bitrate,
+                debug=debug
             )
             mixer.add_sink(youtube_sink)
     
     # Create playout engine
-    playout_engine = PlayoutEngine(mixer)
+    playout_engine = PlayoutEngine(mixer, debug=debug)
     
     # Create DJ engine (music_path parameter kept for compatibility but not used)
     dj_engine = DJEngine(dj_path, regular_music_path)
@@ -205,7 +208,8 @@ def start_station(config: RadioConfig) -> None:
         video_file=config.video_file,
         video_size=config.video_size,
         video_fps=config.video_fps,
-        video_bitrate=config.video_bitrate
+        video_bitrate=config.video_bitrate,
+        debug=config.debug
     )
     
     # Create shutdown event (Phase 8)
@@ -219,7 +223,8 @@ def start_station(config: RadioConfig) -> None:
     
     # Phase 9: Start MasterClock first (must be running before sinks)
     master_clock.start()
-    logger.info("MasterClock started")
+    if config.debug:
+        logger.info("MasterClock started")
     
     # Start sinks
     if mixer.fm_sink:
@@ -232,7 +237,7 @@ def start_station(config: RadioConfig) -> None:
         if sink is not mixer.fm_sink:
             try:
                 sink.start()
-                if isinstance(sink, YouTubeSink):
+                if isinstance(sink, YouTubeSink) and config.debug:
                     logger.info("YouTube sink started")
             except Exception as e:
                 logger.warning(f"Failed to start sink {type(sink).__name__}: {e}")
@@ -243,6 +248,7 @@ def start_station(config: RadioConfig) -> None:
         playlist_manager=playlist_manager,
         dj_engine=dj_engine,
         playout_engine=playout_engine,
+        debug=config.debug,
         shutdown_event=shutdown_event,
         now_playing_writer=now_playing_writer
     )

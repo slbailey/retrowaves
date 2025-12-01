@@ -37,6 +37,7 @@ class RadioConfig:
     video_bitrate: str  # Video bitrate, e.g. "4000k"
     refresh_interval_seconds: int  # Library refresh interval
     log_level: str  # Logging level: "INFO", "DEBUG", etc.
+    debug: bool  # Enable verbose debug logging (periodic stats, frame-by-frame logs, etc.)
     now_playing_path: Path  # File to write current track metadata to
 
 
@@ -130,6 +131,7 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
     video_bitrate = get_value("video_bitrate", "YOUTUBE_VIDEO_BITRATE", "4000k")
     refresh_interval_seconds = get_int("refresh_interval", "REFRESH_INTERVAL_SECONDS", 300)
     log_level = get_value("log_level", "LOG_LEVEL", "INFO")
+    debug = get_bool("debug", "DEBUG", False)
     now_playing_path = expand_path(
         get_value("now_playing_path", "NOW_PLAYING_PATH", "/tmp/now_playing.json")
     )
@@ -149,6 +151,7 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
         video_bitrate=video_bitrate,
         refresh_interval_seconds=refresh_interval_seconds,
         log_level=log_level,
+        debug=debug,
         now_playing_path=now_playing_path
     )
 
