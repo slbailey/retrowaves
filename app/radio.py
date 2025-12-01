@@ -93,7 +93,6 @@ def build_engine(
         if youtube_rtmp_url:
             youtube_sink = YouTubeSink(
                 rtmp_url=youtube_rtmp_url,
-                master_clock=master_clock,  # Pass MasterClock for clock-driven operation
                 sample_rate=sample_rate,
                 channels=2,
                 frame_size=frame_size,

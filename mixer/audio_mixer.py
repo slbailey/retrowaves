@@ -250,9 +250,8 @@ class AudioMixer:
                         # Log YouTube sink writes for debugging
                         from outputs.youtube_sink import YouTubeSink
                         if isinstance(sink, YouTubeSink):
-                            yt_buffer_size = sink.get_buffer_size()
                             logger.debug(
-                                f"[Mixer] → YouTube {len(deliver_frame)} bytes (buffer={yt_buffer_size}) (tick {frame_index})"
+                                f"[Mixer] → YouTube {len(deliver_frame)} bytes (tick {frame_index})"
                             )
                     except Exception as e:
                         # Non-FM sink failures are non-critical

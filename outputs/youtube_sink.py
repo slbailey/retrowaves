@@ -2,7 +2,7 @@
 YouTube Live streaming audio sink.
 
 This module provides the YouTubeSink class, which streams PCM frames to
-YouTube Live via RTMP using FFmpeg. Clock-driven - no internal timing.
+YouTube Live via RTMP using FFmpeg. Uses internal worker thread for pacing.
 """
 
 import logging
@@ -20,16 +20,13 @@ class YouTubeSink(SinkBase):
     """
     YouTube Live streaming audio sink.
     
-    MasterClock-driven sink - writes exactly one frame per MasterClock tick.
-    No internal pacing or timing loops. MasterClock is the sole timing source.
-    
-    Small buffer (max 5 frames) for jitter tolerance only.
+    Simple design: write_frame() enqueues frames, background worker thread
+    paces writes to FFmpeg at real-time rate. No MasterClock integration.
     """
     
     def __init__(
         self,
         rtmp_url: str,
-        master_clock=None,  # MasterClock instance (required for clock-driven operation)
         reconnect_delay: float = 5.0,
         sample_rate: int = 48000,
         channels: int = 2,
@@ -45,7 +42,6 @@ class YouTubeSink(SinkBase):
         
         Args:
             rtmp_url: Full RTMP URL including stream key
-            master_clock: MasterClock instance (required for clock-driven operation)
             reconnect_delay: Delay in seconds before reconnecting after failure
             sample_rate: Audio sample rate in Hz (default: 48000)
             channels: Number of audio channels (default: 2 = stereo)
@@ -58,7 +54,6 @@ class YouTubeSink(SinkBase):
         """
         super().__init__()
         self.rtmp_url = rtmp_url
-        self.master_clock = master_clock
         self.reconnect_delay = reconnect_delay
         self.sample_rate = sample_rate
         self.channels = channels
@@ -69,13 +64,13 @@ class YouTubeSink(SinkBase):
         self.video_fps = video_fps
         self.video_bitrate = video_bitrate
         
-        # Calculate tick interval to match MasterClock
-        samples_per_frame = frame_size // (2 * 2)  # 2 bytes per sample, 2 channels
-        self.tick_interval = samples_per_frame / sample_rate
+        # Calculate tick interval for pacing
+        samples_per_frame = frame_size // (2 * channels)  # 2 bytes per sample
+        self.tick_interval = samples_per_frame / sample_rate  # ~0.021333s for 4096 bytes at 48kHz
         
-        # Internal queue for frames (maintain 3-8 frames for healthy buffer)
-        # No maxlen - we manually drop newest to prevent time jump
+        # Internal queue for frames (max ~4 seconds of audio)
         self._queue: deque[bytes] = deque()
+        self._max_queue_size = 200
         self._queue_lock = threading.Lock()
         
         # FFmpeg process management
@@ -83,25 +78,18 @@ class YouTubeSink(SinkBase):
         self._process_lock = threading.Lock()
         self._is_connected = False
         
-        # Frame counter and index tracking
+        # Frame counter
         self._frames_written = 0
-        self._frame_index = 0
-        self._frame_index_lock = threading.Lock()
         
-        # Background worker thread (only for FFmpeg monitoring/unblocking, NOT timing)
+        # Background worker thread for pacing and I/O
         self._worker: Optional[threading.Thread] = None
         
-        # Periodic logging (every 1 second)
+        # Periodic logging
         self._last_log_time = time.time()
-        
-        # Register with MasterClock if provided
-        if master_clock:
-            master_clock.register_callback(self.on_clock_tick)
-            logger.info("YouTubeSink registered with MasterClock (clock-driven, no internal timing)")
     
     def start(self) -> bool:
         """
-        Start the YouTube sink by spawning background monitoring thread.
+        Start the YouTube sink by spawning background worker thread.
         
         Returns:
             True if started successfully, False otherwise
@@ -114,7 +102,7 @@ class YouTubeSink(SinkBase):
             # Set running flag BEFORE starting thread
             self._running = True
             
-            # Spawn background worker thread for all I/O
+            # Spawn background worker thread for pacing and I/O
             self._worker = threading.Thread(
                 target=self._drain_loop,
                 name="YouTubeSinkWorker",
@@ -125,7 +113,7 @@ class YouTubeSink(SinkBase):
             # Attempt initial FFmpeg connection
             self._ensure_ffmpeg_running()
             
-            logger.info("YouTubeSink started (MasterClock-driven, no internal timing)")
+            logger.info("YouTubeSink started (worker thread pacing)")
             return True
             
         except Exception as e:
@@ -137,8 +125,8 @@ class YouTubeSink(SinkBase):
         """
         Write a PCM frame to the YouTube sink (O(1), non-blocking).
         
-        Enqueues frame into buffer (maintains 3-8 frames). MasterClock's on_clock_tick
-        will write frames to FFmpeg at the correct rate. No unbounded growth.
+        Enqueues frame into buffer. Worker thread writes frames to FFmpeg
+        at real-time rate. No I/O performed here.
         
         Args:
             pcm_frame: Raw PCM frame bytes
@@ -146,162 +134,109 @@ class YouTubeSink(SinkBase):
         if not self._running:
             return
         
-        # Enqueue frame with size limit (max 8 frames)
+        # Enqueue frame (drop oldest if queue full)
         with self._queue_lock:
-            if len(self._queue) >= 8:
-                # Queue full - drop newest to prevent time jump (oldest would cause gap)
-                # Dropping newest maintains continuity
-                self._queue.pop()
+            if len(self._queue) >= self._max_queue_size:
+                # Drop oldest frame to avoid unbounded growth
+                self._queue.popleft()
             self._queue.append(pcm_frame)
-    
-    def get_buffer_size(self) -> int:
-        """
-        Get current buffer size (thread-safe).
-        
-        Returns:
-            Number of frames currently in buffer
-        """
-        with self._queue_lock:
-            return len(self._queue)
-    
-    def on_clock_tick(self, frame_index: int) -> None:
-        """
-        Called by MasterClock on each tick. Writes exactly ONE frame to FFmpeg.
-        
-        This is the primary timing mechanism - MasterClock drives all audio output.
-        No internal pacing loops or timing logic.
-        
-        Always writes one frame per tick to maintain real-time playback. Uses silence
-        if buffer is empty to avoid underrun. Mixer pushes multiple frames per tick to
-        maintain healthy buffer level (3-8 frames).
-        
-        Args:
-            frame_index: Current frame index from MasterClock
-        """
-        if not self._running:
-            return
-        
-        # Ensure FFmpeg is running
-        if not self._ensure_ffmpeg_running():
-            return
-        
-        # Get one frame from queue (or use silence if empty)
-        frame = None
-        buffer_size = 0
-        with self._queue_lock:
-            buffer_size = len(self._queue)
-            if len(self._queue) > 0:
-                frame = self._queue.popleft()
-        
-        # If queue empty, use silence to avoid underrun (maintains real-time)
-        if frame is None:
-            frame = b'\x00' * self.frame_size
-            # Log warning if buffer is consistently low (indicates starvation)
-            if buffer_size == 0:
-                logger.warning(f"[YouTubeSink] Buffer empty at tick {frame_index} - using silence")
-        
-        # Write frame to FFmpeg (non-blocking, handles backpressure)
-        try:
-            with self._process_lock:
-                if self._process is None or self._process.poll() is not None:
-                    # FFmpeg died - frame will be dropped, will retry next tick
-                    return
-                
-                if self._process.stdin and not self._process.stdin.closed:
-                    try:
-                        # Write exactly ONE frame per tick
-                        self._process.stdin.write(frame)
-                        
-                        # Update counters
-                        with self._frame_index_lock:
-                            self._frame_index = frame_index
-                        self._frames_written += 1
-                        
-                        # Flush periodically (every 16 frames) for consistent timestamps
-                        if self._frames_written % 16 == 0:
-                            self._process.stdin.flush()
-                        
-                        if not self._is_connected:
-                            logger.info("YouTube stream connected")
-                            logger.info(
-                                "[YouTubeSink] First frame written to FFmpeg: %d bytes (frame_index=%d)",
-                                len(frame),
-                                frame_index,
-                            )
-                        self._is_connected = True
-                        
-                        # Log first few frames for debugging
-                        if self._frames_written <= 5:
-                            logger.debug(
-                                "[YouTubeSink] Wrote frame %d (index=%d) to FFmpeg: %d bytes",
-                                self._frames_written,
-                                frame_index,
-                                len(frame),
-                            )
-                    
-                    except BlockingIOError:
-                        # Pipe would block - requeue frame (if not silence) and let drain_loop handle it
-                        if frame != b'\x00' * self.frame_size:
-                            with self._queue_lock:
-                                if len(self._queue) < 5:
-                                    self._queue.appendleft(frame)
-                        # Don't log - this is normal backpressure
-                        return
-                    except BrokenPipeError:
-                        # FFmpeg died
-                        logger.warning("[YouTubeSink] Broken pipe, will restart on next tick")
-                        self._is_connected = False
-                        return
-        
-        except Exception as e:
-            logger.error(f"[YouTubeSink] on_clock_tick write error: {e}", exc_info=True)
-        
-        # Periodic logging every 1 second
-        current_time = time.time()
-        if current_time - self._last_log_time >= 1.0:
-            with self._queue_lock:
-                queue_size = len(self._queue)
-            with self._frame_index_lock:
-                current_frame_index = self._frame_index
-            logger.info(
-                "[YT] buffer=%d frames_written=%d frame_index=%d",
-                queue_size,
-                self._frames_written,
-                current_frame_index,
-            )
-            self._last_log_time = current_time
     
     def _drain_loop(self) -> None:
         """
-        Worker thread that monitors FFmpeg and handles unblocking.
+        Worker thread that paces writes to FFmpeg at real-time rate.
         
-        NOT used for primary timing - MasterClock's on_clock_tick handles that.
-        This thread only:
-        - Monitors FFmpeg process health
-        - Handles reconnection if FFmpeg dies
-        - Optionally drains buffered frames if FFmpeg unblocks after backpressure
+        Writes exactly one frame per tick_interval to maintain continuous
+        audio stream. Handles reconnection if FFmpeg dies.
         """
-        logger.debug("[YouTubeSink] Worker thread started (FFmpeg monitoring only)")
-
+        logger.debug("[YouTubeSink] Worker thread started")
+        
+        flush_counter = 0
+        next_write_time = None
+        
         while self._running:
             try:
-                # Ensure FFmpeg is running (monitoring only)
+                # Ensure FFmpeg is running
                 if not self._ensure_ffmpeg_running():
-                    # Failed to start - wait before retry
                     if self._running:
                         time.sleep(self.reconnect_delay)
+                    next_write_time = None  # Reset timing on reconnect
                     continue
                 
-                # Brief sleep to avoid busy loop (we're not doing primary timing here)
-                time.sleep(0.1)  # Check every 100ms
-
+                # Initialize timing on first iteration
+                now = time.monotonic()
+                if next_write_time is None:
+                    next_write_time = now
+                
+                # Sleep until it's time to write the next frame
+                sleep_time = next_write_time - now
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                
+                # Update next write time (maintains steady pace)
+                next_write_time += self.tick_interval
+                
+                # Pull one frame (or silence)
+                frame = None
+                with self._queue_lock:
+                    if self._queue:
+                        frame = self._queue.popleft()
+                    else:
+                        frame = bytes(self.frame_size)  # silence
+                
+                # Write frame to FFmpeg
+                try:
+                    with self._process_lock:
+                        if self._process is None or self._process.poll() is not None:
+                            continue
+                        
+                        if self._process.stdin and not self._process.stdin.closed:
+                            self._process.stdin.write(frame)
+                            self._frames_written += 1
+                            flush_counter += 1
+                            
+                            if flush_counter >= 16:
+                                self._process.stdin.flush()
+                                flush_counter = 0
+                            
+                            if not self._is_connected:
+                                logger.info("YouTube stream connected")
+                                logger.info(
+                                    "[YouTubeSink] First frame written to FFmpeg: %d bytes",
+                                    len(frame)
+                                )
+                            self._is_connected = True
+                
+                except BrokenPipeError:
+                    logger.warning("[YouTubeSink] Broken pipe, will restart on next loop")
+                    self._is_connected = False
+                    next_write_time = None  # Reset timing on error
+                except BlockingIOError:
+                    # FFmpeg backpressure - don't advance timing, retry next iteration
+                    # This prevents buffer growth when FFmpeg is slow
+                    next_write_time = time.monotonic()  # Reset to now to retry immediately
+                except Exception:
+                    logger.exception("[YouTubeSink] worker write error")
+                    next_write_time = None  # Reset timing on error
+                
+                # Periodic logging (every ~5 seconds)
+                log_now = time.time()
+                if log_now - self._last_log_time >= 5.0:
+                    with self._queue_lock:
+                        queue_size = len(self._queue)
+                    logger.info(
+                        "[YT] buffer=%d frames_written=%d",
+                        queue_size,
+                        self._frames_written
+                    )
+                    self._last_log_time = log_now
+            
             except Exception as e:
                 logger.error(f"[YouTubeSink] drain_loop error: {e}", exc_info=True)
+                next_write_time = None  # Reset timing on exception
                 time.sleep(0.1)
-
+        
         logger.debug("[YouTubeSink] Worker thread stopped")
-
-
+    
     def _ensure_ffmpeg_running(self) -> bool:
         """
         Ensure FFmpeg process is running. Start if needed.
@@ -321,7 +256,6 @@ class YouTubeSink(SinkBase):
             # Process doesn't exist or died - start it
             return self._start_ffmpeg_process()
     
-    
     def _start_ffmpeg_process(self) -> bool:
         """
         Start FFmpeg process for RTMP streaming.
@@ -331,7 +265,6 @@ class YouTubeSink(SinkBase):
         """
         try:
             # Build video input based on video_source
-            # For video files, use -re flag to read at native frame rate (matches working command style)
             if self.video_source == "video":
                 if not self.video_file:
                     logger.error("video_source is 'video' but no video_file provided")
@@ -340,10 +273,11 @@ class YouTubeSink(SinkBase):
                 if not os.path.exists(self.video_file):
                     logger.error(f"Video file not found: {self.video_file}")
                     return False
+                # Simple video input matching working CLI test
                 video_input = [
-                    "-re",  # Read input at native frame rate (matches working command)
+                    "-re",
                     "-stream_loop", "-1",
-                    "-i", self.video_file
+                    "-i", self.video_file,
                 ]
                 logger.info(f"Using video file: {self.video_file}")
             elif self.video_source == "image":
@@ -371,41 +305,36 @@ class YouTubeSink(SinkBase):
                 return False
             
             # Build FFmpeg command
-            # Audio input: Use -use_wallclock_as_timestamps so FFmpeg uses wallclock
-            # for PTS. We pace writes to exactly one frame per tick_interval (21.333ms)
-            # so timestamps are continuous and correct.
-            cmd = [
-                "ffmpeg",
-            ]
+            # Match working CLI test order: video input first, then audio input
+            cmd = ["ffmpeg"]
             
-            # Add video input first (matches working command style: video input before audio)
+            # Add video input first (matches working CLI test)
             cmd.extend(video_input)
             
-            # Add audio input (raw PCM from pipe)
+            # Add audio input (simple PCM pipe, no -re, no -use_wallclock_as_timestamps)
             cmd.extend([
                 "-f", "s16le",
                 "-ac", str(self.channels),
                 "-ar", str(self.sample_rate),
-                "-use_wallclock_as_timestamps", "1",  # Use wallclock for PTS (we pace writes correctly)
                 "-i", "pipe:0",
             ])
             
             # Output encoding settings
-            # For video files: copy video codec (no re-encoding) - matches working command
-            # For image/color: still need encoding
             if self.video_source == "video":
-                # Copy video directly (no encoding) - matches working command style
+                # Video passthrough (copy) - no re-encoding
+                # Note: Keyframe frequency is determined by source video file
+                # If YouTube complains about keyframes, the source file needs to be re-encoded
+                # with smaller GOP size (but we can't do that here without re-encoding)
                 cmd.extend([
-                    "-vcodec", "copy",  # Copy video codec (matches working command)
-                    "-acodec", "aac",   # Encode audio to AAC
-                    "-b:a", "160k",     # Audio bitrate (matches working command: 160k)
+                    "-c:v", "copy",  # Copy video codec (no re-encoding)
+                    "-c:a", "aac",   # Encode audio to AAC
+                    "-b:a", "160k",  # Audio bitrate
                 ])
             else:
                 # Image/color sources still need video encoding
-                # Calculate GOP size for encoding
-                gop_size = self.video_fps * 2
-                if gop_size < 30:
-                    gop_size = 30
+                # Calculate GOP for <= 4 second keyframe interval (YouTube requirement)
+                max_keyframe_seconds = 4
+                gop_size = self.video_fps * max_keyframe_seconds
                 
                 # Calculate buffer size
                 try:
@@ -419,7 +348,7 @@ class YouTubeSink(SinkBase):
                 
                 cmd.extend([
                     "-c:a", "aac",
-                    "-b:a", "160k",     # Match audio bitrate
+                    "-b:a", "160k",
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-pix_fmt", "yuv420p",
@@ -438,7 +367,7 @@ class YouTubeSink(SinkBase):
             
             # Output format
             cmd.extend([
-                "-f", "flv",  # FLV format (matches working command)
+                "-f", "flv",
                 "-loglevel", "error",
                 self.rtmp_url
             ])
@@ -476,10 +405,8 @@ class YouTubeSink(SinkBase):
                 return False
             
             logger.info("FFmpeg process started successfully")
-            # Reset frame counter and index for new process
+            # Reset frame counter for new process
             self._frames_written = 0
-            with self._frame_index_lock:
-                self._frame_index = 0
             return True
             
         except FileNotFoundError:
@@ -517,13 +444,6 @@ class YouTubeSink(SinkBase):
     def stop(self) -> None:
         """Stop the YouTube sink."""
         self._running = False
-        
-        # Unregister from MasterClock
-        if self.master_clock:
-            try:
-                self.master_clock.unregister_callback(self.on_clock_tick)
-            except Exception as e:
-                logger.warning(f"Error unregistering from MasterClock: {e}")
         
         # Close FFmpeg process
         with self._process_lock:
