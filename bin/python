@@ -3,11 +3,11 @@ set -euo pipefail
 
 # Project-local shim to ensure `python` resolves predictably.
 # Preference order:
-# 1) Absolute project venv: /opt/appalachia-radio/venv/bin/python
+# 1) Absolute project venv: /opt/retrowaves/venv/bin/python
 # 2) Relative venv next to this repo: ../venv/bin/python
 # 3) System python3
 
-ABS_VENV="/opt/appalachia-radio/venv/bin/python"
+ABS_VENV="/opt/retrowaves/venv/bin/python"
 REL_VENV="$(dirname "$0")/../venv/bin/python"
 
 if [ -x "$ABS_VENV" ]; then
