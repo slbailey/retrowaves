@@ -304,6 +304,7 @@ class PlayoutEngine:
         
         try:
             # Create decoder for this segment
+            # Note: decoder.read_frames() handles cleanup automatically via finally block
             decoder = FFmpegDecoder(segment.path, frame_size=frame_size)
             logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
             

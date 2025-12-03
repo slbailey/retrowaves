@@ -135,7 +135,21 @@ class Station:
         - Ignores comments (#) and blank lines
         - Does not handle quotes or escapes
         """
-        path = dotenv_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        # Default to /etc/retrowaves/station.env if not specified
+        if dotenv_path is None:
+            # Try system location first, then fallback to station directory for development
+            system_path = "/etc/retrowaves/station.env"
+            dev_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+            if os.path.exists(system_path):
+                path = system_path
+            elif os.path.exists(dev_path):
+                path = dev_path
+            else:
+                # Neither exists, try system path anyway (will silently fail if not found)
+                path = system_path
+        else:
+            path = dotenv_path
+        
         if not os.path.exists(path):
             return
         try:

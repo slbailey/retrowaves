@@ -1,0 +1,37 @@
+[Unit]
+Description=Retrowaves Station (DJ + Playout Engine)
+After=network.target sound.target retrowaves-tower.service
+Wants=retrowaves-tower.service
+
+[Service]
+Type=simple
+User=retrowaves
+Group=retrowaves
+
+# Your actual project root
+WorkingDirectory=/opt/retrowaves/station
+
+# Ensure imports resolve correctly
+Environment="PYTHONPATH=/opt/retrowaves/station"
+
+# Optional config
+EnvironmentFile=/etc/retrowaves/station.env
+
+# Correct venv path
+ExecStart=/opt/retrowaves/venv/bin/python3 -m app.radio
+
+Restart=always
+RestartSec=2
+
+LimitNOFILE=65536
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=50
+
+KillMode=mixed
+TimeoutStopSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

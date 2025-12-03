@@ -1,6 +1,8 @@
-# 📘 Appalachia Radio — Future Enhancements & Expansion Wishlist
+# 📘 Retrowaves — Future Enhancements & Expansion Wishlist
 
-This document is a non-binding, forward-looking companion to the canonical Unified Architecture. It defines potential future enhancements, integrations, and features that may be added to Appalachia Radio after the core THINK/DO system and real-time audio streaming are complete.
+This document is a non-binding, forward-looking companion to the canonical Unified Architecture. It defines potential future enhancements, integrations, and features that may be added to Retrowaves after the core THINK/DO system and real-time audio streaming are complete.
+
+**Note:** Retrowaves is the software platform. Appalachia Radio is the first station instance that uses this software.
 
 **This is NOT implementation guidance.** It is a design sandbox for ideas worth exploring later.
 
@@ -76,7 +78,7 @@ Offline operation, zero API cost.
 
 ### 4.1 Icecast/Shoutcast Compatibility
 
-**Why:** If Appalachia Radio should broadcast publicly and support infinite listeners.
+**Why:** If a Retrowaves station instance should broadcast publicly and support infinite listeners.
 
 **Features:**
 - Multiple mountpoints
@@ -240,7 +242,7 @@ Could allow remote control via phone app.
 
 ### 7.5 Intelligent Media Library Self-Organization
 
-**Future Goal:** Allow Appalachia Radio to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
+**Future Goal:** Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
 
 **Current Status:**
 - We continue using Phase A filename-driven intros/outros exactly as they are.
@@ -274,14 +276,13 @@ Could allow remote control via phone app.
 
 ### 7.6 Multi-Station Platform Architecture
 
-**Future Goal:** Rename the entire system to a platform name, where "Appalachia Radio" becomes one output stream instance. Enable running multiple radio stations simultaneously from a single codebase.
+**Future Goal:** Enable running multiple radio stations simultaneously from a single Retrowaves codebase, where "Appalachia Radio" becomes one output stream instance among many.
 
 **Current Status:**
-- System is named "Appalachia Radio" and runs as a single station instance
+- Retrowaves runs as a single station instance
 - All configuration, state, and media libraries are tied to one station
 
 **Desired Future Behavior:**
-- Platform-level naming (e.g., "Radio Automation Platform" or similar)
 - Station instances are independently configurable
 - Each station has its own:
   - Media library (songs, intros, outros, IDs)
@@ -321,7 +322,7 @@ Could allow remote control via phone app.
   - Current segment (song/intro/outro/ID) finishes playing completely
   - Playout engine stops accepting new segments from queue
   - DJ optionally generates/selects an offline announcement
-  - Offline announcement plays (e.g., "Appalachia Radio is going offline for maintenance. We'll be back soon!")
+  - Offline announcement plays (e.g., station-specific message like "Appalachia Radio is going offline for maintenance. We'll be back soon!")
   - After announcement completes, gracefully close all connections and stop
 - Listeners hear a clean end to the stream, not an abrupt cut
 - State is saved after current segment finishes (warm restart possible)
@@ -406,7 +407,7 @@ Just for fun.
 
 Create a second output stream (parallel to audio) delivering real-time events and metadata about what the station is doing.
 
-This channel would allow **ANY intelligent client** — OBS, a web UI, a Discord bot, a mobile app, a dashboard, etc. — to react to the station without Appalachia Radio being tied to any one platform.
+This channel would allow **ANY intelligent client** — OBS, a web UI, a Discord bot, a mobile app, a dashboard, etc. — to react to the station without Retrowaves being tied to any one platform.
 
 **No assumptions. No coupling. Pure abstraction.**
 
@@ -486,7 +487,7 @@ OBS would simply:
    - `{ "event": "station_stopping" }` → Switch to "Please Stand By"
    - `{ "event": "segment_started", "type": "song" }` → Switch to your main scene
 
-This keeps Appalachia Radio:
+This keeps Retrowaves:
 - **pure**
 - **platform-independent**
 - **deterministic**
@@ -627,7 +628,7 @@ You choose any of these modes:
 **Mode B — Looping MP3 file**
 
 E.g.:
-- `/mnt/media/appalachia-radio/system/please-stand-by.mp3`
+- `/mnt/media/appalachia-radio/system/please-stand-by.mp3` (station-specific path)
 
 This gives a professional aesthetic.
 
@@ -708,7 +709,7 @@ This Wishlist item adds:
 
 ## 12. Summary
 
-This document is a sandbox of ideas — future enhancements that can extend Appalachia Radio beyond its core architecture.
+This document is a sandbox of ideas — future enhancements that can extend Retrowaves beyond its core architecture.
 
 Nothing here changes the THINK/DO design or the canonical architecture.
 

@@ -16,7 +16,17 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from app.station import Station
+# Use relative import when running as module, absolute when running directly
+try:
+    from .station import Station
+except ImportError:
+    # Fallback for direct execution
+    import sys
+    from pathlib import Path
+    station_dir = Path(__file__).parent.parent
+    if str(station_dir) not in sys.path:
+        sys.path.insert(0, str(station_dir))
+    from app.station import Station
 
 logger = logging.getLogger(__name__)
 

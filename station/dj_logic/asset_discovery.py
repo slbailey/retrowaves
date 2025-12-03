@@ -129,23 +129,19 @@ class AssetDiscoveryManager:
                 if not filename.lower().endswith('.mp3'):
                     continue
                 
-                # Skip ignored files
-                if should_ignore(filename):
-                    continue
-                
                 full_path = os.path.join(root, filename)
                 
-                # Check for generic intros FIRST (before per-song patterns)
+                # Check for generic intros FIRST (before per-song patterns and ignore patterns)
                 if generic_intro_pattern.match(filename):
                     self.generic_intros.append(full_path)
                     continue
                 
-                # Check for generic outros (before per-song patterns)
+                # Check for generic outros (before per-song patterns and ignore patterns)
                 if generic_outro_pattern.match(filename):
                     self.generic_outros.append(full_path)
                     continue
                 
-                # Check for per-song intros
+                # Check for per-song intros (before ignore patterns - intros/outros should never be ignored)
                 intro_match = intro_pattern.match(filename)
                 if intro_match:
                     songroot = intro_match.group(1)
@@ -156,7 +152,7 @@ class AssetDiscoveryManager:
                         self.intros_per_song[songroot].append(full_path)
                     continue
                 
-                # Check for per-song outros
+                # Check for per-song outros (before ignore patterns - intros/outros should never be ignored)
                 outro_match = outro_pattern.match(filename)
                 if outro_match:
                     songroot = outro_match.group(1)
@@ -166,6 +162,10 @@ class AssetDiscoveryManager:
                             self.outtros_per_song[songroot] = []
                         self.outtros_per_song[songroot].append(full_path)
                     continue
+                
+                # Skip ignored files (only after we've checked for intro/outro patterns)
+                if should_ignore(filename):
+                    continue
         
         # Update scan time
         self.last_scan_time = time.time()
@@ -173,12 +173,24 @@ class AssetDiscoveryManager:
         # Log results
         total_per_song_intros = sum(len(v) for v in self.intros_per_song.values())
         total_per_song_outtros = sum(len(v) for v in self.outtros_per_song.values())
+        unique_songs_with_intros = len(self.intros_per_song)
+        unique_songs_with_outtros = len(self.outtros_per_song)
         logger.info(
-            f"[ASSET SCAN] Found {total_per_song_intros} per-song intros, "
-            f"{total_per_song_outtros} per-song outtros, "
+            f"[ASSET SCAN] Found {total_per_song_intros} per-song intros "
+            f"({unique_songs_with_intros} unique songs), "
+            f"{total_per_song_outtros} per-song outtros "
+            f"({unique_songs_with_outtros} unique songs), "
             f"{len(self.generic_intros)} generic intros, "
-            f"{len(self.generic_outros)} generic outtros."
+            f"{len(self.generic_outros)} generic outros."
         )
+        
+        # Debug: log a few examples if we found any
+        if total_per_song_intros > 0:
+            example_intros = list(self.intros_per_song.items())[:3]
+            logger.debug(f"[ASSET SCAN] Example per-song intros: {example_intros}")
+        if total_per_song_outtros > 0:
+            example_outtros = list(self.outtros_per_song.items())[:3]
+            logger.debug(f"[ASSET SCAN] Example per-song outtros: {example_outtros}")
     
     def get_intros_for_song(self, song_path: str) -> List[str]:
         """

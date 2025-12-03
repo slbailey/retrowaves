@@ -1,6 +1,8 @@
-# Appalachia Radio — Unified System Architecture
+# Retrowaves — Unified System Architecture
 
 A DJ-driven, event-timed, intent-based radio automation engine with real audio playout.
+
+**Note:** Retrowaves is the software platform. Appalachia Radio is the first station instance that uses this software.
 
 This is the canonical architecture document and supersedes all previous versions.
 
@@ -208,7 +210,7 @@ DJ_PATH=/path/to/dj_assets
 ## 9. Directory Structure (informative)
 
 ```
-appalachia-radio/
+retrowaves/
 ├── app/                      # station orchestration
 ├── music_logic/              # rotation, library
 ├── dj_logic/                 # dj engine, intent, ticklers, cache
