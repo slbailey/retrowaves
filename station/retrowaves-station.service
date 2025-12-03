@@ -15,7 +15,7 @@ WorkingDirectory=/opt/retrowaves/station
 Environment="PYTHONPATH=/opt/retrowaves/station"
 
 # Optional config
-EnvironmentFile=/etc/retrowaves/station.env
+EnvironmentFile=-/etc/retrowaves/station.env
 
 # Correct venv path
 ExecStart=/opt/retrowaves/venv/bin/python3 -m app.radio
