@@ -62,10 +62,13 @@ Never generate assets during DO. No TTS, scanning, or re-encoding on the transit
 ## 3. System Lifecycle Events
 
 ### 3.1 on_station_start
-At boot:
-- Load media library, cache manager, DJ/rotation state.
+`Station.start()` handles state loading directly during boot:
+- Load media library, AssetDiscoveryManager, DJ/rotation state.
+- AssetDiscoveryManager discovers intros, outros, and generic intros by scanning DJ asset directories based on naming conventions. Performs hourly rescans during THINK windows to maintain an in-memory cache of available assets.
 - Choose first song and queue it to start playback.
 - Transition to normal THINK/DO operation.
+
+Note: `DJEngine.on_station_start` exists for future expansion but is not part of the active flow. State loading is handled directly by `Station.start()`, not through this callback.
 
 ### 3.2 on_segment_started (THINK)
 - Clear previously executed intent.
@@ -93,9 +96,12 @@ Ticklers constraint:
 No decisions, no blocking, no external calls in DO.
 
 ### 3.4 on_station_stop
+`Station.stop()` handles state saving directly during shutdown:
 - Save DJ/rotation state and any tickler backlog.
 - Safely stop decoder and output sinks.
 - Ensure warm-start avoids immediate repeats.
+
+Note: `DJEngine.on_station_stop` exists for future expansion but is not part of the active flow. State saving is handled directly by `Station.stop()`, not through this callback.
 
 ---
 
@@ -115,8 +121,11 @@ Represents exactly what will be pushed during DO, resolved to concrete MP3s:
 - `outro: Optional[AudioEvent]`
 - `station_ids: list[AudioEvent]`
 - `intro: Optional[AudioEvent]`
+- `has_legal_id: bool` — determined during THINK; indicates whether the station ID chosen qualifies as a legal ID for compliance/timestamp tracking.
 
 Built during THINK, executed during DO.
+
+Note: `has_legal_id` is metadata only and is used exclusively in DO to update compliance timestamps.
 
 ---
 
@@ -197,9 +206,12 @@ DJ_PATH=/path/to/dj_assets
 - `HOLIDAY_MUSIC_PATH/*.mp3`
 - `DJ_PATH/`
   - `intros/intro_*.mp3`
-  - `outros/outro_*.mp3`
+  - `outros/outro_*.mp3` (canonical spelling)
+  - `outros/outtro_*.mp3` (legacy spelling, accepted for compatibility)
   - `ids/id_*.mp3` (legal and generic)
   - `talk/talk_*.mp3`
+
+**Note on outro filename patterns:** Both `_outro` and `_outtro` filename patterns are accepted for legacy compatibility. The canonical spelling is `_outro`. Phase B will normalize spellings automatically.
 
 ### 8.3 Asset availability rules
 - If a requested file is missing at DO, never block; DO must not fail.
@@ -209,15 +221,19 @@ DJ_PATH=/path/to/dj_assets
 
 ## 9. Directory Structure (informative)
 
+**Note:** The architecture above describes a logical module layout. The physical codebase resides under `station/`.
+
 ```
 retrowaves/
-├── app/                      # station orchestration
-├── music_logic/              # rotation, library
-├── dj_logic/                 # dj engine, intent, ticklers, cache
-├── broadcast_core/           # audio event, playout engine, sinks/decoders
-├── mixer/                    # audio mixer
-├── outputs/                  # sinks
-└── clock/                    # timing utilities
+└── station/
+    ├── app/                      # station orchestration
+    ├── music_logic/              # rotation, library
+    ├── dj_logic/                 # dj engine, intent, ticklers, cache
+    ├── broadcast_core/           # audio event, playout engine, sinks/decoders
+    ├── mixer/                    # audio mixer
+    ├── outputs/                  # sinks
+    ├── clock/                    # timing utilities
+    └── state/                    # DJ state persistence (DJStateStore)
 ```
 
 ---
@@ -225,7 +241,7 @@ retrowaves/
 ## 10. Startup / Shutdown
 
 Startup:
-- Load MediaLibrary and CacheManager
+- Load MediaLibrary and AssetDiscoveryManager
 - Load rotation/DJ state
 - Select first song and queue initial `AudioEvent`
 - Start the real-time playout loop
