@@ -1,8 +1,7 @@
 """
-DJ logic module.
+DJ Logic module for Appalachia Radio 3.1.
 
-This package contains the independent DJ decision-making system for
-intros, outros, and talk segments. DJ logic is completely separate
-from music playback and provides recommendations to the playout engine.
+This package contains the DJ Brain implementation, intent model, and all
+DJ decision-making logic as defined in Architecture 3.1.
 """
 

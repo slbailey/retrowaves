@@ -1,197 +1,155 @@
-"""
-Station orchestrator for the radio broadcast system.
-
-This module provides the Station class, which orchestrates all components
-and runs the main scheduling loop.
-"""
-
 import logging
 import os
 import time
-import sys
-import threading
 from typing import Optional
-from music_logic.library_manager import LibraryManager
-from music_logic.playlist_manager import PlaylistManager
+
+from music_logic.media_library import MediaLibrary
+from music_logic.rotation import RotationManager
 from dj_logic.dj_engine import DJEngine
+from broadcast_core.audio_event import AudioEvent
 from broadcast_core.playout_engine import PlayoutEngine
-from broadcast_core.event_queue import AudioEvent
-from app.now_playing import NowPlaying, NowPlayingWriter
+from outputs.factory import create_output_sink
+from outputs.http_streaming_sink import HTTPStreamingSink
+from state.dj_state_store import DJStateStore
 
 logger = logging.getLogger(__name__)
 
 
 class Station:
     """
-    Main station orchestrator.
-    
-    Coordinates LibraryManager, PlaylistManager, DJEngine, and PlayoutEngine
-    to run the radio station continuously.
+    Phase 7 station orchestrator:
+    - Loads MediaLibrary and RotationManager
+    - Emits synthetic THINK/DO events to the DJ
+    - Uses a simple PlayoutQueue (no audio)
+    - Supports warm-start recovery with state persistence
     """
-    
-    def __init__(
-        self,
-        library_manager: LibraryManager,
-        playlist_manager: PlaylistManager,
-        dj_engine: DJEngine,
-        playout_engine: PlayoutEngine,
-        shutdown_event: threading.Event,
-        now_playing_writer: Optional[NowPlayingWriter] = None,
-        debug: bool = False
-    ) -> None:
+
+    def __init__(self) -> None:
+        self._load_dotenv_simple()
+        # Load library from environment
+        self.library = MediaLibrary.from_env()
+
+        # Initialize rotation (Phase 1 minimal)
+        self.rotation = RotationManager(
+            self.library.regular_tracks,
+            self.library.holiday_tracks
+        )
+
+        # DJ assets path from environment (fallback to ./cache)
+        dj_path = os.getenv("DJ_PATH") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache")
+
+        # Phase 7: Initialize state store
+        state_path = os.getenv("DJ_STATE_PATH", "/tmp/appalachia_dj_state.json")
+        self.state_store = DJStateStore(path=state_path)
+
+        # Initialize DJ engine
+        self.dj = DJEngine(
+            playout_engine=None,  # Will be set after engine creation
+            rotation_manager=self.rotation,
+            dj_asset_path=dj_path
+        )
+
+        # Phase 7: Load saved state (warm-start recovery)
+        saved = self.state_store.load()
+        if saved:
+            self.dj.from_dict(saved)
+            logger.info("[STATION] Warm start: DJ state restored.")
+        else:
+            logger.info("[STATION] Cold start: no previous state found.")
+
+        # Phase 8.5: Output sink - HTTP streaming enabled by default for production
+        stream_host = os.getenv("STREAM_HOST", "0.0.0.0")
+        stream_port = int(os.getenv("STREAM_PORT", "8000"))
+        enable_http_stream = os.getenv("ENABLE_HTTP_STREAM", "true").lower() == "true"
+        
+        if enable_http_stream:
+            self.sink = HTTPStreamingSink(host=stream_host, port=stream_port)
+            logger.info(f"[STATION] HTTP streaming enabled on {stream_host}:{stream_port}")
+        else:
+            self.sink = create_output_sink()
+            logger.info("[STATION] HTTP streaming disabled, using factory sink")
+
+        # Real playout engine with DJ callback and output sink (Architecture 3.2)
+        self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink)
+        
+        # Set playout engine reference in DJ
+        self.dj.set_playout_engine(self.engine)
+
+    def start(self) -> None:
         """
-        Initialize the station.
+        Start the station.
         
-        Args:
-            library_manager: LibraryManager instance
-            playlist_manager: PlaylistManager instance
-            dj_engine: DJEngine instance
-            playout_engine: PlayoutEngine instance
-            shutdown_event: threading.Event for graceful shutdown
-            now_playing_writer: Optional NowPlayingWriter for metadata
-            debug: Enable debug logging
+        Phase 7: On warm start, don't seed a song - let DJ THINK handle it.
+        On cold start, seed the first song.
         """
-        self.library_manager = library_manager
-        self.playlist_manager = playlist_manager
-        self.dj_engine = dj_engine
-        self.playout_engine = playout_engine
-        self.shutdown_event = shutdown_event
-        self.now_playing_writer = now_playing_writer
-        self._running = False
-        self.debug = debug
-        self._restart_requested = False
-        self._current_song_filename = None
-        self._current_song_path = None  # Full path to currently playing song
-        self._current_song_is_holiday = False
-        self._current_song_finished = False  # Flag to track if current song finished during restart
+        saved = self.state_store.load()
         
-        # Wire DJEngine to PlayoutEngine for event-driven decisions
-        self.playout_engine.set_dj_engine(self.dj_engine)
+        if saved:
+            # Warm start: Don't choose anything; playout picks up cleanly
+            # The first THINK will kickstart DJIntent
+            logger.info("[STATION] Warm start: waiting for DJ THINK on first segment.")
+            # Note: We still need to seed something to start the playout loop
+            # But we'll let the DJ decide what to play first via THINK
+            # For now, we'll seed a song but the DJ will override it
+            first_song = self.rotation.select_next_song()
+            self.engine.queue_audio([AudioEvent(first_song, "song")])
+        else:
+            # Cold start: Choose first song
+            first_song = self.rotation.select_next_song()
+            self.engine.queue_audio([AudioEvent(first_song, "song")])
+            logger.info(f"[STATION] Cold start: seeded first song - {first_song}")
         
-        # DJ no longer uses queue_events_callback - decisions are returned directly
-        # DJ no longer receives song_finished callbacks - only song_started
+        # Phase 8: Start HTTP streaming sink if enabled
+        if hasattr(self.sink, 'start'):
+            self.sink.start()
         
-        # Register callback to update playlist history when songs complete
-        self.playout_engine.add_event_complete_callback(self._on_song_complete)
-        
-        # Register metadata/history tracking callback
-        self.playout_engine.add_event_start_callback(self._on_song_start)
-    
-    
-    def run(self) -> None:
+        # Start playout loop
+        self.engine.run()
+
+    def stop(self) -> None:
         """
-        Run the main station loop.
+        Stop the station and save state.
         
-        Pure event-driven model:
-        - Station startup event → DJ decision → preload deck A
-        - Song started event → DJ decision → preload opposite deck
-        - Song finished event → DJ records completion
-        - Loop only waits for shutdown/restart
+        Phase 7: Saves DJ state before shutdown.
         """
-        self._running = True
-        if self.debug:
-            logger.info("Station started (DJ-driven event model)")
-        
+        # Save DJ state before stopping
         try:
-            while self._running:
-                # Check if normal shutdown was requested (not a restart)
-                if not self._running or (self.shutdown_event.is_set() and not self._restart_requested):
-                    # Normal shutdown - break immediately
-                    break
-                
-                # Wait until playout is idle before checking for restart
-                # For restart, continue waiting even if shutdown_event is set
-                # Poll every 250-500ms until engine is truly idle
-                while self._running and not self.playout_engine.is_idle():
-                    # If shutdown is requested but not a restart, break immediately
-                    if self.shutdown_event.is_set() and not self._restart_requested:
-                        break
-                    
-                    # For restart, check if current song finished (via callback)
-                    # This is more reliable than checking decoder state
-                    if self._restart_requested and self._current_song_finished:
-                        logger.info("Restart: Current song finished, ready to restart")
-                        break
-                    
-                    # Wait before checking again (Phase 7 spec: 250-500ms)
-                    time.sleep(0.375)  # 375ms = middle of 250-500ms range
-                
-                # After playout becomes idle, check for restart
-                if self._restart_requested:
-                    # Playout is idle, safe to restart
-                    logger.info("Restart: Current song finished, ready to restart")
-                    break
-                
-                # Check again for normal shutdown
-                if not self._running or (self.shutdown_event.is_set() and not self._restart_requested):
-                    break
-                
-                # If we get here, playout is idle and we're not shutting down
-                # This shouldn't normally happen in the event-driven model, but
-                # we keep the loop for restart/shutdown handling
-                time.sleep(0.5)  # Small sleep to prevent busy-waiting
-                
-        except KeyboardInterrupt:
-            if self.debug:
-                logger.info("Received interrupt signal, shutting down...")
+            state = self.dj.to_dict()
+            self.state_store.save(state)
+            logger.info("[STATION] DJ state saved.")
         except Exception as e:
-            logger.error(f"Station error: {e}", exc_info=True)
-        finally:
-            self._running = False
-            
-            # Save playlist state
-            if hasattr(self, 'playlist_manager') and self.playlist_manager:
-                self.playlist_manager.save_state()
-            
-            if self.debug:
-                logger.info("Station stopped")
-    
-    def _on_song_start(self, event: AudioEvent) -> None:
-        """
-        Callback when an event starts playing - handles metadata and history tracking.
+            logger.error(f"[STATION] Failed to save DJ state: {e}")
         
-        DJ decisions are handled by DJEngine callbacks (on_song_started).
+        # Phase 8: Stop HTTP streaming sink if enabled
+        if hasattr(self.sink, 'start'):
+            self.sink.close()
         
-        Args:
-            event: Started AudioEvent
+        # Stop the engine
+        self.engine.stop()
+
+    @staticmethod
+    def _load_dotenv_simple(dotenv_path: Optional[str] = None) -> None:
         """
-        # Only handle metadata for song events (not intro/outro)
-        if event.type == "song":
-            # Store current song path for history tracking
-            self._current_song_path = event.path
-            self._current_song_filename = os.path.basename(event.path)
-            self._current_song_is_holiday = 'holiday' in event.path.lower()
-            
-            # Write now-playing metadata
-            if self.now_playing_writer:
-                now_playing = NowPlaying(
-                    title=self._current_song_filename,
-                    path=event.path,
-                    started_at=time.time(),
-                    intro_used=False,  # TODO: Track this from DJ decision
-                    outro_used=False   # TODO: Track this from DJ decision
-                )
-                try:
-                    self.now_playing_writer.write(now_playing)
-                except Exception as e:
-                    logger.error(f"Failed to write now-playing metadata: {e}")
-    
-    def _on_song_complete(self, event: AudioEvent) -> None:
+        Minimal .env loader (no external dependencies).
+        - Supports KEY=VALUE lines
+        - Ignores comments (#) and blank lines
+        - Does not handle quotes or escapes
         """
-        Callback when an event completes - update playlist history for songs.
-        
-        Args:
-            event: Completed AudioEvent
-        """
-        # If this is a song event (not intro/outro), mark it as finished
-        # This is used for graceful restart detection
-        if event.type == "song":
-            self._current_song_finished = True
-        # Only update history for song events (not intro/outro)
-        if event.type == "song" and self._current_song_filename:
-            filename = os.path.basename(event.path)
-            # Use stored holiday status
-            self.playlist_manager.update_history(
-                filename,
-                self._current_song_is_holiday
-            )
+        path = dotenv_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key and value and key not in os.environ:
+                        os.environ[key] = value
+        except OSError:
+            pass
+
+

@@ -1,8 +1,7 @@
 """
-Music selection logic module.
+Music Logic module for Appalachia Radio 3.1.
 
-This package contains pure music selection algorithms with no knowledge of
-playback or DJ systems. Components are pure functions that take inputs
-and return selection probabilities.
+This package contains music library management, rotation logic, and
+song selection algorithms.
 """
 

@@ -1,6 +1,6 @@
 """
-App module - main application entry points.
-"""
+App module for Appalachia Radio 3.1.
 
-__all__ = ["radio", "station", "test_play"]
+This package contains the main application entry point and orchestration logic.
+"""
 

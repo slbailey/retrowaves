@@ -1,62 +1,48 @@
 """
-Base class for audio output sinks.
+Base Output Sink for Appalachia Radio 3.1.
 
-All audio sinks must inherit from SinkBase and implement the required methods.
+Abstract base class for all output sinks (FM, YouTube, etc.).
+
+Architecture 3.1 Reference:
+- Section 2.7: Frame-Based Audio Pipeline (FMSink, YouTubeSink)
 """
 
-from abc import ABC, abstractmethod
 import logging
+from abc import ABC, abstractmethod
+from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
 
 class SinkBase(ABC):
     """
-    Abstract base class for all audio output sinks.
+    Abstract base class for output sinks.
     
-    All sinks must implement:
-    - write_frame(): Write a PCM frame chunk to the sink
-    - start(): Start the sink (open device, connect stream, etc.)
-    - stop(): Stop the sink (close device, disconnect stream, etc.)
+    All sinks must implement non-blocking frame writing.
+    Architecture 3.1 Reference: Section 2.7
     """
     
-    def __init__(self) -> None:
-        """Initialize the sink."""
-        self._running = False
-    
     @abstractmethod
-    def write_frame(self, pcm_frame: bytes) -> None:
+    def write_frames(self, frames: Iterator[bytes]) -> None:
         """
-        Write a single PCM frame chunk to the sink.
+        Write PCM frames to output sink.
+        
+        Must never block the audio pipeline.
+        
+        Architecture 3.1 Reference: Section 2.7
         
         Args:
-            pcm_frame: Raw PCM frame bytes (typically 4096-8192 bytes)
+            frames: Iterator of PCM frame data
         """
-        pass
+        raise NotImplementedError("Subclasses must implement write_frames")
     
     @abstractmethod
-    def start(self) -> bool:
-        """
-        Start the sink (e.g., open device, connect stream).
-        
-        Returns:
-            True if started successfully, False otherwise
-        """
-        pass
+    def start(self) -> None:
+        """Start the output sink."""
+        raise NotImplementedError("Subclasses must implement start")
     
     @abstractmethod
     def stop(self) -> None:
-        """
-        Stop the sink (e.g., close device, disconnect stream).
-        """
-        pass
-    
-    def is_running(self) -> bool:
-        """
-        Check if the sink is currently running.
-        
-        Returns:
-            True if running, False otherwise
-        """
-        return self._running
+        """Stop the output sink gracefully."""
+        raise NotImplementedError("Subclasses must implement stop")
 

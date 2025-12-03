@@ -1,12 +1,6 @@
 """
-Audio mixer module.
+Mixer module for Appalachia Radio 3.1.
 
-Provides AudioMixer, AudioDecoder, and PCMBuffer for audio processing.
+This package contains audio decoding, mixing, and frame processing logic.
 """
-
-from mixer.audio_mixer import AudioMixer
-from mixer.audio_decoder import AudioDecoder
-from mixer.pcm_buffer import PCMBuffer
-
-__all__ = ["AudioMixer", "AudioDecoder", "PCMBuffer"]
 

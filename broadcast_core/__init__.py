@@ -1,18 +1,12 @@
 """
-Broadcast core module.
+Broadcast Core module for Appalachia Radio 3.1.
 
-Provides PlayoutEngine, EventQueue, and state management for audio playback.
+This package contains the playout engine, event queue, and core
+audio pipeline components.
 """
 
-from broadcast_core.event_queue import AudioEvent, EventQueue
-from broadcast_core.state_machine import PlaybackState, PlaybackContext, StateMachine
-from broadcast_core.playout_engine import PlayoutEngine
+from broadcast_core.audio_event import AudioEvent
+from broadcast_core.playout_queue import PlayoutQueue
+from broadcast_core.playout_engine import PlayoutEngine, DJCallback
 
-__all__ = [
-    "AudioEvent",
-    "EventQueue",
-    "PlaybackState",
-    "PlaybackContext",
-    "StateMachine",
-    "PlayoutEngine",
-]
+__all__ = ["AudioEvent", "PlayoutQueue", "PlayoutEngine", "DJCallback"]
