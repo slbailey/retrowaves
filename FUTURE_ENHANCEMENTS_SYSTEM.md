@@ -257,6 +257,28 @@ Could allow remote control via phone app.
 
 **Implementation Notes:**
 - This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
+
+### 7.6 Centralized Logging with Rotation
+
+**Future Goal:** All Retrowaves components should write logs to standardized locations with automatic log rotation.
+
+**Desired Behavior:**
+- Each component writes to `/var/log/retrowaves-<component>.log`
+  - `retrowaves-tower.log` for Tower service
+  - `retrowaves-station.log` for Station service
+  - `retrowaves-dj.log` for DJ engine (if separated)
+  - etc.
+- Use system log rotation mechanisms (e.g., `logrotate` on Linux)
+- Rotate logs based on size and/or time (e.g., daily rotation, 10MB max size)
+- Retain a configurable number of rotated log files (e.g., keep last 7 days or last 10 files)
+- Compress old log files to save disk space
+- Ensure log files have appropriate permissions (readable by `retrowaves` user/group)
+
+**Benefits:**
+- Easier debugging and troubleshooting
+- Prevents log files from growing unbounded
+- Standardized log locations across all components
+- Better integration with system monitoring tools
 - Migration should happen incrementally during THINK windows (non-blocking)
 - Files should be moved atomically with fallback to original location if needed
 - DJ should maintain a mapping of old paths to new paths during transition

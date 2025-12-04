@@ -1,0 +1,38 @@
+[Unit]
+Description=Retrowaves Tower (External Encoder + Stream Fanout)
+After=network.target sound.target
+# Tower starts independently; Station may optionally Want= it
+Wants=network.target
+
+[Service]
+Type=simple
+User=retrowaves
+Group=retrowaves
+
+# Tower lives in its own directory
+WorkingDirectory=/opt/retrowaves/tower
+
+# Ensure imports resolve correctly
+Environment="PYTHONPATH=/opt/retrowaves"
+
+# Optional environment overrides
+EnvironmentFile=-/etc/retrowaves/tower.env
+
+# Correct venv path (same as Station)
+ExecStart=/opt/retrowaves/venv/bin/python3 -m tower
+
+Restart=always
+RestartSec=2
+
+LimitNOFILE=65536
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=50
+
+KillMode=mixed
+TimeoutStopSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

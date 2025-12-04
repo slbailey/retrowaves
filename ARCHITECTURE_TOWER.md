@@ -166,6 +166,25 @@ When no live PCM is available:
 
 Fallback is internal to Tower and requires no Station participation.
 
+**Fallback Source Priority Order:**
+
+Tower selects the fallback source using the following priority order (highest to lowest):
+
+1. **MP3/WAV File** (if `TOWER_SILENCE_MP3_PATH` is configured and exists):
+   - If the file is a WAV file (`.wav` extension), Tower uses it as a file source
+   - If the file is an MP3 or other format, Tower falls through to tone generator (FileSource only handles WAV files)
+   - Note: To use MP3 files as fallback, they must be converted to WAV first, or MP3 support must be added to FileSource
+
+2. **Tone Generator** (default):
+   - Generates continuous PCM tone (e.g., 440 Hz sine wave)
+   - Used when no file is configured, or when file source initialization fails
+   - Configured via `TOWER_DEFAULT_SOURCE=tone` (default)
+
+3. **Silence** (fallback if tone generation fails):
+   - Produces continuous PCM zeros (silence)
+   - Used only if tone generator initialization fails
+   - Ensures Tower always has a valid source, even if tone generation encounters errors
+
 ### 4.3 Input Selection Logic
 
 At each audio tick (~21.3 ms intervals):
@@ -355,6 +374,26 @@ Connection: keep-alive
   - **Looping:** Loop cached PCM frames during fallback mode
   - **Fallback:** If asset is missing or fails to load, use tone generator
 
+**Source Selection Priority:**
+
+The fallback source is selected at Tower startup using the following priority order:
+
+1. **File Source** (if `TOWER_SILENCE_MP3_PATH` is set and points to a valid WAV file):
+   - Tower attempts to use the file as a file source
+   - If the file is not a WAV file or initialization fails, falls through to tone generator
+
+2. **Tone Generator** (default):
+   - Generates continuous PCM tone (440 Hz sine wave by default)
+   - Used when no file is configured or file source initialization fails
+   - Configured via `TOWER_DEFAULT_SOURCE=tone`
+
+3. **Silence Source** (last resort):
+   - Produces continuous PCM zeros
+   - Used only if tone generator initialization fails
+   - Ensures Tower always has a valid source, even in error conditions
+
+This priority order ensures Tower always has a valid fallback source, with graceful degradation from file → tone → silence.
+
 ### 7.3 AudioPump
 
 Runs in its own thread.
@@ -402,13 +441,17 @@ Runs in its own thread.
 On service start:
 
 1. Load configuration (host, port, bitrate, fallback mode, etc.)
-2. Initialize `AudioInputRouter`, `FallbackGenerator`, and `HTTPConnectionManager`
-3. Start FFmpeg encoder process
-4. Start:
+2. Initialize fallback source using priority order (see Section 4.2):
+   - Try MP3/WAV file if `TOWER_SILENCE_MP3_PATH` is configured
+   - Fall back to tone generator if file unavailable or invalid
+   - Fall back to silence if tone generator fails
+3. Initialize `AudioInputRouter`, `FallbackGenerator`, and `HTTPConnectionManager`
+4. Start FFmpeg encoder process
+5. Start:
    - AudioPump thread
    - EncoderReader thread
    - HTTP server thread
-5. Begin continuous streaming
+6. Begin continuous streaming
 
 Station may be offline at this point; Tower still streams fallback audio.
 
@@ -479,8 +522,9 @@ TOWER_PORT=8000
 TOWER_SAMPLE_RATE=48000
 TOWER_CHANNELS=2
 TOWER_BITRATE=128k
-TOWER_FALLBACK_MODE=tone   # future: "standby_file"
-TOWER_FALLBACK_FILE=/path/to/please_stand_by.mp3
+TOWER_DEFAULT_SOURCE=tone   # "tone", "silence", or "file"
+TOWER_DEFAULT_FILE_PATH=/path/to/fallback.wav  # required if TOWER_DEFAULT_SOURCE=file
+TOWER_SILENCE_MP3_PATH=/path/to/silence.wav     # optional: used as fallback source if present (WAV only)
 TOWER_SOCKET_PATH=/var/run/retrowaves/pcm.sock
 TOWER_BUFFER_SIZE=5        # frames in AudioInputRouter queue (~100 ms)
 TOWER_FRAME_TIMEOUT_MS=50  # timeout for frame retrieval
@@ -490,6 +534,16 @@ TOWER_CLIENT_TIMEOUT_MS=250  # timeout before dropping slow clients
 TOWER_READ_CHUNK_SIZE=8192  # bytes for reading MP3 from encoder
 TOWER_SHUTDOWN_TIMEOUT=5    # seconds for graceful shutdown
 ```
+
+**Fallback Source Priority:**
+
+The fallback source is selected at startup using this priority order:
+
+1. **File** (if `TOWER_SILENCE_MP3_PATH` is set and points to a valid WAV file)
+2. **Tone generator** (default, or if file unavailable/invalid)
+3. **Silence** (if tone generator initialization fails)
+
+Note: `TOWER_SILENCE_MP3_PATH` must point to a WAV file for file source to work. MP3 files are not supported by FileSource and will cause fallback to tone generator.
 
 ### 9.2 Station-to-Tower Integration
 
