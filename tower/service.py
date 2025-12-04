@@ -255,10 +255,19 @@ class TowerService:
                         
                         # Still generate frame to maintain real-time pace
                         # Phase 3: Try to get frame from AudioInputRouter first
+                        # Use grace period to prevent tone blips during short gaps
                         if self.audio_input_router is not None:
-                            frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                            if self.audio_input_router.router_dead:
+                                # Router is dead - force fallback by setting frame to None
+                                frame = None
+                            elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
+                                # PCM available within grace period - try to get frame
+                                frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                            else:
+                                # Grace period expired - no PCM available
+                                frame = None
                         
-                        # If no frame from router, fall back to SourceManager
+                        # Only fallback when no PCM AND grace expired
                         if frame is None:
                             # Get current source (thread-safe, may change between calls)
                             source = self.source_manager.get_current_source()
@@ -291,10 +300,19 @@ class TowerService:
                     frame: Optional[bytes] = None
                     
                     # Phase 3: Try to get frame from AudioInputRouter first
+                    # Use grace period to prevent tone blips during short gaps
                     if self.audio_input_router is not None:
-                        frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                        if self.audio_input_router.router_dead:
+                            # Router is dead - force fallback by setting frame to None
+                            frame = None
+                        elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
+                            # PCM available within grace period - try to get frame
+                            frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                        else:
+                            # Grace period expired - no PCM available
+                            frame = None
                     
-                    # If no frame from router, fall back to SourceManager
+                    # Only fallback when no PCM AND grace expired
                     if frame is None:
                         # Get current source (thread-safe, may change between calls)
                         source = self.source_manager.get_current_source()

@@ -9,7 +9,8 @@ from dj_logic.dj_engine import DJEngine
 from broadcast_core.audio_event import AudioEvent
 from broadcast_core.playout_engine import PlayoutEngine
 from outputs.factory import create_output_sink
-from outputs.http_streaming_sink import HTTPStreamingSink
+from outputs.tower_pcm_sink import TowerPCMSink
+from outputs.tower_control import TowerControlClient
 from state.dj_state_store import DJStateStore
 
 logger = logging.getLogger(__name__)
@@ -57,17 +58,18 @@ class Station:
         else:
             logger.info("[STATION] Cold start: no previous state found.")
 
-        # Phase 8.5: Output sink - HTTP streaming enabled by default for production
-        stream_host = os.getenv("STREAM_HOST", "0.0.0.0")
-        stream_port = int(os.getenv("STREAM_PORT", "8000"))
-        enable_http_stream = os.getenv("ENABLE_HTTP_STREAM", "true").lower() == "true"
+        # Output sink - Tower PCM socket (replaces HTTP streaming)
+        tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
         
-        if enable_http_stream:
-            self.sink = HTTPStreamingSink(host=stream_host, port=stream_port)
-            logger.info(f"[STATION] HTTP streaming enabled on {stream_host}:{stream_port}")
-        else:
-            self.sink = create_output_sink()
-            logger.info("[STATION] HTTP streaming disabled, using factory sink")
+        # Initialize Tower PCM sink (connects to Tower's Unix socket)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path)
+        logger.info(f"[STATION] Tower PCM sink initialized (socket={tower_socket_path})")
+        
+        # Initialize Tower control client (for sending commands to Tower)
+        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
+        logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
 
         # Real playout engine with DJ callback and output sink (Architecture 3.2)
         self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink)
@@ -99,9 +101,8 @@ class Station:
             self.engine.queue_audio([AudioEvent(first_song, "song")])
             logger.info(f"[STATION] Cold start: seeded first song - {first_song}")
         
-        # Phase 8: Start HTTP streaming sink if enabled
-        if hasattr(self.sink, 'start'):
-            self.sink.start()
+        # Connect to Tower (TowerPCMSink handles connection automatically on first write)
+        # No explicit start() needed - sink connects on demand
         
         # Start playout loop
         self.engine.run()
@@ -120,9 +121,8 @@ class Station:
         except Exception as e:
             logger.error(f"[STATION] Failed to save DJ state: {e}")
         
-        # Phase 8: Stop HTTP streaming sink if enabled
-        if hasattr(self.sink, 'start'):
-            self.sink.close()
+        # Close Tower PCM sink connection
+        self.sink.close()
         
         # Stop the engine
         self.engine.stop()

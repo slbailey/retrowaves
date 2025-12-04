@@ -55,10 +55,17 @@ class AudioInputRouter:
         # Shutdown flag
         self._shutdown = False
         
+        # Watchdog state for long-running fallback
+        self.last_frame_ts = time.monotonic()
+        self.router_dead = False
+        
         # Buffer for partial frames
         # Limit buffer size to prevent unbounded growth from misaligned data
         self._read_buffer = bytearray()
         self._max_buffer_size = 16384  # 16KB max buffer (4 frames worth)
+        
+        # Watchdog thread
+        self._watchdog_thread: Optional[threading.Thread] = None
     
     def start(self) -> None:
         """Start AudioInputRouter (create socket and start listening)."""
@@ -107,6 +114,14 @@ class AudioInputRouter:
         )
         self._listener_thread.start()
         
+        # Start watchdog thread
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=False,
+            name="AudioInputRouter-Watchdog"
+        )
+        self._watchdog_thread.start()
+        
         logger.info("AudioInputRouter started")
     
     def stop(self) -> None:
@@ -141,6 +156,9 @@ class AudioInputRouter:
         
         if self._reader_thread:
             self._reader_thread.join(timeout=2.0)
+        
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=2.0)
         
         # Clear queue
         while not self._queue.empty():
@@ -194,6 +212,9 @@ class AudioInputRouter:
                         self._writer_socket = writer_sock
                         self._writer_connected = True
                         self._read_buffer = bytearray()  # Clear buffer on new connection
+                        # Reset watchdog state on new connection
+                        self.last_frame_ts = time.monotonic()
+                        self.router_dead = False
                         
                         logger.info("Writer connected to AudioInputRouter")
                         
@@ -263,6 +284,8 @@ class AudioInputRouter:
                         
                         self._read_buffer.extend(data)
                         self._process_buffer()
+                        # Update last frame timestamp when processing buffer
+                        # (frames are added to queue in _process_buffer)
                 
                 except socket.timeout:
                     # Timeout is OK - continue reading
@@ -306,6 +329,10 @@ class AudioInputRouter:
                 
                 # Add frame to queue (non-blocking)
                 self._queue.put_nowait(frame)
+                
+                # Update last frame timestamp when a valid frame is queued
+                self.last_frame_ts = time.monotonic()
+                self.router_dead = False
             
             except queue.Full:
                 # Should not happen (we check above), but be safe
@@ -337,6 +364,90 @@ class AudioInputRouter:
         
         logger.info("Writer disconnected, queue cleared")
     
+    def pcm_available(self, grace_sec: float = 5.0) -> bool:
+        """
+        Check if PCM is available within grace period.
+        
+        Returns True if a frame was received within the grace period,
+        indicating PCM source is still active (even if queue is temporarily empty).
+        
+        Args:
+            grace_sec: Grace period in seconds (default: 5.0)
+            
+        Returns:
+            True if PCM was received within grace period, False otherwise
+        """
+        with self._lock:
+            if not self._writer_connected:
+                return False
+            
+            elapsed = time.monotonic() - self.last_frame_ts
+            return elapsed < grace_sec
+    
+    def _watchdog_loop(self) -> None:
+        """
+        Watchdog thread: monitors for idle timeout and resets router if needed.
+        
+        If no frames are received for ROUTER_IDLE_TIMEOUT_SEC, the router is marked
+        as dead, the writer socket is closed, and the queue is cleared. This allows
+        Tower to run indefinitely with tone fallback and automatically resume PCM
+        when Station reconnects.
+        """
+        logger.debug("AudioInputRouter watchdog thread started")
+        
+        timeout_sec = self.config.router_idle_timeout_sec
+        
+        try:
+            while not self._shutdown:
+                time.sleep(5.0)  # Check every 5 seconds
+                
+                if self._shutdown:
+                    break
+                
+                with self._lock:
+                    # Only check if writer is connected
+                    if not self._writer_connected:
+                        continue
+                    
+                    # Check if idle timeout exceeded
+                    now = time.monotonic()
+                    idle_time = now - self.last_frame_ts
+                    
+                    if idle_time > timeout_sec:
+                        # No PCM for timeout window - mark router as dead
+                        logger.warning(
+                            f"No PCM for {idle_time:.1f}s (timeout: {timeout_sec}s) — "
+                            "dropping writer, waiting for reconnect"
+                        )
+                        
+                        # Close active writer socket if any
+                        if self._writer_socket:
+                            try:
+                                self._writer_socket.close()
+                            except Exception:
+                                pass
+                            self._writer_socket = None
+                        
+                        # Clear queue completely
+                        while not self._queue.empty():
+                            try:
+                                self._queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        
+                        # Mark router as dead
+                        self.router_dead = True
+                        self._writer_connected = False
+                        self._read_buffer = bytearray()
+                        
+                        # Continue listening for new writer without restarting Tower
+                        logger.info("Router reset complete, waiting for Station reconnect")
+        
+        except Exception as e:
+            logger.error(f"Watchdog thread error: {e}")
+        finally:
+            logger.debug("AudioInputRouter watchdog thread stopped")
+    
     def get_next_frame(self, timeout_ms: float = 50.0) -> Optional[bytes]:
         """
         Get next frame from queue.
@@ -345,8 +456,13 @@ class AudioInputRouter:
             timeout_ms: Timeout in milliseconds
         
         Returns:
-            bytes: Complete frame (4096 bytes) or None if timeout/no writer
+            bytes: Complete frame (4096 bytes) or None if timeout/no writer/router_dead
         """
+        # Check if router is dead - if so, always return None to force fallback
+        with self._lock:
+            if self.router_dead:
+                return None
+        
         # Check if writer is connected
         with self._lock:
             if not self._writer_connected:
@@ -356,6 +472,10 @@ class AudioInputRouter:
         try:
             timeout_seconds = timeout_ms / 1000.0
             frame = self._queue.get(timeout=timeout_seconds)
+            # Update timestamp when frame is retrieved
+            if frame:
+                self.last_frame_ts = time.monotonic()
+                self.router_dead = False
             return frame
         except queue.Empty:
             # Timeout - no frame available

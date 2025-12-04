@@ -82,6 +82,8 @@ class TowerConfig:
     
     # Phase 3: Unix socket configuration
     socket_path: str = "/var/run/retrowaves/pcm.sock"
+    router_idle_timeout_sec: int = 30  # Timeout before marking router as dead
+    pcm_grace_sec: int = 5  # Grace period before switching to tone fallback
     
     # Phase 4: Slow-client policy
     client_timeout_ms: int = 250
@@ -156,6 +158,17 @@ class TowerConfig:
         
         # Phase 3: Unix socket configuration
         socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
+        router_idle_timeout_sec_str = os.getenv("TOWER_ROUTER_IDLE_TIMEOUT_SEC", "30")
+        try:
+            router_idle_timeout_sec = int(router_idle_timeout_sec_str)
+        except ValueError:
+            raise ValueError(f"Invalid TOWER_ROUTER_IDLE_TIMEOUT_SEC: {router_idle_timeout_sec_str} (must be an integer)")
+        
+        pcm_grace_sec_str = os.getenv("TOWER_PCM_GRACE_SEC", "5")
+        try:
+            pcm_grace_sec = int(pcm_grace_sec_str)
+        except ValueError:
+            raise ValueError(f"Invalid TOWER_PCM_GRACE_SEC: {pcm_grace_sec_str} (must be an integer)")
         
         # Phase 4: Slow-client policy
         client_timeout_ms_str = os.getenv("TOWER_CLIENT_TIMEOUT_MS", "250")
@@ -208,6 +221,8 @@ class TowerConfig:
             default_source=default_source,
             default_file_path=default_file_path,
             socket_path=socket_path,
+            router_idle_timeout_sec=router_idle_timeout_sec,
+            pcm_grace_sec=pcm_grace_sec,
             client_timeout_ms=client_timeout_ms,
             client_buffer_bytes=client_buffer_bytes,
             encoder_backoff_ms=encoder_backoff_ms,
