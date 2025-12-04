@@ -80,6 +80,22 @@ Mode switching is internal to Tower and does not disconnect clients.
 
 If live PCM is unavailable, Tower immediately uses fallback without blocking.
 
+### 2.6 Golden Rules of Tower
+
+These are the immutable invariants that govern all Tower behavior:
+
+1. **Tower never stops streaming audio.** Audio output must be continuous regardless of input, timing, or encoder health. Clients always receive valid MP3 data (real or silence).
+
+2. **Client writes never block Tower.** Slow or blocked clients are automatically dropped. Tower maintains real-time performance at all times.
+
+3. **Encoder may die – stream must not.** Encoder failures trigger automatic restarts, but output continues from buffer, then silence, then real audio. The stream never stops.
+
+4. **Output loop never waits on input.** The tick-driven output loop operates independently from the PCM input pump. Two independent clocks ensure no coupling.
+
+5. **Frame-based semantics end-to-end.** Everything inside the encoder subsystem operates on complete MP3 frames only – no partials. Frame boundaries are preserved throughout the pipeline.
+
+These rules ensure Tower maintains broadcast-grade reliability and performance.
+
 ---
 
 ## 3. Service Boundaries & Responsibilities
@@ -143,12 +159,23 @@ Tower exposes an internal interface (`AudioInputRouter`) that Station can push P
 - 2 channels (stereo)
 - `frame_size = 1024` samples (~21.3 ms per frame at 48 kHz)
 
-**Frame Timing:**
+**Live PCM Delivery Model:**
 
-- Station should write frames at real-time pace (approximately one frame every ~21.3 ms)
-- Tower consumes frames at the same rate to maintain continuous audio
-- If Station writes faster than Tower consumes, the buffer may fill (see buffer management in Section 7.1)
-- If Station falls behind or stops writing, Tower must detect this and use fallback
+Station (producer) → unpaced writes → Unix Socket → Tower Ring Buffer → paced consumption → Encoder
+
+| Component | Timing Responsibility |
+|-----------|----------------------|
+| Station | no timing — decode & write frames immediately as available |
+| Tower | sole metronome — pulls one 1024-sample frame every 21.333ms |
+| Fallback | provides frames only when Tower pulls and none are available |
+
+**Important Principles:**
+
+- **Tower is the only clock in the system.** Station writes frames into the socket with no timing, pushing decoded PCM bursts.
+- **Station pushes fast; Tower pulls steady.** Tower is the rate limiter, consuming frames at exactly 48kHz → 1024-sample frames → 21.333ms.
+- **Buffer must be bounded (200–500ms max recommended).** A ring buffer absorbs burstiness; underflow triggers fallback tone.
+- **Buffer never grows unbounded — Tower consumption rate stabilizes the system.** Overflow drops newest or oldest depending on strategy.
+- **Underflow triggers silence → tone after grace window.** If Station falls behind or stops writing, Tower must detect this and use fallback.
 
 **Format Validation:**
 
@@ -187,16 +214,24 @@ Tower selects the fallback source using the following priority order (highest to
 
 ### 4.3 Input Selection Logic
 
-At each audio tick (~21.3 ms intervals):
+At each audio tick (exactly 21.333 ms intervals, driven by Tower's metronome):
 
-1. Attempt to pull a live PCM frame from the Station input buffer
-2. If available → mark as live frame
-3. If not available within **50 ms timeout** → generate or fetch fallback frame
-   - 50 ms ≈ 2.3 frame periods, fast enough for graceful switching but slow enough to absorb jitter
-   - Prevents false positives from Python sleep timing variations
+1. Tower pulls one frame from the Station input buffer (non-blocking, short timeout ~5ms)
+2. If available → use live frame
+3. If not available (queue empty or timeout) → check grace period:
+   - **5 second grace period before fallback**: When Station switches between MP3 tracks, there may be brief gaps in PCM data. Tower must wait 5 seconds (configurable via `TOWER_PCM_GRACE_SEC`) before switching to fallback tone. During the grace period, Tower uses silence frames to maintain continuous MP3 stream. This prevents audible tone interruptions during track transitions.
+   - If within grace period (default 5 seconds): use silence frame
+   - If grace period expired: generate or fetch fallback frame (tone/file)
 4. Send the chosen PCM to the encoder
 
-This logic ensures there is never a gap in the PCM stream feeding the encoder.
+**Key Points:**
+
+- Tower's consumption rate (21.333ms per frame) is the sole timing reference
+- Station writes are unpaced bursts; Tower's steady pull rate stabilizes the buffer
+- Grace period prevents tone blips during short gaps between tracks
+- This logic ensures there is never a gap in the PCM stream feeding the encoder
+
+This architecture aligns with broadcast automation, SDR, VoIP jitter buffers, ALSA/JACK, Icecast source clients, radio encoders, and MPEG TS playout systems.
 
 ---
 
@@ -235,21 +270,163 @@ Tower writes PCM to FFmpeg stdin and reads encoded MP3 chunks from FFmpeg stdout
 - If FFmpeg fails to start, Tower should log the error and continue with fallback audio
 - If FFmpeg writes invalid data or crashes, Tower should detect and restart the encoder
 
-### 5.2 Encoder Lifecycle
+### 5.2 Broadcast-Grade Encoding Architecture
 
-- FFmpeg is started when Tower starts
-- If FFmpeg exits unexpectedly:
-  - Tower detects EOF/poll on stdout
-  - Tower attempts a controlled restart of the encoder with exponential backoff
-  - **Max restart attempts:** 5
-  - **Backoff strategy:** Exponential starting at 1s, doubling each attempt, capped at 10s
-    - Attempt 1: 1s delay
-    - Attempt 2: 2s delay
-    - Attempt 3: 4s delay
-    - Attempt 4: 8s delay
-    - Attempt 5: 10s delay (capped)
-  - After 5 failures: Tower enters silence-only mode but keeps HTTP server running
-- Tower never blocks on encoder startup; Tower stays up no matter what
+Tower implements a production-quality encoding subsystem designed to eliminate silent failures, ensure frame-aligned MP3 output, and provide jitter-tolerant streaming with smooth encoder restarts.
+
+**Core Invariant:** MP3 output must be smooth and continuous regardless of input, timing, or encoder health.
+
+#### 5.2.1 Dual-Buffer Architecture
+
+The encoding subsystem uses a **dual-buffer architecture** with independent input and output queues, separated by the FFmpeg encoder process:
+
+- **PCM Input Buffer**: Thread-safe ring buffer for PCM frames (~50-100 frames, ~1-2 seconds)
+  - Pumped by AudioPump at real-time pace (source clock)
+  - Non-blocking writes (drops newest if full)
+  - Non-blocking reads (returns None if empty)
+
+- **MP3 Output Buffer**: Frame-based ring buffer for MP3 frames (~400 frames, ~5 seconds depth)
+  - Consumed by tick-driven broadcast loop (consumer clock)
+  - Stores complete MP3 frames only (no partials)
+  - Non-blocking writes (drops oldest if full)
+  - Non-blocking reads (returns None if empty)
+
+**Why Split Buffers?**
+- Input timing (PCM pump) operates independently from output timing (HTTP broadcast)
+- No coupling between input and output clocks
+- Prevents jitter and timing dependencies
+
+#### 5.2.2 Frame-Aligned MP3 Output
+
+**Problem:** Arbitrary byte accumulation (e.g., `read(8192)`) can split MP3 frames at non-frame boundaries, causing audio warble/distortion and decoder sync issues.
+
+**Solution:** `MP3Packetizer` ensures complete MP3 frames only:
+- Detects sync word: `0xFF + (next_byte & 0xE0 == 0xE0)`
+- Parses first frame header to compute fixed frame size (CBR assumption)
+- Yields only complete frames (fixed-size after first header)
+- Frame-based buffer ensures no partials in pipeline
+
+**Frame-Based Semantics:**
+- Everything inside encoder subsystem operates on complete MP3 frames only
+- Frame boundaries preserved end-to-end
+- Multiple frames can be joined only at socket edge (when writing to clients)
+
+#### 5.2.3 Tick-Driven Output Pacing
+
+**Problem:** "Read as fast as possible" causes CPU spinning, inconsistent output rate, buffer oscillation, and poor jitter tolerance.
+
+**Solution:** Tick-driven loop with fixed interval (15ms default, ~66 ticks/second):
+- Consistent output rate (not bursty)
+- Better jitter tolerance (smooths network/system delays)
+- Lower CPU usage (no busy loops)
+- Predictable behavior
+
+**Output Loop:**
+```python
+# Tick-driven broadcast loop
+tick_interval_ms = 15  # ~66 frames/second
+while not shutdown:
+    frame = encoder_manager.get_frame()  # Returns frame or silence_frame
+    broadcast(frame)
+    sleep(tick_interval_ms)  # Fixed interval, not "as fast as possible"
+```
+
+#### 5.2.4 Encoder Lifecycle & Restart Flow
+
+**Stall Detection:**
+- Monitors encoder output for stalls (0 bytes for N milliseconds)
+- Default threshold: 2000ms (configurable via `TOWER_ENCODER_STALL_THRESHOLD_MS`)
+- Triggers automatic restart when stall detected
+
+**Restart Flow (Smooth Transition):**
+
+1. **Detection**: Monitor thread or drain thread detects failure/stall
+2. **State Transition**: `RUNNING` → `RESTARTING`
+3. **Continue Streaming Buffer**: Keep streaming MP3 buffer content until empty
+   - Output loop is **completely oblivious** to restart state
+   - Buffer acts as bridge between old and new encoder
+4. **Silence Filler**: When buffer empties, `get_frame()` returns silence frame
+5. **Async Restart**: Restart thread waits for backoff delay, then starts new encoder
+6. **Buffer Refill**: New MP3 data fills ring buffer (via MP3Packetizer)
+7. **Smooth Blend**: When buffer refills, `get_frame()` automatically returns real frames
+
+**Key Points:**
+- **Buffer is NOT cleared** during restart (only on full failure after max restarts)
+- Restart never blocks output path
+- Playback continues during restart (from buffer, then silence, then real)
+- No instant flip, no jitter loop, no state checks in output path
+
+**Backoff Strategy:**
+- **Max restart attempts:** 5
+- **Backoff schedule:** [1000, 2000, 4000, 8000, 10000]ms (exponential, capped at 10s)
+- After 5 failures: Tower enters FAILED state but keeps HTTP server running
+
+#### 5.2.5 EncoderManager Components
+
+**EncoderManager** (`tower/encoder_manager.py`):
+- Manages FFmpeg encoder process lifecycle
+- Stall detection and async restart
+- State management: RUNNING, RESTARTING, FAILED, STOPPED
+- Key methods:
+  - `write_pcm(data)`: Fire-and-forget PCM writes (non-blocking, independent clock)
+  - `get_frame()`: Returns one complete MP3 frame or silence frame (tick-driven)
+
+**EncoderOutputDrainThread**:
+- Dedicated thread that continuously drains encoder stdout
+- Reads MP3 bytes from FFmpeg stdout as fast as possible
+- Feeds complete MP3 frames to ring buffer via MP3Packetizer
+- Detects stalls and triggers restart
+- Uses `select()` with timeout for efficient polling
+
+**MP3Packetizer** (`tower/audio/mp3_packetizer.py`):
+- Accumulates raw MP3 bytes and yields complete frames
+- Simplified for fixed CBR profile (MPEG-1 Layer III, 128kbps)
+- Computes frame size from first header, then treats all frames as fixed-size
+
+**FrameRingBuffer** (`tower/audio/ring_buffer.py`):
+- Frame-based ring buffer (not byte-based)
+- Capacity: ~400 frames (5-second depth)
+- Methods: `push_frame()`, `pop_frame()`, `stats()`
+
+#### 5.2.6 Configuration
+
+```bash
+# Encoder stall detection threshold (milliseconds)
+TOWER_ENCODER_STALL_THRESHOLD_MS=2000
+
+# Encoder restart backoff schedule (comma-separated milliseconds)
+TOWER_ENCODER_BACKOFF_MS=1000,2000,4000,8000,10000
+
+# Maximum encoder restart attempts
+TOWER_ENCODER_MAX_RESTARTS=5
+
+# MP3 output buffer capacity (frames) - 5 seconds @ ~66 fps = 330 frames
+# Recommended: 400 frames (with headroom) for jitter tolerance
+TOWER_MP3_BUFFER_CAPACITY_FRAMES=400
+
+# PCM input buffer size (frames) - ~1-2 seconds
+TOWER_PCM_BUFFER_SIZE=100
+
+# Tick-driven output interval (milliseconds)
+TOWER_OUTPUT_TICK_INTERVAL_MS=15  # ~66 ticks/second
+```
+
+**Default Values:**
+- Stall Threshold: 2000ms
+- Backoff Schedule: [1000, 2000, 4000, 8000, 10000]ms
+- Max Restarts: 5
+- MP3 Buffer Capacity: 400 frames (~5 seconds @ ~66 fps)
+- PCM Buffer Size: 100 frames (~2 seconds)
+- Output Tick Interval: 15ms (~66 ticks/second)
+
+**Performance Characteristics:**
+- Latency: ~5 seconds (MP3 buffer depth)
+- CPU Usage: Minimal (select-based I/O, tick-driven pacing, no busy loops)
+- Memory Usage: ~150KB-1.7MB (MP3 buffer, depends on frame size) + ~100KB (PCM buffer)
+- Restart Time: ~1-10 seconds (depending on backoff schedule)
+- Output Rate: ~66 frames/second (15ms tick interval)
+
+For detailed troubleshooting, design rationale, and verification procedures, see the full encoding architecture documentation in `tower/docs/BROADCAST_ENCODER_ARCHITECTURE.md`.
 
 ### 5.3 Encoded Stream Characteristics
 
@@ -338,25 +515,28 @@ Connection: keep-alive
 ### 7.1 AudioInputRouter
 
 - Receives PCM frames from Station via Unix domain socket (`/var/run/retrowaves/pcm.sock`)
-- Buffers frames in a thread-safe queue with bounded size
-- **Queue size:** 5 frames (~100 ms of audio)
-  - Low latency is prioritized over buffering
-  - Tower is real-time, not a buffering system
-  - We want "now" audio, not "2 seconds ago" audio
+- Buffers frames in a thread-safe bounded queue (ring buffer)
+- **Queue size:** 10 frames (~213 ms of audio at 48kHz)
+  - Bounded size prevents unbounded growth
+  - Tower's steady consumption rate (21.333ms per frame) stabilizes the buffer
+  - Absorbs burstiness from Station's unpaced writes
 - Provides a `get_next_frame(timeout)` method to the Tower audio pump
+- Tower pulls frames at exactly 21.333ms intervals (sole metronome)
 - If no frames arrive within timeout, Tower assumes Station is offline or paused and uses fallback
 
 **Buffer Overflow Handling:**
 
 - If the queue is full when Station tries to write:
   - **Strategy:** Drop incoming frame (newest frame is discarded)
-  - This preserves real-time feel and keeps Tower synced to real-time
+  - Station writes are unpaced bursts; Tower's steady pull rate prevents sustained overflow
   - Station stays non-blocking; Tower maintains continuous audio flow
+  - Buffer never grows unbounded — Tower consumption rate stabilizes the system
 
 **Buffer Underflow Handling:**
 
 - If the queue is empty when Tower tries to read:
   - Tower uses fallback frame (already specified in 4.3)
+  - Underflow triggers silence → tone after grace window (default 5 seconds)
 
 **Partial Frame Handling:**
 
@@ -396,35 +576,54 @@ This priority order ensures Tower always has a valid fallback source, with grace
 
 ### 7.3 AudioPump
 
-Runs in its own thread.
+Runs in its own thread. **Tower's sole metronome — the only clock in the system.**
 
-**Loop:**
+**Loop (exactly 21.333ms per iteration, using absolute clock timing):**
 
-1. Pull live PCM from `AudioInputRouter` with timeout
-2. If none, get fallback frame from `FallbackGenerator`
+1. Pull live PCM from `AudioInputRouter` with short timeout (~5ms, non-blocking)
+2. If none available:
+   - Check grace period: if within grace window, use silence frame
+   - If grace period expired, get fallback frame from `FallbackGenerator`
 3. Write PCM bytes into FFmpeg stdin
 4. Handle FFmpeg stdin errors (broken pipe, etc.) and trigger encoder restart if needed
+5. **Sleep for remaining time in 21.333ms period** (absolute clock timing prevents drift)
+
+**Timing Model:**
+
+- Uses absolute clock timing (`next_frame_time += FRAME_DURATION`) to prevent cumulative drift
+- If loop falls behind schedule, resyncs clock instead of accumulating delay
+- Tower is the rate limiter: consumes frames at exactly 48kHz → 1024-sample frames → 21.333ms
+- Station pushes fast (unpaced bursts); Tower pulls steady (metronome)
 
 **Thread Safety:**
 
 - Must coordinate with `AudioInputRouter` (thread-safe queue)
 - Must handle FFmpeg process lifecycle (process may be restarted by another thread)
 
-### 7.4 EncoderReader
+### 7.4 Encoder Output & Broadcast Loop
 
-Runs in its own thread.
+The encoder output path is implemented as a tick-driven loop (see Section 5.2.3 for details).
 
-**Loop:**
+**Architecture:**
 
-1. Read encoded MP3 chunks from FFmpeg stdout
-2. Pass chunks to `HTTPConnectionManager.broadcast()`
-3. Handle FFmpeg stdout EOF/errors and trigger encoder restart if needed
+1. **EncoderOutputDrainThread**: Dedicated thread drains FFmpeg stdout, packetizes MP3 frames via MP3Packetizer, and pushes complete frames to MP3 ring buffer
+2. **Tick-Driven Broadcast Loop**: Fixed-interval loop (15ms default) that:
+   - Calls `encoder_manager.get_frame()` to get one complete MP3 frame or silence frame
+   - Broadcasts frame to all connected clients via `HTTPConnectionManager.broadcast()`
+   - Sleeps for fixed interval (not "as fast as possible")
 
-**Chunk Size:**
+**Key Properties:**
 
-- **Read buffer size:** 8192 bytes (8 KB)
-- MP3 frames are small, but larger chunks reduce network overhead
-- 8 KB provides good balance between latency and efficiency
+- **Frame-Based**: Operates on complete MP3 frames only (no partials)
+- **Non-Blocking**: Never blocks on buffer reads or client writes
+- **Jitter Tolerant**: Fixed tick interval smooths network/system jitter
+- **Oblivious to Restart State**: Output loop doesn't know about encoder restarts; `get_frame()` handles all state internally
+
+**Integration:**
+
+- Replaces the old "read as fast as possible" pattern
+- Ensures consistent output rate and better jitter tolerance
+- See Section 5.2 for complete architecture details
 
 ### 7.5 HTTP Server Thread
 
@@ -475,8 +674,10 @@ When Station starts feeding PCM:
 **Transition Behavior:**
 
 - Transition should be seamless (no audio glitches)
-- If Station provides frames faster than expected, buffer may accumulate
-- If Station provides frames slower than expected, Tower may interleave fallback frames
+- Station writes frames in unpaced bursts; Tower's steady pull rate (21.333ms) absorbs burstiness
+- Buffer (ring buffer, bounded) absorbs temporary bursts without unbounded growth
+- If Station provides frames slower than expected, Tower uses grace period (silence) then fallback frames
+- Tower's consumption rate stabilizes the system regardless of Station's write pattern
 
 ### 8.3 on_live_audio_lost
 
@@ -528,10 +729,13 @@ TOWER_SILENCE_MP3_PATH=/path/to/silence.wav     # optional: used as fallback sou
 TOWER_SOCKET_PATH=/var/run/retrowaves/pcm.sock
 TOWER_BUFFER_SIZE=5        # frames in AudioInputRouter queue (~100 ms)
 TOWER_FRAME_TIMEOUT_MS=50  # timeout for frame retrieval
-TOWER_ENCODER_RESTART_MAX=5  # max encoder restart attempts
-TOWER_ENCODER_RESTART_BACKOFF_MS=1000  # initial backoff delay (exponential, max 10s)
+TOWER_ENCODER_STALL_THRESHOLD_MS=2000  # encoder stall detection threshold
+TOWER_ENCODER_BACKOFF_MS=1000,2000,4000,8000,10000  # encoder restart backoff schedule
+TOWER_ENCODER_MAX_RESTARTS=5  # max encoder restart attempts
+TOWER_MP3_BUFFER_CAPACITY_FRAMES=400  # MP3 output buffer capacity (frames, ~5 seconds)
+TOWER_PCM_BUFFER_SIZE=100  # PCM input buffer size (frames, ~2 seconds)
+TOWER_OUTPUT_TICK_INTERVAL_MS=15  # tick-driven output interval (~66 ticks/second)
 TOWER_CLIENT_TIMEOUT_MS=250  # timeout before dropping slow clients
-TOWER_READ_CHUNK_SIZE=8192  # bytes for reading MP3 from encoder
 TOWER_SHUTDOWN_TIMEOUT=5    # seconds for graceful shutdown
 ```
 
@@ -557,8 +761,10 @@ Station configuration must include:
 - **Connection behavior:**
   - Station attempts connection at startup
   - If connection fails, Station retries every 1 second
-  - Once connected, Station writes frames at real-time pace (~21.3 ms per frame)
+  - Once connected, Station writes frames with **no timing** (unpaced, immediate writes as decoded)
   - Station writes are non-blocking; if buffer is full, frames may be dropped
+  - **Tower is the rate limiter:** Tower pulls frames at exactly 21.333ms intervals (sole metronome)
+  - Tower's steady consumption rate stabilizes the buffer and prevents unbounded growth
 
 ---
 
