@@ -263,16 +263,24 @@ class TowerService:
                             elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
                                 # PCM available within grace period - try to get frame
                                 frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                                # If None but still within grace period, use silence instead of tone
+                                if frame is None:
+                                    # Check again if still within grace period (may have expired during get_next_frame)
+                                    if self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
+                                        # Within grace period but no frame available - use silence
+                                        import numpy as np
+                                        frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
+                                    # else: grace period expired, frame stays None to trigger tone fallback
                             else:
                                 # Grace period expired - no PCM available
                                 frame = None
                         
-                        # Only fallback when no PCM AND grace expired
+                        # Only fallback to tone when no PCM AND grace expired
                         if frame is None:
                             # Get current source (thread-safe, may change between calls)
                             source = self.source_manager.get_current_source()
                             
-                            # Generate frame from current source
+                            # Generate frame from current source (tone fallback)
                             frame = source.generate_frame()
                         
                         # Validate frame size
@@ -308,16 +316,24 @@ class TowerService:
                         elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
                             # PCM available within grace period - try to get frame
                             frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
+                            # If None but still within grace period, use silence instead of tone
+                            if frame is None:
+                                # Check again if still within grace period (may have expired during get_next_frame)
+                                if self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
+                                    # Within grace period but no frame available - use silence
+                                    import numpy as np
+                                    frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
+                                # else: grace period expired, frame stays None to trigger tone fallback
                         else:
                             # Grace period expired - no PCM available
                             frame = None
                     
-                    # Only fallback when no PCM AND grace expired
+                    # Only fallback to tone when no PCM AND grace expired
                     if frame is None:
                         # Get current source (thread-safe, may change between calls)
                         source = self.source_manager.get_current_source()
                         
-                        # Generate frame from current source
+                        # Generate frame from current source (tone fallback)
                         frame = source.generate_frame()
                     
                     # Validate frame size (fallback to silence if invalid)
