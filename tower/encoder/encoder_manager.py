@@ -316,15 +316,49 @@ class EncoderManager:
         
         # PCM fallback injection per contract [M19]-[M24]
         # Grace period configuration (default 1500ms per [M21])
+        # NOTE: Fallback is now driven by AudioPump ticks, not a separate thread per [M25]
         self._grace_period_ms = int(os.getenv("TOWER_PCM_GRACE_PERIOD_MS", "1500"))
         self._fallback_use_tone = os.getenv("TOWER_PCM_FALLBACK_TONE", "0") not in ("0", "false", "False", "FALSE")
-        self._fallback_thread: Optional[threading.Thread] = None
-        self._fallback_running = False
         self._fallback_grace_timer_start: Optional[float] = None
         # Silence frame for PCM fallback (4608 bytes: 1152 samples × 2 channels × 2 bytes)
         self._pcm_silence_frame = b'\x00' * 4608
         # Fallback generator for tone (lazy import to avoid circular dependency)
         self._fallback_generator: Optional[object] = None
+        
+        # Per contract [M19F]: Internal fallback injection flag for test-only control
+        # MUST default to False on startup per [M19F]
+        # MUST remain False in OFFLINE_TEST_MODE [O6] per [M19J]
+        # This is purely a state flag (e.g., "we are routing via fallback"), not a timing indicator
+        self._fallback_running = False
+        
+        # Per contract [M25]: _fallback_thread MUST NOT exist on EncoderManager.
+        # Fallback is driven purely by AudioPump ticks, not by any background thread.
+        # AudioPump remains the sole metronome ([A1], [A4], [M25], [BG2]).
+        # Note: This attribute is intentionally not created to enforce the single-metronome design.
+        
+        # PCM detection per contract [BG8], [BG11]
+        # PCM validity threshold: continuous run of N frames (default 15 frames)
+        self._pcm_validity_threshold_frames = int(os.getenv("TOWER_PCM_VALIDITY_THRESHOLD_FRAMES", "15"))
+        self._pcm_consecutive_frames = 0  # Track consecutive PCM frames
+        self._pcm_last_frame_time: Optional[float] = None  # Track last PCM frame arrival
+        
+        # PCM loss detection per contract [BG11]
+        # Loss window: time without PCM before treating as loss (default 500ms)
+        self._pcm_loss_window_ms = int(os.getenv("TOWER_PCM_LOSS_WINDOW_MS", "500"))
+        self._pcm_loss_window_sec = self._pcm_loss_window_ms / 1000.0
+        
+        # Audio state tracking per contract [BG3], [BG20]
+        # Track current audio state: SILENCE_GRACE, FALLBACK_TONE, PROGRAM, DEGRADED
+        self._audio_state = "SILENCE_GRACE"  # Initial state
+        self._audio_state_lock = threading.Lock()
+        
+        # Self-healing recovery per contract [BG22]
+        # Recovery retry interval (default 10 minutes)
+        self._recovery_retry_minutes = int(os.getenv("TOWER_RECOVERY_RETRY_MINUTES", "10"))
+        self._recovery_retry_sec = self._recovery_retry_minutes * 60
+        self._recovery_thread: Optional[threading.Thread] = None
+        self._recovery_running = False
+        self._recovery_retries = 0
         
         # FFmpeg Supervisor (delegates all process lifecycle management)
         self._supervisor: Optional[FFmpegSupervisor] = None
@@ -389,9 +423,10 @@ class EncoderManager:
         with self._state_lock:
             self._state = EncoderState.from_supervisor_state(supervisor_state)
         
-        # Per contract [M19]-[M24]: Start fallback injection if in BOOTING, RESTART_RECOVERY, or DEGRADED
+        # Per contract [M19]-[M24]: Initialize fallback grace period if in BOOTING, RESTART_RECOVERY, or DEGRADED
+        # NOTE: Fallback frames are now provided by AudioPump on every tick, not a separate thread per [M25]
         if supervisor_state in (SupervisorState.BOOTING, SupervisorState.RESTARTING, SupervisorState.FAILED):
-            self._start_fallback_injection()
+            self._init_fallback_grace_period()
         
         logger.info("EncoderManager started")
     
@@ -401,26 +436,55 @@ class EncoderManager:
             old_state = self._state
             self._state = EncoderState.from_supervisor_state(new_state)
         
-        # Per contract [M19]-[M24]: Manage fallback injection based on state
-        # Start fallback injection during BOOTING, RESTART_RECOVERY, DEGRADED
-        # Stop fallback injection when transitioning to RUNNING
+        # Per contract [M19]-[M24]: Manage fallback grace period based on state
+        # Initialize grace period during BOOTING, RESTART_RECOVERY, DEGRADED
+        # NOTE: Fallback frames are now provided by AudioPump on every tick, not a separate thread per [M25]
+        # Per contract [M19L]: After supervisor restart, fallback MUST re-activate automatically
+        # until valid PCM threshold is reached per [BG8], [BG9]. This ensures continuous PCM delivery per [BG17].
         if new_state in (SupervisorState.BOOTING, SupervisorState.RESTARTING, SupervisorState.FAILED):
-            self._start_fallback_injection()
+            self._init_fallback_grace_period()
         elif new_state == SupervisorState.RUNNING:
-            self._stop_fallback_injection()
+            # Per contract [M19L]: After restart, fallback MUST re-activate automatically until PCM threshold is met
+            # Whenever supervisor transitions back to RUNNING (post-restart), EncoderManager MUST enable
+            # fallback controller state and ensure _fallback_running is True until PROGRAM conditions are satisfied
+            # Reset PCM tracking to ensure threshold must be met again
+            self._pcm_consecutive_frames = 0
+            self._pcm_last_frame_time = None
+            
+            # Re-initialize fallback grace period to ensure fallback remains active
+            # This ensures continuous PCM delivery per [BG17] and prevents gaps after restart completion
+            # There MUST be no window where FFmpeg is running but receiving no PCM from either program or fallback
+            self._init_fallback_grace_period()
+        
+        # Per contract [BG20]: Log mode transitions
+        self._log_audio_state_transition(new_state, old_state)
+        
+        # Per contract [BG22]: Start recovery thread if in FAILED state
+        if new_state == SupervisorState.FAILED:
+            self._start_recovery_thread()
+        else:
+            self._stop_recovery_thread()
     
     def stop(self, timeout: float = 5.0) -> None:
         """
         Stop encoder process via supervisor.
+        
+        Per contract [M30]: EncoderManager Clean Shutdown Behavior
+        1. Stops the FFmpegSupervisor cleanly
+        2. Prevents further calls to write_pcm/write_fallback
+        3. Allows next_frame() calls to no-op safely if invoked post-stop
+        4. Releases threads (drain thread, recovery thread)
+        5. Ensures no restart loops run after shutdown
         
         Args:
             timeout: Maximum time to wait for cleanup
         """
         logger.info("Stopping EncoderManager...")
         
+        # Per contract [M30]: Set shutdown flag to prevent further operations
         self._shutdown = True
         
-        # Stop supervisor (handles all cleanup)
+        # Per contract [M30] #1: Stop supervisor (handles all cleanup)
         if self._supervisor is not None:
             self._supervisor.stop(timeout=timeout)
             self._supervisor = None
@@ -428,8 +492,15 @@ class EncoderManager:
         with self._state_lock:
             self._state = EncoderState.STOPPED
         
-        # Stop fallback injection thread per contract [M19]-[M24]
-        self._stop_fallback_injection()
+        # Clear fallback grace period state
+        self._fallback_grace_timer_start = None
+        
+        # Per contract [M30] #4: Stop recovery thread per contract [BG22]
+        self._stop_recovery_thread()
+        
+        # Per contract [M30] #5: Ensure no restart loops run after shutdown
+        # Supervisor.stop() already disables restart logic, but we clear references
+        # to ensure no lingering restart attempts
         
         # Clear legacy references
         self._process = None
@@ -442,46 +513,359 @@ class EncoderManager:
         
         logger.info("EncoderManager stopped")
     
+    def _get_operational_mode(self) -> str:
+        """
+        Determine current operational mode from supervisor state per contract [M12], [M14].
+        
+        Returns:
+            str: Operational mode name ("COLD_START", "BOOTING", "LIVE_INPUT", "RESTART_RECOVERY", "DEGRADED", "OFFLINE_TEST_MODE")
+        """
+        # Per contract [M17]: OFFLINE_TEST_MODE [O6] bypasses supervisor
+        if not self._encoder_enabled:
+            return "OFFLINE_TEST_MODE"
+        
+        if self._supervisor is None:
+            # COLD_START [O1] - no encoder process yet
+            return "COLD_START"
+        
+        supervisor_state = self._supervisor.get_state()
+        
+        # Per contract [M12], EncoderManager state tracks SupervisorState but resolves externally as Operational Modes.
+        # The mapping is conditional and takes into account both encoder liveness and PCM admission state:
+        # - STOPPED/STARTING → COLD_START [O1]
+        # - BOOTING → BOOTING [O2] until first MP3 frame is received
+        # - RUNNING → LIVE_INPUT [O3] only when:
+        #   - SupervisorState == RUNNING, AND
+        #   - PCM validity threshold has been satisfied per [M16A]/[BG8], AND
+        #   - the internal audio state machine is in PROGRAM (no active PCM loss window)
+        # - A non-PROGRAM audio state while SupervisorState == RUNNING MUST resolve to fallback-oriented operational mode (e.g. FALLBACK_ONLY [O4])
+        # - RESTARTING → RESTART_RECOVERY [O5]
+        # - FAILED → DEGRADED [O7]
+        # Note: This method currently returns LIVE_INPUT for RUNNING unconditionally; the conditional behavior
+        # (threshold and audio state checks) is enforced in write_pcm() and next_frame() routing logic per [M16A].
+        if supervisor_state in (SupervisorState.STOPPED, SupervisorState.STARTING):
+            return "COLD_START"
+        elif supervisor_state == SupervisorState.BOOTING:
+            return "BOOTING"
+        elif supervisor_state == SupervisorState.RUNNING:
+            return "LIVE_INPUT"
+        elif supervisor_state == SupervisorState.RESTARTING:
+            return "RESTART_RECOVERY"
+        elif supervisor_state == SupervisorState.FAILED:
+            return "DEGRADED"
+        else:
+            return "COLD_START"  # Fallback
+    
+    def _track_pcm_frame(self, frame: bytes) -> None:
+        """
+        Track PCM frame for validity threshold without forwarding per contract [M16A].
+        
+        This method is called when PCM is available but threshold is not yet met.
+        It tracks the frame for threshold calculation without forwarding to supervisor.
+        
+        Args:
+            frame: PCM frame bytes to track
+        """
+        operational_mode = self._get_operational_mode()
+        
+        if operational_mode == "LIVE_INPUT":
+            # Per contract [BG8]: Track PCM validity threshold (consecutive frames)
+            self._pcm_consecutive_frames += 1
+            self._pcm_last_frame_time = time.monotonic()
+            
+            # Note: We don't forward here - that's done via write_pcm() when threshold is met
+            # or via write_fallback() when threshold is not met
+    
+    def next_frame(self, pcm_buffer: FrameRingBuffer) -> None:
+        """
+        Process next frame from AudioPump tick per contract [M3A], [A3], [A7].
+        
+        This is the primary entry point for AudioPump. EncoderManager handles ALL routing
+        decisions internally:
+        - Checks PCM buffer for available frames
+        - Determines operational mode
+        - Applies PCM validity threshold per [M16A]
+        - Routes to write_pcm() or write_fallback() as appropriate
+        
+        Per contract [M3A]: AudioPump does not need to know about routing, thresholds, or
+        operational modes. All routing logic is unified in EncoderManager.
+        
+        Per contract [A8]: MUST be non-blocking and return immediately.
+        
+        Per contract [M30] #3: Allows next_frame() calls to no-op safely if invoked post-stop.
+        
+        Args:
+            pcm_buffer: FrameRingBuffer to check for program PCM frames
+        """
+        # Per contract [M30] #3: Allow next_frame() to no-op safely if invoked post-stop
+        if self._shutdown:
+            return  # Shutdown in progress or complete - no-op safely
+        
+        if not self._supervisor:
+            return  # No supervisor - nothing to do
+        
+        # Try to get program PCM from buffer
+        pcm_frame = pcm_buffer.pop_frame(timeout=0.005)
+        
+        # Determine operational mode
+        operational_mode = self._get_operational_mode()
+        
+        # Per contract [M19I]: During BOOTING / RESTART_RECOVERY / DEGRADED, always use fallback
+        if operational_mode in ("BOOTING", "RESTART_RECOVERY", "DEGRADED"):
+            # Always inject fallback during these modes
+            fallback_frame = self._get_fallback_frame()
+            self.write_fallback(fallback_frame)
+            return
+        
+        # Per contract [M16], [M16A]: Live program PCM MUST only be delivered during LIVE_INPUT [O3]
+        # and only after PCM validity threshold is met
+        if operational_mode == "LIVE_INPUT":
+            # Check if threshold is already met (before processing this frame)
+            threshold_met = self._pcm_consecutive_frames >= self._pcm_validity_threshold_frames
+            
+            if pcm_frame is not None:
+                # Program PCM available
+                
+                if threshold_met:
+                    # Threshold already met - route PCM directly (write_pcm will track and forward)
+                    # Per contract [M16A]: Once threshold is met, MUST forward real PCM every tick, not fallback
+                    # Per contract [G7]: Grace period resets when new PCM frame available (only after threshold is met)
+                    # Per contract [G8]: Reset is immediate (no delay or hysteresis)
+                    if self._fallback_grace_timer_start is not None:
+                        self._fallback_grace_timer_start = None
+                        logger.debug("Grace period reset per [G7] - PCM frame available, threshold met")
+                    
+                    # Telemetry: Log when PROGRAM threshold is reached (first time only)
+                    if self._pcm_consecutive_frames == self._pcm_validity_threshold_frames:
+                        logger.info(
+                            "ENCODER_MANAGER: PROGRAM threshold reached",
+                            extra={"threshold_frames": self._pcm_validity_threshold_frames, "pcm_frames_seen": self._pcm_consecutive_frames}
+                        )
+                    
+                    self._set_audio_state("PROGRAM", reason="PCM detected and validity threshold satisfied per [M16A]/[BG8]")
+                    
+                    # Telemetry: Log each frame routed to ffmpeg
+                    logger.debug(
+                        "ENCODER_MANAGER: routing PCM to ffmpeg",
+                        extra={"frame_index": self._pcm_consecutive_frames, "bytes": len(pcm_frame)}
+                    )
+                    self.write_pcm(pcm_frame)
+                else:
+                    # Threshold not met - we are still in SILENCE_GRACE / FALLBACK_TONE path
+                    # Per contract [M16A]: Before threshold is satisfied, system MUST remain in SILENCE_GRACE or FALLBACK_TONE
+                    # Per contract [M16A]: Fallback MUST remain active until threshold is met
+                    
+                    # Force audio state to fallback-oriented one if not already
+                    if self._audio_state not in ("SILENCE_GRACE", "FALLBACK_TONE"):
+                        self._set_audio_state(
+                            "SILENCE_GRACE",
+                            reason="PCM below validity threshold per [M16A]"
+                        )
+                    
+                    # Fallback MUST be active and grace timer MUST be running
+                    # Do NOT reset the grace timer on pre-threshold PCM
+                    if self._fallback_grace_timer_start is None:
+                        self._fallback_grace_timer_start = time.monotonic()
+                        logger.debug("Grace period started per [M16A] - pre-threshold PCM detected")
+                    
+                    # Track progress toward threshold
+                    # Per contract [M16A]: Track PCM validity threshold
+                    # Only increment if frame passes validity checks (if you have BG25 logic)
+                    # For now, increment for any non-None frame
+                    self._pcm_consecutive_frames += 1
+                    self._pcm_last_frame_time = time.monotonic()
+                    
+                    # Telemetry: Log if PCM is NOT routed because of threshold
+                    logger.debug(
+                        "ENCODER_MANAGER: withholding PCM, threshold not reached",
+                        extra={"pcm_frames_seen": self._pcm_consecutive_frames, "threshold": self._pcm_validity_threshold_frames}
+                    )
+                    
+                    # Still send fallback, not PCM
+                    fallback_frame = self._get_fallback_frame()
+                    self.write_fallback(fallback_frame)
+            else:
+                # PCM buffer empty
+                # Per contract [BG11]: If threshold is met (in PROGRAM state), check for PCM loss
+                # This detects when PCM stops arriving and triggers fallback transition per [BG12]
+                if threshold_met and self._pcm_last_frame_time is not None:
+                    # We're in PROGRAM state and have received PCM before - check for loss
+                    self._check_pcm_loss()
+                
+                # Check grace period per [G4], [G6]
+                # Per contract [G4]: Grace period starts when EncoderManager detects PCM buffer is empty
+                if self._fallback_grace_timer_start is None:
+                    self._fallback_grace_timer_start = time.monotonic()
+                    logger.debug("Grace period started per [G4] - PCM buffer empty")
+                
+                # Per contract [G6]: After grace period expires, route to fallback tone/file
+                # get_fallback_frame() will check grace expiry and return silence or tone accordingly
+                fallback_frame = self._get_fallback_frame()
+                self.write_fallback(fallback_frame)
+            return
+        
+        # COLD_START or OFFLINE_TEST_MODE: no routing needed (no supervisor)
+        # Do nothing - these modes don't write PCM
+    
+    def _should_use_fallback(self) -> bool:
+        """
+        Determine if AudioPump should use fallback routing per contract [M19H], [M19I], [M16A].
+        
+        NOTE: This method is deprecated in favor of next_frame(). It may still exist for
+        backwards compatibility or internal use, but AudioPump should use next_frame() instead.
+        
+        Per contract [M19I]: During BOOTING / RESTART_RECOVERY / FALLBACK_TONE / DEGRADED,
+        AudioPump MUST deliver fallback via write_fallback().
+        
+        Per contract [M16A]: Until PCM validity threshold is met, fallback MUST remain active
+        even in LIVE_INPUT mode.
+        
+        Returns:
+            bool: True if AudioPump should use write_fallback(), False if should use write_pcm()
+        """
+        operational_mode = self._get_operational_mode()
+        
+        # Per contract [M19I]: Always use fallback during these modes
+        if operational_mode in ("BOOTING", "RESTART_RECOVERY", "DEGRADED"):
+            return True
+        
+        # Per contract [M16A]: In LIVE_INPUT, use fallback until threshold is met
+        if operational_mode == "LIVE_INPUT":
+            # Check if PCM validity threshold is met
+            if self._pcm_consecutive_frames >= self._pcm_validity_threshold_frames:
+                return False  # Threshold met - use program PCM
+            else:
+                return True  # Threshold not met - use fallback
+        
+        # COLD_START or OFFLINE_TEST_MODE: no routing needed (no supervisor)
+        return True  # Default to fallback (though these modes don't write anyway)
+    
     def write_pcm(self, frame: bytes) -> None:
         """
         Write PCM frame to encoder stdin (non-blocking).
         
-        Forwards to supervisor's write_pcm() method per contract [M8].
-        Per contract [M16], only delivers PCM during LIVE_INPUT [O3].
-        During BOOTING, RESTART_RECOVERY, FALLBACK, and DEGRADED, silence/tone generation is used instead.
-        Supervisor handles process liveness checks and error handling.
-        Never blocks.
+        Entry point for all PCM from AudioPump (live input and fallback).
+        AudioPump is state-agnostic and always calls this method.
+        EncoderManager internally decides what to do based on operational mode.
+        
+        Per contract [M16]: Live program PCM MUST only be delivered during LIVE_INPUT [O3].
+        During BOOTING [O2], RESTART_RECOVERY [O5], FALLBACK_TONE, and DEGRADED [O7], frames are fallback PCM
+        and must be routed via write_fallback() per [M19], [S7.1].
+        
+        Per contract [M16A]: Transition into PROGRAM/LIVE_INPUT [O3] MUST be gated by the PCM validity threshold.
+        Until threshold is satisfied, system MUST remain in SILENCE_GRACE or FALLBACK_TONE, and fallback MUST
+        remain active. A single stray PCM frame MUST NOT cause a transition to PROGRAM.
+        
+        Per contract [M8]: Error handling (BrokenPipeError) is handled by supervisor's write_pcm() method.
+        Per contract [M8]: Async restart is triggered by supervisor; write_pcm() does not wait for restart.
+        
+        Per contract [M30] #2: Prevents further calls to write_pcm/write_fallback from processing new PCM frames.
+        
+        Note: [M8] states "Only writes if encoder state is RUNNING", but [M16] is more specific:
+        "MUST only deliver PCM during LIVE_INPUT [O3]". Since EncoderState.RUNNING includes BOOTING
+        (per [M12]), we use operational mode (LIVE_INPUT) as the authoritative gate per [M14], [M16].
         
         Args:
-            frame: PCM frame bytes to write
+            frame: PCM frame bytes to write (from AudioPump - can be live or fallback)
         """
-        # Per contract [M16], write_pcm() only delivers PCM during LIVE_INPUT [O3]
-        # Check supervisor state to determine if we're in LIVE_INPUT mode
-        if self._supervisor is None:
+        # Per contract [M30] #2: Prevent further calls to write_pcm/write_fallback after shutdown
+        if self._shutdown:
+            return  # Shutdown in progress or complete - no-op immediately
+        
+        if not self._supervisor:
+            return
+        
+        # Per contract [M14], [M16]: Determine operational mode and route accordingly
+        # Operational mode is the authoritative switching logic per [M14]
+        # [M16] explicitly states: "MUST only deliver PCM during LIVE_INPUT [O3]"
+        operational_mode = self._get_operational_mode()
+        
+        if operational_mode == "LIVE_INPUT":
+            # Per contract [M16]: Live PCM MUST only be delivered during LIVE_INPUT [O3]
+            # Per contract [BG8]: Track PCM validity threshold (consecutive frames)
+            # Only track during LIVE_INPUT mode (live PCM)
+            self._pcm_consecutive_frames += 1
+            self._pcm_last_frame_time = time.monotonic()
+            
+            # Per contract [M16A]: Transition into PROGRAM/LIVE_INPUT [O3] MUST be gated by PCM validity threshold
+            # Until threshold is satisfied, system MUST remain in SILENCE_GRACE or FALLBACK_TONE
+            # A single stray PCM frame MUST NOT cause a transition to PROGRAM
+            if self._pcm_consecutive_frames >= self._pcm_validity_threshold_frames:
+                # PCM validity threshold is met - transition to PROGRAM per [BG8], [BG9]
+                # Per contract [BG20]: Log transition to PROGRAM
+                self._set_audio_state("PROGRAM", reason="PCM detected")
+                
+                # Telemetry: Log each frame routed to ffmpeg (in write_pcm)
+                logger.debug(
+                    "ENCODER_MANAGER: routing PCM to ffmpeg",
+                    extra={"frame_index": self._pcm_consecutive_frames, "bytes": len(frame)}
+                )
+                
+                # Per contract [M16A]: Only forward to supervisor AFTER threshold is met
+                # Forward to supervisor's write_pcm() method per contract [M8]
+                # Supervisor.write_pcm() handles:
+                # - Process liveness check (process.poll())
+                # - Non-blocking write to stdin
+                # - BrokenPipeError handling (triggers restart asynchronously)
+                # - Multiple calls after broken pipe must all return immediately (non-blocking)
+                # Supervisor is source-agnostic and treats all valid PCM frames identically per [S22A]
+                self._supervisor.write_pcm(frame)
+            else:
+                # Per contract [M16A]: Threshold not yet met - do NOT forward program PCM
+                # System remains in SILENCE_GRACE or FALLBACK_TONE
+                # Fallback MUST remain active and continue to be injected (via AudioPump ticks)
+                # Do not forward this frame - it's not yet considered valid program PCM
+                pass
+        
+        elif operational_mode in ("BOOTING", "RESTART_RECOVERY", "DEGRADED"):
+            # Per contract [M16]: Live program PCM must NOT forward during BOOTING [O2], RESTART_RECOVERY [O5], DEGRADED [O7]
+            # Per contract [M19H], [M19I]: write_pcm() MUST NOT forward program PCM to supervisor during these modes
+            # AudioPump MUST deliver fallback via write_fallback() directly, not through write_pcm()
+            # Do nothing here - fallback frames are delivered via write_fallback() called directly by AudioPump
+            pass
+        
+        # COLD_START and OFFLINE_TEST_MODE: Do nothing (no supervisor or encoder disabled)
+    
+    def write_fallback(self, frame: bytes) -> None:
+        """
+        Write fallback PCM frame to encoder stdin (non-blocking).
+        
+        Per contract [M19]: Fallback injection must run during BOOTING [O2], RESTART_RECOVERY [O5] (RESTARTING),
+        and DEGRADED [O7] (FAILED) states. This ensures continuous PCM delivery even during encoder restarts.
+        
+        This method is called by write_pcm() when operational mode is BOOTING, RESTART_RECOVERY, or DEGRADED.
+        It forwards fallback frames directly to supervisor per [S7.1], [M19].
+        
+        Per contract [M8]: Error handling (BrokenPipeError) is handled by supervisor's write_pcm() method.
+        Per contract [M8]: Async restart is triggered by supervisor; write_fallback() does not wait for restart.
+        
+        Per contract [M30] #2: Prevents further calls to write_pcm/write_fallback from processing new PCM frames.
+        
+        Args:
+            frame: Fallback PCM frame bytes to write (from AudioPump - silence or tone)
+        """
+        # Per contract [M30] #2: Prevent further calls to write_pcm/write_fallback after shutdown
+        if self._shutdown:
+            return  # Shutdown in progress or complete - no-op immediately
+        
+        if not self._supervisor:
             return
         
         supervisor_state = self._supervisor.get_state()
         
-        # Per contract [M12], operational mode mapping:
-        # - RUNNING → LIVE_INPUT [O3] (only mode where live PCM is forwarded)
-        # - BOOTING → BOOTING [O2] (silence/tone generation used instead)
-        # - RESTARTING → RESTART_RECOVERY [O5] (silence/tone generation used instead)
-        # - FAILED → DEGRADED [O7] (silence/tone generation used instead)
-        # - STOPPED/STARTING → COLD_START [O1] (no supervisor, returns early above)
-        #
-        # Per contract [M16], only deliver PCM during LIVE_INPUT [O3] (SupervisorState.RUNNING)
-        # During BOOTING, RESTART_RECOVERY, FALLBACK, and DEGRADED, silence/tone generation is used
-        # Per contract [S7.1], silence frames are fed during BOOTING, but that's handled by AudioPump/FallbackGenerator
-        # This method only forwards live PCM during LIVE_INPUT
-        if supervisor_state != SupervisorState.RUNNING:
-            return
-        
-        # Forward to supervisor's write_pcm() method per contract [M8]
-        # Supervisor.write_pcm() handles:
-        # - Process liveness check (process.poll())
-        # - Non-blocking write to stdin
-        # - BrokenPipeError handling (triggers restart)
-        self._supervisor.write_pcm(frame)
+        # Per contract [M19], [M19H], [M19I]: Fallback must inject during BOOTING, RESTARTING, DEGRADED (FAILED), and RUNNING
+        # RESTARTING is included to ensure continuous injection during restart sequences
+        # FAILED (DEGRADED) is included per [M19H], [M19I] to ensure continuous PCM delivery
+        # RUNNING is included because fallback may be active during RUNNING if PCM loss detected
+        if supervisor_state in (SupervisorState.BOOTING, SupervisorState.RESTARTING, SupervisorState.FAILED, SupervisorState.RUNNING):
+            # Forward fallback frames to supervisor per [S7.1], [M19], [M19H], [M19I]
+            # Supervisor is source-agnostic and treats all valid PCM frames identically per [S22A]
+            # Supervisor.write_pcm() handles:
+            # - Process liveness check (process.poll())
+            # - Non-blocking write to stdin
+            # - BrokenPipeError handling (triggers restart asynchronously)
+            # - Multiple calls after broken pipe must all return immediately (non-blocking)
+            self._supervisor.write_pcm(frame)
     
     def get_frame(self) -> Optional[bytes]:
         """
@@ -515,12 +899,19 @@ class EncoderManager:
         
         supervisor_state = self._supervisor.get_state()
         
-        # Per contract [M12], EncoderManager state tracks SupervisorState but resolves externally as Operational Modes:
+        # Per contract [M12], EncoderManager state tracks SupervisorState but resolves externally as Operational Modes.
+        # The mapping is conditional and takes into account both encoder liveness and PCM admission state:
         # - STOPPED/STARTING → COLD_START [O1]
-        # - BOOTING → BOOTING [O2] until first MP3 frame received
-        # - RUNNING → LIVE_INPUT [O3]
+        # - BOOTING → BOOTING [O2] until first MP3 frame is received
+        # - RUNNING → LIVE_INPUT [O3] only when:
+        #   - SupervisorState == RUNNING, AND
+        #   - PCM validity threshold has been satisfied per [M16A]/[BG8], AND
+        #   - the internal audio state machine is in PROGRAM (no active PCM loss window)
+        # - A non-PROGRAM audio state while SupervisorState == RUNNING MUST resolve to fallback-oriented operational mode (e.g. FALLBACK_ONLY [O4])
         # - RESTARTING → RESTART_RECOVERY [O5]
         # - FAILED → DEGRADED [O7]
+        # Note: This method currently returns LIVE_INPUT for RUNNING unconditionally; the conditional behavior
+        # (threshold and audio state checks) is enforced in write_pcm() and next_frame() routing logic per [M16A].
         #
         # Per contract [O14], mode-aware frame selection:
         # - [O3] LIVE_INPUT: Return frames from MP3 buffer (encoder output)
@@ -645,24 +1036,29 @@ class EncoderManager:
         """
         return self._silence_frame
     
-    def _start_fallback_injection(self) -> None:
+    def _init_fallback_grace_period(self) -> None:
         """
-        Start PCM fallback injection thread per contract [M19]-[M24].
+        Initialize fallback grace period per contract [M20], [M21], [BG4].
         
-        Injects PCM data during BOOTING, RESTART_RECOVERY, and DEGRADED states
-        even when no live PCM input exists.
+        Per contract [M25]: Fallback is now driven by AudioPump ticks, not a separate thread.
+        This method only initializes the grace period timer for state tracking and logging.
+        AudioPump will call get_fallback_pcm_frame() on every tick to get fallback frames.
         
-        Per contract [M24A]: Does not start in OFFLINE_TEST_MODE [O6].
+        Per contract [M24A]: Does not apply in OFFLINE_TEST_MODE [O6].
+        Per contract [BG4]: Must be initialized within 1 frame interval (≈24ms) on cold start.
         """
         # Per contract [M24A]: [M19]-[M24] do not apply in OFFLINE_TEST_MODE [O6]
         if not self._encoder_enabled:
             return
         
-        if self._fallback_running:
-            return
+        # Initialize grace period timer per [M20], [M21]
+        if self._fallback_grace_timer_start is None:
+            self._fallback_grace_timer_start = time.monotonic()
+            logger.debug("Fallback grace period initialized per [M20], [M21]")
         
-        self._fallback_running = True
-        self._fallback_grace_timer_start = time.monotonic()  # Per [M20], [M21]: Start grace period
+        # Per contract [BG4]: Reset PCM tracking when starting fallback
+        self._pcm_consecutive_frames = 0
+        self._pcm_last_frame_time = None
         
         # Lazy import to avoid circular dependency
         if self._fallback_generator is None:
@@ -672,103 +1068,14 @@ class EncoderManager:
             except Exception as e:
                 logger.warning(f"Failed to initialize FallbackGenerator: {e}, using silence only")
                 self._fallback_generator = None
-        
-        self._fallback_thread = threading.Thread(
-            target=self._fallback_injection_loop,
-            daemon=True,
-            name="EncoderManagerFallbackInjection"
-        )
-        self._fallback_thread.start()
-        logger.debug("PCM fallback injection started per [M19]")
     
-    def _stop_fallback_injection(self) -> None:
-        """
-        Stop PCM fallback injection thread per contract [M24].
-        
-        Called when state transitions to RUNNING or when stopping.
-        """
-        if not self._fallback_running:
-            return
-        
-        self._fallback_running = False
-        self._fallback_grace_timer_start = None
-        
-        if self._fallback_thread is not None and self._fallback_thread.is_alive():
-            self._fallback_thread.join(timeout=1.0)
-            if self._fallback_thread.is_alive():
-                logger.warning("Fallback injection thread did not stop within timeout")
-        
-        self._fallback_thread = None
-        logger.debug("PCM fallback injection stopped per [M24]")
-    
-    def _fallback_injection_loop(self) -> None:
-        """
-        Main loop for PCM fallback injection per contract [M19]-[M25].
-        
-        - [M20]: Begins with SILENCE, not tone
-        - [M21]: Silence continues for GRACE_PERIOD_MS (default 1500ms)
-        - [M22]: After grace period, tone or silence (configurable)
-        - [M23]: Continuous and real-time paced (24ms intervals)
-        - [M24]: Stops when state transitions to RUNNING (checked in loop)
-        - [M25]: Timing-stable loop, independent of frame arrival or restart logic
-        """
-        # Frame duration: 1152 samples / 48000 Hz = 0.024 seconds
-        # Per [M25]: Timing-stable loop with fixed frame duration
-        FRAME_DURATION_SEC = 1152 / 48000
-        next_tick = time.time()
-        
-        logger.debug("PCM fallback injection loop started per [M25]")
-        
-        while self._fallback_running:
-            # Check if we should still be running (state may have changed)
-            if self._supervisor is None:
-                break
-            
-            supervisor_state = self._supervisor.get_state()
-            # Per [M24]: Stop when state transitions to RUNNING
-            if supervisor_state == SupervisorState.RUNNING:
-                break
-            
-            # Only inject during BOOTING, RESTART_RECOVERY, DEGRADED per [M19]
-            if supervisor_state not in (SupervisorState.BOOTING, SupervisorState.RESTARTING, SupervisorState.FAILED):
-                # State changed, stop injection
-                break
-            
-            # Per [M20], [M21], [M22]: Determine which frame to inject
-            frame = self._get_fallback_frame()
-            
-            # Write directly to supervisor's stdin (bypassing write_pcm which only works in RUNNING)
-            # This ensures fallback injection works during BOOTING/RESTART_RECOVERY/DEGRADED
-            try:
-                stdin = self._supervisor.get_stdin()
-                if stdin is not None:
-                    stdin.write(frame)
-                    stdin.flush()
-            except (BrokenPipeError, OSError) as e:
-                # Pipe broken or process ended - supervisor will handle restart
-                logger.debug(f"Fallback injection write error (expected during transitions): {e}")
-                break
-            except Exception as e:
-                logger.warning(f"Unexpected error in fallback injection: {e}")
-                break
-            
-            # Per [M23], [M25]: Real-time paced injection (24ms intervals)
-            # Per [M25]: Timing-stable loop independent of frame arrival or restart logic
-            # Uses fixed frame duration to maintain consistent pacing even during heavy churn
-            next_tick += FRAME_DURATION_SEC
-            sleep_time = next_tick - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # Behind schedule - resync to maintain timing stability per [M25]
-                next_tick = time.time()
-        
-        logger.debug("PCM fallback injection loop stopped")
-        self._fallback_running = False
-    
-    def _get_fallback_frame(self) -> bytes:
+    def get_fallback_pcm_frame(self) -> bytes:
         """
         Get fallback PCM frame per contract [M20], [M21], [M22].
+        
+        This method is called on-demand by AudioPump (or FallbackGenerator) on every tick
+        when no live PCM is available. It is non-blocking and does not use any timing loops.
+        All pacing is driven by AudioPump's 24ms tick per [M25].
         
         Returns:
             bytes: PCM frame (4608 bytes) - silence or tone based on grace period
@@ -793,6 +1100,225 @@ class EncoderManager:
         # Continue with silence if tone is disabled or generator unavailable
         return self._pcm_silence_frame
     
+    def _get_fallback_frame(self) -> bytes:
+        """
+        Get fallback PCM frame (private/internal API).
+        
+        Per contract [M19G]: Private fallback frame accessor.
+        Returns correct fallback PCM (silence→tone progression per [M20], [M21], [M22]).
+        Callable synchronously with no blocking. No internal sleep, no timing loop.
+        
+        This method wraps get_fallback_pcm_frame() for backwards compatibility and
+        provides a private API for tests per [M19F], [M19G].
+        
+        Returns:
+            bytes: PCM frame (4608 bytes) - silence or tone based on grace period
+        """
+        # Per contract [M19G]: Internally wraps get_fallback_pcm_frame() for backwards compatibility
+        return self.get_fallback_pcm_frame()
+    
+    def _start_fallback_injection(self) -> None:
+        """
+        Start manual fallback injection (test-only operational control).
+        
+        Per contract [M19F]: Private/internal method used only by broadcast-grade tests.
+        MUST activate fallback mode immediately, without requiring PCM loss detection.
+        MUST call the internal fallback controller (_init_fallback_grace_period()).
+        MUST set _fallback_running = True.
+        
+        Per contract [M19J]: MUST NOT start in OFFLINE_TEST_MODE [O6].
+        These hooks MUST NOT introduce timing loops or threads. All pacing is driven by AudioPump per [M25].
+        """
+        # Per contract [M19J]: MUST NOT start in OFFLINE_TEST_MODE [O6]
+        if not self._encoder_enabled:
+            return  # OFFLINE_TEST_MODE [O6] - do not start fallback per [M19J]
+        
+        # Per contract [M19F]: MUST call _init_fallback_grace_period()
+        self._init_fallback_grace_period()
+        
+        # Per contract [M19F]: MUST set _fallback_running = True
+        self._fallback_running = True
+        logger.debug("Manual fallback injection started per [M19F] (test-only control)")
+    
+    def _stop_fallback_injection(self) -> None:
+        """
+        Stop manual fallback injection (test-only operational control).
+        
+        Per contract [M19F]: Optional method for test resets.
+        If present, MUST disable manual fallback injection.
+        Primary purpose: test resets.
+        """
+        # Per contract [M19F]: MUST disable manual fallback injection
+        self._fallback_running = False
+        logger.debug("Manual fallback injection stopped per [M19F] (test-only control)")
+    
+    def _check_pcm_loss(self) -> None:
+        """
+        Check for PCM loss per contract [BG11], [BG12].
+        
+        Per contract [BG11]: Once in PROGRAM state, if no valid PCM frames are available
+        for LOSS_WINDOW_MS, system MUST treat this as "loss of program audio".
+        
+        Per contract [BG12]: On program loss, enter SILENCE_GRACE again.
+        """
+        if self._supervisor is None:
+            return
+        
+        supervisor_state = self._supervisor.get_state()
+        if supervisor_state != SupervisorState.RUNNING:
+            return
+        
+        # Check if PCM frames have stopped arriving
+        if self._pcm_last_frame_time is None:
+            # No PCM frames ever received - not in PROGRAM state
+            return
+        
+        now = time.monotonic()
+        elapsed_sec = now - self._pcm_last_frame_time
+        
+        if elapsed_sec >= self._pcm_loss_window_sec:
+            # Per contract [BG11]: PCM loss detected
+            logger.warning(f"PCM loss detected: no frames for {elapsed_sec * 1000:.0f}ms (threshold: {self._pcm_loss_window_ms}ms) per [BG11]")
+            
+            # Per contract [BG12]: Enter SILENCE_GRACE again
+            self._pcm_consecutive_frames = 0
+            self._pcm_last_frame_time = None
+            self._set_audio_state("SILENCE_GRACE", reason="PCM lost")
+            
+            # Reinitialize fallback grace period (AudioPump will provide fallback frames)
+            self._init_fallback_grace_period()
+    
+    def _set_audio_state(self, new_state: str, reason: str = "") -> None:
+        """
+        Set audio state and log transition per contract [BG3], [BG20].
+        
+        Args:
+            new_state: New audio state (SILENCE_GRACE, FALLBACK_TONE, PROGRAM, DEGRADED)
+            reason: Reason for transition (startup, PCM detected, PCM lost, encoder restart, fatal error)
+        """
+        with self._audio_state_lock:
+            old_state = self._audio_state
+            if old_state == new_state:
+                return  # No change
+            
+            self._audio_state = new_state
+        
+        # Per contract [BG20]: Log mode transitions
+        logger.info(
+            f"Audio state transition: {old_state} -> {new_state}"
+            + (f" (reason: {reason})" if reason else "")
+            + f" per [BG20]"
+        )
+    
+    def _log_audio_state_transition(self, supervisor_state: SupervisorState, old_encoder_state: EncoderState) -> None:
+        """
+        Log audio state transition based on supervisor state per contract [BG20].
+        
+        Args:
+            supervisor_state: Current supervisor state
+            old_encoder_state: Previous encoder state
+        """
+        # Map supervisor state to audio state
+        if supervisor_state == SupervisorState.RUNNING:
+            # Check if we have valid PCM
+            if self._pcm_consecutive_frames >= self._pcm_validity_threshold_frames:
+                self._set_audio_state("PROGRAM", reason="PCM detected")
+            else:
+                # RUNNING but no valid PCM yet - still in fallback
+                if self._fallback_grace_timer_start is not None:
+                    self._set_audio_state("FALLBACK_TONE", reason="encoder running, no PCM")
+        elif supervisor_state == SupervisorState.FAILED:
+            self._set_audio_state("DEGRADED", reason="encoder failed")
+        elif supervisor_state in (SupervisorState.BOOTING, SupervisorState.RESTARTING):
+            # Check if in grace period or tone phase
+            if self._fallback_grace_timer_start is not None:
+                elapsed_ms = (time.monotonic() - self._fallback_grace_timer_start) * 1000.0
+                if elapsed_ms < self._grace_period_ms:
+                    self._set_audio_state("SILENCE_GRACE", reason="startup/restart")
+                else:
+                    self._set_audio_state("FALLBACK_TONE", reason="grace period expired")
+            else:
+                self._set_audio_state("SILENCE_GRACE", reason="startup/restart")
+    
+    def _start_recovery_thread(self) -> None:
+        """
+        Start recovery thread per contract [BG22].
+        
+        After max restarts, system enters DEGRADED but continues streaming.
+        Recovery thread attempts full encoder restart every RECOVERY_RETRY_MINUTES.
+        """
+        if self._recovery_running:
+            return
+        
+        self._recovery_running = True
+        self._recovery_thread = threading.Thread(
+            target=self._recovery_loop,
+            daemon=True,
+            name="EncoderRecovery"
+        )
+        self._recovery_thread.start()
+        logger.info(f"Recovery thread started (retry interval: {self._recovery_retry_minutes} minutes) per [BG22]")
+    
+    def _stop_recovery_thread(self) -> None:
+        """Stop recovery thread."""
+        if not self._recovery_running:
+            return
+        
+        self._recovery_running = False
+        if self._recovery_thread is not None and self._recovery_thread.is_alive():
+            self._recovery_thread.join(timeout=1.0)
+        self._recovery_thread = None
+        logger.debug("Recovery thread stopped")
+    
+    def _recovery_loop(self) -> None:
+        """
+        Recovery loop per contract [BG22].
+        
+        Attempts full encoder restart every RECOVERY_RETRY_MINUTES.
+        Must run FOREVER without operator intervention.
+        """
+        logger.info("Recovery loop started - will retry encoder recovery indefinitely per [BG22]")
+        
+        while self._recovery_running:
+            # Wait for retry interval
+            time.sleep(self._recovery_retry_sec)
+            
+            if not self._recovery_running:
+                break
+            
+            # Check if still in FAILED state
+            if self._supervisor is None:
+                continue
+            
+            supervisor_state = self._supervisor.get_state()
+            if supervisor_state != SupervisorState.FAILED:
+                # No longer in FAILED state - stop recovery
+                logger.info("Encoder recovered, stopping recovery thread")
+                break
+            
+            # Attempt recovery
+            self._recovery_retries += 1
+            logger.info(f"Recovery attempt #{self._recovery_retries} - restarting encoder per [BG22]")
+            
+            try:
+                # Per contract [BG22]: Reset restart attempts and attempt full restart
+                # Reset supervisor's restart counter to allow new restart sequence
+                if hasattr(self._supervisor, '_restart_attempts'):
+                    self._supervisor._restart_attempts = 0
+                    logger.debug("Reset supervisor restart counter for recovery attempt")
+                
+                # Trigger restart by calling supervisor's restart method
+                # This will follow normal startup sequence (BOOTING → RUNNING)
+                if hasattr(self._supervisor, '_schedule_restart'):
+                    self._supervisor._schedule_restart()
+                    logger.info("Recovery: Scheduled encoder restart")
+            except Exception as e:
+                logger.error(f"Recovery attempt failed: {e}")
+                # Continue loop - will retry again after interval
+        
+        logger.debug("Recovery loop stopped")
+        self._recovery_running = False
+    
     def get_state(self) -> EncoderState:
         """
         Get current encoder state.
@@ -802,6 +1328,17 @@ class EncoderManager:
         """
         with self._state_lock:
             return self._state
+    
+    def get_supervisor_state(self) -> Optional[SupervisorState]:
+        """
+        Get current supervisor state.
+        
+        Returns:
+            Current SupervisorState if supervisor exists, None otherwise
+        """
+        if self._supervisor is None:
+            return None
+        return self._supervisor.get_state()
     
     # Legacy methods removed - now handled by FFmpegSupervisor
     # _start_encoder_process, _stderr_drain, _handle_stall, _handle_drain_error, _restart_encoder_async

@@ -15,11 +15,13 @@ SILENCE_FRAME_SIZE = 1152 * 2 * 2  # 4608 bytes
 class AudioPump:
     """
     Simple working PCM→FFmpeg pump.
-    Continuously pulls PCM frames from the ring buffer.
-    Implements PCM grace period: uses silence frames during brief gaps,
-    falls back to tone only after grace period expires.
+    Continuously calls encoder_manager.next_frame() at 24ms intervals.
     
-    Writes PCM frames via encoder_manager.write_pcm() only.
+    Per contract [A3], [A7]: AudioPump DOES NOT route audio. It calls encoder_manager.next_frame()
+    each tick. All routing decisions (PCM vs fallback, thresholds, operational modes) are made
+    inside EncoderManager.
+    
+    Per contract [A1], [A4]: AudioPump is Tower's sole metronome - the only clock in the system.
     Never interacts with FFmpegSupervisor directly.
     """
 
@@ -57,44 +59,27 @@ class AudioPump:
 
     def _run(self):
         next_tick = time.time()
+        tick_index = 0
 
         while self.running:
-            # Step 1: Try PCM first with 5ms timeout
-            frame = self.pcm_buffer.pop_frame(timeout=0.005)
+            # Telemetry: Log tick start
+            logger.debug("AUDIO_PUMP: tick", extra={"tick": tick_index})
             
-            if frame is not None:
-                # PCM frame available: use it and reset grace timer per contract [G7]-[G8]
-                self.grace_timer_start = None  # Reset grace timer
-            else:
-                # PCM buffer empty: check grace period per contract [G4]-[G6]
-                now = time.monotonic()
-                
-                if self.grace_period_sec > 0:
-                    # Grace period enabled
-                    if self.grace_timer_start is None:
-                        # Start grace period (buffer just became empty)
-                        self.grace_timer_start = now
-                        logger.debug("PCM grace period started")
-                    
-                    elapsed = now - self.grace_timer_start
-                    
-                    if elapsed < self.grace_period_sec:
-                        # Within grace period: use silence frame per contract [G5]
-                        frame = self.silence_frame
-                    else:
-                        # Grace period expired: use fallback per contract [G6]
-                        frame = self.fallback.get_frame()
-                else:
-                    # Grace period disabled: immediately use fallback
-                    frame = self.fallback.get_frame()
-
+            # Telemetry: Log first PCM frame generated
+            if tick_index == 0:
+                logger.info("AUDIO_PUMP: first PCM frame generated")
+            
+            # Per contract [A3], [A7]: AudioPump calls encoder_manager.next_frame() each tick
+            # EncoderManager handles ALL routing decisions internally (operational mode, thresholds, etc.)
+            # AudioPump does not choose PCM vs fallback — routing is inside EncoderManager
             try:
-                self.encoder_manager.write_pcm(frame)
+                self.encoder_manager.next_frame(self.pcm_buffer)
             except Exception as e:
-                logger.error(f"AudioPump write error: {e}")
+                logger.error(f"AudioPump next_frame error: {e}")
                 time.sleep(0.1)
                 continue
 
+            tick_index += 1
             next_tick += FRAME_DURATION_SEC
             sleep_time = next_tick - time.time()
             if sleep_time > 0:
