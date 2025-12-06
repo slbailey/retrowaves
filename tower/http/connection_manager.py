@@ -90,6 +90,19 @@ class HTTPConnectionManager:
         """
         with self._lock:
             self._drop_client_locked(client_id, "explicit removal")
+    
+    def close_all(self) -> None:
+        """
+        Close all client connections per contract [I27] #3.
+        
+        This method is called during shutdown to ensure all client sockets
+        are closed gracefully.
+        """
+        with self._lock:
+            client_ids = list(self._clients.keys())
+            for client_id in client_ids:
+                self._drop_client_locked(client_id, "shutdown")
+        logger.info("All client connections closed")
 
     def broadcast(self, data: bytes) -> None:
         """

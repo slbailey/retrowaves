@@ -101,11 +101,19 @@ class HTTPServer:
             self.connection_manager.broadcast(frame)
 
     def stop(self):
-        """Stop the HTTP server."""
+        """
+        Stop the HTTP server.
+        
+        Per contract [I27] #3: Stop HTTP connection manager (close client sockets).
+        """
         self.running = False
         if self._server_sock:
             try:
                 self._server_sock.close()
             except:
                 pass
+        
+        # Per contract [I27] #3: Close all client connections via connection manager
+        if hasattr(self, 'connection_manager'):
+            self.connection_manager.close_all()
 

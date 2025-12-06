@@ -11,28 +11,30 @@ This contract defines the behavior of the PCM grace period, which prevents fallb
 ## 2. Grace Period Semantics
 
 - [G4] Grace period starts when:
-  - PCM buffer becomes empty (no frames available from Station)
-  - `pop_frame(timeout)` returns `None` after timeout
+  - EncoderManager detects PCM buffer is empty (no frames available from Station)
+  - EncoderManager's `next_frame()` determines no valid PCM is available
 - [G5] During grace period:
-  - AudioPump uses **silence frames** (PCM zeros)
+  - EncoderManager routes **silence frames** (PCM zeros) via `write_fallback()`
   - Silence frames are **standardized** (exactly 4608 bytes, s16le, 48kHz, stereo)
   - Silence frames are **cached** (pre-built, not generated on-demand)
-  - FallbackGenerator is **not called**
-  - Grace timer continues counting
+  - FallbackGenerator is **not called** during grace period (silence only)
+  - Grace timer continues counting inside EncoderManager
 - [G6] After grace period expires:
-  - AudioPump calls `FallbackGenerator.get_frame()`
+  - EncoderManager (via `next_frame()`) routes to fallback tone/file via `write_fallback()`
+  - EncoderManager calls `FallbackGenerator.get_frame()` internally
   - Fallback tone/file begins playing
   - Grace timer is **not reset** (remains expired until new PCM arrives)
 
 ## 3. Grace Period Reset
 
 - [G7] Grace period **resets** when:
-  - New PCM frame arrives from Station (buffer becomes non-empty)
-  - `pop_frame()` returns a valid frame (not None)
+  - EncoderManager's `next_frame()` detects new PCM frame available (buffer becomes non-empty)
+  - EncoderManager determines valid PCM is present via PCM buffer check
 - [G8] Reset behavior:
-  - Grace timer resets to zero
-  - AudioPump immediately switches to live PCM (no silence delay)
-  - FallbackGenerator stops being called
+  - EncoderManager resets grace timer to zero internally
+  - EncoderManager immediately routes to live PCM via `write_pcm()` (no silence delay)
+  - EncoderManager stops calling FallbackGenerator
+  - AudioPump continues providing 24ms ticks (timing only, no routing decisions)
 - [G9] Reset is **immediate** (no delay or hysteresis).
 
 ## 4. Boundary Conditions
@@ -41,17 +43,19 @@ This contract defines the behavior of the PCM grace period, which prevents fallb
   - If grace period just expired: switch to fallback
   - If new PCM arrives at exactly grace expiry: reset grace, use live PCM
 - [G11] Grace period is measured in **real time** (wall clock, not frame count).
-- [G12] Grace period uses `time.monotonic()` for timing (prevents clock adjustment issues).
+- [G12] EncoderManager uses `time.monotonic()` for grace period timing (prevents clock adjustment issues). The timer is maintained inside EncoderManager, not AudioPump.
 
-## 5. Integration with AudioPump
+## 5. Integration with EncoderManager and AudioPump
 
-- [G13] AudioPump implements grace period logic:
-  1. Try `pcm_buffer.pop_frame(timeout=0.005)` (5ms timeout)
-  2. If frame available: use live frame, reset grace timer
-  3. If frame not available: check grace timer
-     - If within grace: use silence frame
-     - If grace expired: use `fallback_generator.get_frame()`
-- [G14] Grace timer is **maintained by AudioPump** (not by AudioInputRouter or EncoderManager).
+- [G13] EncoderManager implements grace period logic within `next_frame()`:
+  1. EncoderManager checks PCM buffer availability internally
+  2. If valid PCM frame available: route to `write_pcm()`, reset grace timer
+  3. If PCM not available: check internal grace timer
+     - If within grace period: route silence frame via `write_fallback()`
+     - If grace expired: route fallback tone/file via `write_fallback()` (calls `FallbackGenerator.get_frame()` internally)
+  4. AudioPump only provides 24ms timing ticks by calling `next_frame()` each tick
+  5. AudioPump does NOT make routing decisions or own grace period timers
+- [G14] Grace timer is **maintained by EncoderManager** (not by AudioPump or AudioInputRouter). AudioPump provides timing continuity only.
 
 ## 6. Configuration
 

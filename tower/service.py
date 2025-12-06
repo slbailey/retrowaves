@@ -61,10 +61,16 @@ class TowerService:
         logger.info("=== Tower starting ===")
         
         # Start encoder (this also starts the drain thread internally)
+        # Per contract [I7.1]: EncoderManager MAY start before AudioPump, but system MUST feed
+        # initial silence per [S19] step 4, and AudioPump MUST begin ticking within ≤1 grace period.
         self.encoder.start()
         logger.info("Encoder started")
         
         # Start audio pump
+        # Per contract [I7.1]: AudioPump MUST begin ticking within ≤1 grace period (≈24ms) after
+        # encoder start to ensure continuous PCM delivery per [S7.1] and [M19].
+        # The initial silence write in [S19] step 4 covers the tiny window between FFmpeg spawn
+        # and AudioPump's first tick.
         self.audio_pump.start()
         logger.info("AudioPump started")
         
@@ -213,8 +219,48 @@ class TowerService:
         }
     
     def stop(self):
+        """
+        Stop Tower service.
+        
+        Per contract [I27]: Service Shutdown Contract
+        1. Stop AudioPump (metronome halts)
+        2. Stop EncoderManager (which stops Supervisor)
+        3. Stop HTTP connection manager (close client sockets)
+        4. Wait for all threads to exit (join)
+        5. Return only after a fully quiescent system state
+        """
         logger.info("Shutting down Tower...")
+        
+        # Per contract [I27] #2: Stop HTTP broadcast thread first (via self.running = False)
+        # This stops the main_loop() which is running in the current thread
         self.running = False
+        
+        # Per contract [I27] #1: Stop AudioPump (metronome halts)
         self.audio_pump.stop()
+        
+        # Per contract [I27] #2: Stop EncoderManager (which stops Supervisor)
         self.encoder.stop()
+        
+        # Per contract [I27] #3: Stop HTTP connection manager (close client sockets)
+        if hasattr(self.http_server, 'connection_manager'):
+            self.http_server.connection_manager.close_all()
+        
+        # Per contract [I27] #1: Ensure AudioPump thread has fully stopped
+        if self.audio_pump.thread and self.audio_pump.thread.is_alive():
+            self.audio_pump.thread.join(timeout=1.0)
+            if self.audio_pump.thread.is_alive():
+                logger.warning("AudioPump thread did not stop within timeout")
+        
+        # Per contract [I27] #4: Wait for all threads to exit (join)
+        # HTTP server runs in daemon thread, so it will terminate when main thread exits
+        # But we explicitly stop it to close the socket
         self.http_server.stop()
+        
+        # Per contract [I27] #5: Return only after a fully quiescent system state
+        # Verify no critical threads are still running
+        import threading
+        active_threads = [t for t in threading.enumerate() if t != threading.current_thread() and not t.daemon]
+        if active_threads:
+            logger.warning(f"Non-daemon threads still running after shutdown: {[t.name for t in active_threads]}")
+        
+        logger.info("Tower service stopped")

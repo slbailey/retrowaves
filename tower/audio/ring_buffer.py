@@ -137,31 +137,28 @@ class FrameRingBuffer:
         Returns:
             Complete MP3 frame bytes if available, None if buffer is empty (or timeout expires)
         """
-        with self._lock:
-            # If frame available, return immediately
-            if self._buffer:
-                return self._buffer.popleft()
-            
-            # If timeout is None, return None immediately (non-blocking)
-            if timeout is None or timeout <= 0:
+        # If timeout is None or <= 0, return immediately (non-blocking)
+        if timeout is None or timeout <= 0:
+            with self._lock:
+                if self._buffer:
+                    return self._buffer.popleft()
                 return None
             
-            # Wait for frame with timeout using condition variable
-            end_time = time.monotonic() + timeout
+        # Per contract [B12]: With timeout, must wait up to timeout seconds
+        # Use explicit sleep-wait loop to ensure full timeout is respected
+        deadline = time.monotonic() + timeout
+        
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._buffer:
+                    return self._buffer.popleft()
             
-            while not self._buffer:
-                remaining = end_time - time.monotonic()
-                if remaining <= 0:
-                    return None  # Timeout expired
-                
-                # Wait with remaining timeout (condition variable is already associated with _lock)
-                self._condition.wait(timeout=remaining)
-            
-            # Frame available now
-            if self._buffer:
-                return self._buffer.popleft()
-            
-            return None
+            # Sleep briefly and check again (contract-compliant busy-wait)
+            # This ensures we actually wait the full timeout duration
+            time.sleep(0.001)  # 1ms sleep - tiny, contract-compliant
+        
+        # Timeout expired - return None
+        return None
     
     def clear(self) -> None:
         """

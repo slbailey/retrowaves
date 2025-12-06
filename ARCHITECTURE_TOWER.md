@@ -25,6 +25,7 @@ Retrowaves Tower is a dedicated, always-on streaming service that:
 - **Dumb carrier:** Tower makes no programming decisions. It does not know about songs, intros, IDs, or DJIntent
 - **Single encoded signal:** One encoder per station instance, many HTTP clients
 - **Continuous audio:** Clients always receive valid audio data, even when Station is offline
+- **Cold start stability:** Tower must be able to run forever with zero PCM input without restarting, stalling, or requiring operator assistance. Silence→tone fallback must sustain for years. Tower can start cold with zero PCM and remain stable indefinitely.
 
 **Result:** A deterministic, broadcast-style, single-source stream that downstream clients can trust as a stable, never-refusing endpoint.
 
@@ -427,6 +428,300 @@ TOWER_OUTPUT_TICK_INTERVAL_MS=15  # ~66 ticks/second
 - Output Rate: ~66 frames/second (15ms tick interval)
 
 For detailed troubleshooting, design rationale, and verification procedures, see the full encoding architecture documentation in `tower/docs/BROADCAST_ENCODER_ARCHITECTURE.md`.
+
+#### 5.2.7 Broadcast-Grade Behavior Specification
+
+This section defines the end-to-end behavior of the Tower encoding path: PCM input (or lack thereof), fallback generator, EncoderManager, FFmpegSupervisor, and MP3 output. The encoder subsystem MUST be able to start and idle for years with no external PCM, produce valid MP3 at all times, survive encoder failures and restarts without audible glitches, and switch cleanly between fallback tone and real PCM.
+
+##### Core Broadcast Invariants
+
+**[BG1] No Dead Air (MP3 Layer)**
+
+Once `TowerService.start()` returns "Encoder started", every call to `EncoderManager.get_frame()` MUST return a valid MP3 frame (silence/tone/program). None is not allowed in production.
+
+**[BG2] No Hard Dependence on PCM**
+
+The system MUST NEVER require external PCM to be present to:
+- Keep FFmpeg alive
+- Avoid restarts
+- Satisfy timing/watchdog constraints
+
+The encoder MUST be able to run forever on fallback alone.
+
+**[BG3] Predictable Audio State Machine**
+
+At any instant, the encoder is in exactly one of:
+- **SILENCE_GRACE** – startup / recent loss of PCM: silence only
+- **FALLBACK_TONE** – stable absence of PCM: tone (or configured fallback)
+- **PROGRAM** – real PCM only
+- **DEGRADED** – failure mode (silence only but still valid MP3)
+
+All state transitions MUST be deterministic and logged.
+
+##### Timeline: Startup & Idle Behavior
+
+**2.1 Startup with No PCM Present**
+
+**[BG4] Initial Conditions**
+
+When `TowerService.start()` is called with no external PCM arriving (PCM buffer empty) and EncoderManager enabled:
+
+- FFmpegSupervisor starts FFmpeg and immediately writes at least one PCM frame (silence)
+- Within 1 frame interval (≈24ms), EncoderManager MUST start continuous PCM fallback injection into FFmpeg (silence first)
+- Fallback injection MUST continue indefinitely at real-time pace (≈24ms per frame) until real PCM is detected and stable
+
+**2.2 Grace → Tone**
+
+Let `GRACE_PERIOD_MS` (default 1500ms).
+
+**[BG5] Silence Grace Period**
+
+From the moment fallback starts, the encoder MUST inject silence PCM only for at least `GRACE_PERIOD_MS` (e.g. 1500ms). During this period, FFmpeg produces valid MP3 frames (silence audio).
+
+**[BG6] Tone Lock-In**
+
+After `GRACE_PERIOD_MS` has elapsed and there have still been no valid external PCM frames detected, system MUST transition to FALLBACK_TONE:
+- PCM injection switches from silence to tone frames (from FallbackGenerator) if tone is enabled
+- If tone is disabled by config, it remains in pure silence but is still considered FALLBACK_TONE state internally (different from SILENCE_GRACE)
+
+**[BG7] Long-Term Idle Stability**
+
+The encoder MUST be able to remain in FALLBACK_TONE state for arbitrarily long durations (hours/days/years) with:
+- No FFmpeg restarts caused by input absence
+- No MP3 underflow
+- No watchdog "no first frame" or "stall" events as long as FFmpeg is producing output
+
+##### Detecting Real PCM & Transitioning to Program
+
+**3.1 PCM Detection**
+
+**[BG8] PCM Validity Threshold**
+
+A "real PCM stream present" condition is met when:
+- A continuous run of N frames (e.g. 10–20) have been read from the PCM buffer (by AudioPump → write_pcm)
+- AND these frames are not all zeros (if zero-only can't be distinguished, treat "frames present" as the condition)
+
+This prevents toggling due to single stray frames.
+
+**3.2 Tone → Program Transition**
+
+**[BG9] Transition Trigger**
+
+When PCM_PRESENT becomes true while encoder is in FALLBACK_TONE state:
+- EncoderManager MUST stop fallback injection immediately or within 1 frame
+- Thereafter, only real PCM is fed to FFmpeg via write_pcm (LIVE_INPUT mode)
+
+**[BG10] Click/Pop Minimization**
+
+EncoderManager/AudioPump MUST ensure there is no large discontinuity at the moment of switch:
+- If you have a compressor/limiter: rely on it but avoid sudden zero → full-scale jumps
+- At minimum, do NOT change sample rate/format/bit depth
+- Optional enhancement (recommended): Crossfade 1–2 frames between tone and PCM in PCM domain before handing to FFmpeg, or start PCM at a low gain and ramp to full over a small number of frames
+- But even without crossfade, maintain same RMS ballpark to avoid obvious blast
+
+**3.3 Program → Tone (Loss of PCM)**
+
+**[BG11] Loss Detection**
+
+Once in PROGRAM state, if no valid PCM frames are available for `LOSS_WINDOW_MS` (e.g. 250–500ms), system MUST treat this as "loss of program audio".
+
+**[BG12] Program Loss Transition**
+
+On program loss:
+- Enter SILENCE_GRACE again (silence injection, reset grace timer)
+- After another `GRACE_PERIOD_MS` without PCM, move back to FALLBACK_TONE
+- Hysteresis prevents rapid flipping if PCM flickers
+
+##### Encoder Liveness & Watchdogs
+
+**4.1 First Frame Watchdog**
+
+**[BG13] First Frame Source-Agnostic**
+
+The "first MP3 frame received" condition MUST be satisfied by any valid MP3 output (from silence, tone, or real program), not just real inputs. As soon as stdout yields one valid frame, "BOOTING" timeout is satisfied. No additional requirement that PCM be present.
+
+**4.2 Stall Detection While Idle**
+
+**[BG14] Stall Semantics**
+
+A "stall" is defined as no MP3 bytes from FFmpeg for `STALL_THRESHOLD_MS`. This MUST fire whether we're on program or fallback.
+
+**[BG15] Stall Recovery**
+
+On stall:
+- Supervisor transitions to RESTARTING and executes restart backoff
+- EncoderManager MUST continue fallback injection once FFmpeg is up again, returning to SILENCE_GRACE → FALLBACK_TONE sequence as needed
+- Crucially: stall due to input absence should never happen if fallback injection is working; a stall indicates real FFmpeg failure, which justifies restart
+
+##### Restart Behavior & State Preservation
+
+**5.1 MP3 Buffer Continuity**
+
+**[BG16] Buffer Preservation Across Restart**
+
+When FFmpeg restarts:
+- The MP3 ring buffer MUST NOT be forcibly cleared by EncoderManager or Supervisor
+- Any frames already queued MUST be allowed to drain (they'll disappear naturally as consumed)
+- This avoids abrupt artifacts on the listener side at the moment of restart if the player is slightly ahead
+
+**5.2 Fallback Re-Entry After Restart**
+
+**[BG17] Automatic Fallback Resumption**
+
+After a restart completes:
+- Fallback injection MUST resume automatically until conditions for PROGRAM are again satisfied
+- There MUST be no window after restart where FFmpeg is running but receiving no PCM from either program or fallback
+
+##### Production vs Test Behavior
+
+**6.1 OFFLINE_TEST_MODE**
+
+**[BG18] OFFLINE_TEST_MODE as Local Simulation Only**
+
+When `TOWER_ENCODER_ENABLED=0` or `encoder_enabled=False`, EncoderManager MUST NOT start FFmpeg at all. `get_frame()` MUST return synthetic MP3 silence frames (created locally), following the same timing expectations. Fallback injection and watchdog logic can be bypassed. This ensures you can unit-test the upper stack without invoking FFmpeg.
+
+**6.2 Test-Safe Defaults**
+
+**[BG19] No Tone in Tests by Default**
+
+For unit/contract tests:
+- Default `TOWER_PCM_FALLBACK_TONE=0` to avoid requiring audio inspections
+- Ensure fallback silence is enough to satisfy watchdogs
+- Production configs re-enable tone as needed
+
+##### Logging & Monitoring Requirements
+
+**[BG20] Mode Logging**
+
+Whenever encoder state changes: SILENCE_GRACE ↔ FALLBACK_TONE ↔ PROGRAM ↔ DEGRADED, Tower MUST log:
+- Old state → new state
+- Reason (startup, PCM detected, PCM lost, encoder restart, fatal error)
+- Relevant counters (grace ms elapsed, restarts count, etc.)
+
+**[BG21] Alarms**
+
+At minimum, the following events should generate operational alarms (or at least WARN/ERROR):
+- Repeated FFmpeg restarts exceeding max_restarts
+- Persistent operation in FALLBACK_TONE for longer than some configurable threshold (e.g. 10 minutes) – this can be a "no program audio" alarm
+- Switches to DEGRADED (FFmpeg completely dead or disabled)
+
+##### Automatic Self-Healing & Recovery
+
+**[BG22] Self-Healing After Max Restarts**
+
+If FFmpeg reaches `max_restarts`, state becomes DEGRADED but streaming continues. System shall retry full encoder recovery every `RECOVERY_RETRY_MINUTES` (default 10 minutes). Must run FOREVER without operator intervention. This prevents a 3AM outage from requiring manual intervention.
+
+**Implementation:**
+- After max restarts, enter DEGRADED state but continue streaming fallback audio
+- Start background recovery timer that attempts full encoder restart every `RECOVERY_RETRY_MINUTES`
+- Each recovery attempt follows normal startup sequence (BOOTING → RUNNING)
+- If recovery succeeds, transition back to PROGRAM or FALLBACK_TONE as appropriate
+- If recovery fails, continue streaming fallback and schedule next retry
+- System must never give up permanently; retries continue indefinitely
+
+##### Audio Transition Smoothing
+
+**[BG23] Optional Crossfade for Fallback → Program Transitions**
+
+Fallback → Program transitions must support optional crossfade (default off but architecture prepared to support it). Real broadcast stations use crossfading to eliminate clicks, pops, and level jumps during source transitions.
+
+**Implementation:**
+- Crossfade is optional and disabled by default (`TOWER_CROSSFADE_ENABLED=0`)
+- When enabled, perform 1-2 frame crossfade in PCM domain before handing to FFmpeg
+- Architecture must support crossfade without blocking or timing disruption
+- Crossfade parameters: duration (frames), curve (linear/logarithmic), and gain normalization
+- Even without crossfade, maintain same RMS ballpark to avoid obvious level jumps
+
+##### File Fallback Looping
+
+**[BG24] Sample-Accurate Gapless File Fallback**
+
+When fallback MP3/WAV is used, decoding MUST occur into PCM at startup. Loop must be sample-accurate, gapless, and stable indefinitely. This ensures professional "Please Stand By" or emergency audio loops seamlessly without audible gaps or clicks.
+
+**Implementation:**
+- Pre-decode fallback file to PCM at Tower startup (not on-demand)
+- Cache decoded PCM frames in memory for low-latency access
+- Loop detection: identify loop points (start/end samples) for seamless wrapping
+- Sample-accurate looping: no frame boundary misalignment, no partial samples
+- Gapless playback: zero samples of silence between loop iterations
+- Stable indefinitely: loop must run for hours/days without drift or accumulation errors
+- Fallback: If file decoding fails, fall through to tone generator
+
+##### Silence Detection on Program PCM
+
+**[BG25] Amplitude-Aware Silence Detection**
+
+Real PCM may contain silence (songs with silence, mixers idle). Silence ≠ no-input. Silence detection must be amplitude-aware not just "frame present". This stops tone falsely firing during quiet songs or natural program silence.
+
+**Implementation:**
+- PCM presence detection must distinguish between:
+  - **No input**: No frames arriving from source (triggers fallback)
+  - **Silent input**: Frames arriving but containing silence/very low amplitude (remains in PROGRAM)
+- Amplitude threshold: Configure RMS or peak threshold below which PCM is considered "silent" but still "present"
+- Default threshold: -60dB or configurable via `TOWER_PCM_SILENCE_THRESHOLD_DB`
+- Hysteresis: Require sustained silence for `SILENCE_DURATION_MS` before treating as "no input"
+- This prevents false fallback triggers during:
+  - Quiet passages in music
+  - Mixer fader-down moments
+  - Natural program silence between tracks
+
+##### Observability & Monitoring API
+
+**[BG26] HTTP Status Endpoint for DevOps**
+
+HTTP `/status` endpoint must expose:
+- Current source (program/tone/silence)
+- PCM buffer fullness (frames available / capacity)
+- MP3 buffer fullness (frames available / capacity)
+- Restarts count (total encoder restarts since startup)
+- Uptime (seconds since TowerService.start())
+- Optional: JSON stats for dashboards
+
+**Implementation:**
+- Endpoint: `GET /status` returns JSON with current system state
+- Response format:
+  ```json
+  {
+    "source": "program|tone|silence",
+    "encoder_state": "RUNNING|RESTARTING|DEGRADED|STOPPED",
+    "pcm_buffer": {
+      "available": 45,
+      "capacity": 100,
+      "percent_full": 45
+    },
+    "mp3_buffer": {
+      "available": 320,
+      "capacity": 400,
+      "percent_full": 80
+    },
+    "restarts": 2,
+    "uptime_seconds": 86400,
+    "recovery_retries": 0
+  }
+  ```
+- Non-blocking: Status endpoint must never block or affect audio streaming
+- Thread-safe: All status queries must be safe to call from any thread
+- Optional dashboard integration: Consider Prometheus metrics or similar for long-term monitoring
+
+**Note:** This endpoint doesn't need to be implemented immediately, but once Tower runs months continuously, operational visibility becomes critical for diagnosing issues and monitoring health.
+
+##### Summary: What This Guarantees
+
+With this spec in place, you can start Tower with zero PCM and walk away for hours. The encoder will:
+- Start FFmpeg immediately
+- Begin streaming silence as valid MP3
+- After grace, smoothly switch to tone (if enabled)
+- Maintain that tone forever with no restarts
+- When real PCM appears and is stable, stop tone immediately and feed real program audio
+- If program disappears, grace → silence → tone resumes automatically
+- Any FFmpeg crash triggers a restart without ever requiring PCM to be present
+- After max restarts, system continues streaming fallback and automatically retries recovery every 10 minutes forever
+- Optional crossfade eliminates clicks/pops during source transitions
+- File fallback loops seamlessly without gaps
+- Silence detection prevents false fallback during quiet program content
+- Status endpoint provides operational visibility for long-running deployments
+
+That's the broadcast-grade behavior: no dead air, no requirement that the studio "talks" immediately, deterministic logged transitions between known audio states, automatic self-healing, and operational observability.
 
 ### 5.3 Encoded Stream Characteristics
 
@@ -942,6 +1237,12 @@ TOWER_PCM_BUFFER_SIZE=100  # PCM input buffer size (frames, ~2 seconds)
 TOWER_OUTPUT_TICK_INTERVAL_MS=15  # tick-driven output interval (~66 ticks/second)
 TOWER_CLIENT_TIMEOUT_MS=250  # timeout before dropping slow clients
 TOWER_SHUTDOWN_TIMEOUT=5    # seconds for graceful shutdown
+TOWER_PCM_GRACE_PERIOD_MS=1500  # grace period before switching from silence to tone (default 1500ms)
+TOWER_PCM_FALLBACK_TONE=1  # enable tone fallback after grace period (0=silence only, 1=tone enabled)
+TOWER_PCM_LOSS_WINDOW_MS=500  # window for detecting PCM loss when in PROGRAM state (default 250-500ms)
+TOWER_RECOVERY_RETRY_MINUTES=10  # retry encoder recovery after max restarts (default 10 minutes)
+TOWER_CROSSFADE_ENABLED=0  # enable crossfade for fallback→program transitions (default 0=disabled)
+TOWER_PCM_SILENCE_THRESHOLD_DB=-60  # RMS threshold for detecting silent but present PCM (default -60dB)
 ```
 
 **Fallback Source Priority:**
@@ -1012,8 +1313,9 @@ This document defines the canonical behavior, responsibilities, and constraints 
 ---
 
 **Document:** Tower Unified Architecture (canonical)  
-**Last Updated:** 2025-12-04  
-**Authority:** This document supersedes prior Tower-related architecture documents.
+**Last Updated:** 2025-01-XX  
+**Authority:** This document supersedes prior Tower-related architecture documents.  
+**Broadcast-Grade Behavior:** See Section 5.2.7 for complete broadcast-grade encoding behavior specification.
 
 ---
 

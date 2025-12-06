@@ -11,20 +11,23 @@ import re
 import threading
 from pathlib import Path
 
-def run_pytest():
+def run_pytest(suppress_logs=False):
     """Run pytest on all contract tests with real-time output."""
     
     cmd = [
         sys.executable, "-m", "pytest",
         "tower/tests/contracts/",
-        "-q",
+        "-v",  # Use verbose to get individual test results for parsing
         "--disable-warnings",
         "--tb=short",
-        "-v"
+        # Note: --log-cli-level doesn't suppress application logs, only pytest's own logs
+        # We'll filter application logs in the output processing
     ]
     
     print("=" * 60)
     print("Starting pytest execution...")
+    if suppress_logs:
+        print("(Log output suppressed - see full report for details)")
     print("=" * 60)
     print()
     sys.stdout.flush()
@@ -74,6 +77,20 @@ def run_pytest():
         stdout_done = False
         stderr_done = False
         
+        # Filter patterns for log spam (common error log prefixes from application code)
+        # Only filter application logs, not pytest's own output
+        import re
+        log_spam_patterns = [
+            r'ERROR.*tower\.encoder',  # ERROR logs from encoder modules
+            r'WARNING.*tower\.encoder',  # WARNING logs from encoder modules
+            r'🔥\s+',  # Fire emoji error logs
+            r'\[FFMPEG\]',  # FFmpeg prefix logs
+        ]
+        log_spam_re = re.compile('|'.join(log_spam_patterns))
+        
+        # Also track test progress for minimal output
+        last_test_name = None
+        
         while not (stdout_done and stderr_done):
             # Check stdout
             try:
@@ -81,8 +98,24 @@ def run_pytest():
                 if line is None:
                     stdout_done = True
                 else:
-                    print(line, end='', flush=True)
+                    # Always capture for parsing
                     stdout_lines.append(line)
+                    
+                    # Filter output based on suppress_logs flag
+                    if suppress_logs:
+                        # Only show test result lines and pytest summary, suppress application logs
+                        is_test_result = (
+                            '::' in line and ('PASSED' in line or 'FAILED' in line or 'ERROR' in line) or
+                            '=' * 10 in line or  # pytest separators
+                            line.strip().startswith('tower/tests/contracts/')  # Test file paths
+                        )
+                        is_not_log_spam = not log_spam_re.search(line)
+                        
+                        if is_test_result or is_not_log_spam:
+                            print(line, end='', flush=True)
+                    else:
+                        # Show everything
+                        print(line, end='', flush=True)
             except queue.Empty:
                 pass
             
@@ -92,8 +125,16 @@ def run_pytest():
                 if line is None:
                     stderr_done = True
                 else:
-                    print(line, end='', flush=True, file=sys.stderr)
+                    # Always capture for parsing
                     stderr_lines.append(line)
+                    
+                    # Filter stderr similarly
+                    if suppress_logs:
+                        is_not_log_spam = not log_spam_re.search(line)
+                        if is_not_log_spam:
+                            print(line, end='', flush=True, file=sys.stderr)
+                    else:
+                        print(line, end='', flush=True, file=sys.stderr)
             except queue.Empty:
                 pass
             
@@ -107,14 +148,29 @@ def run_pytest():
                 while not stdout_queue.empty():
                     line, _ = stdout_queue.get_nowait()
                     if line is not None:
-                        print(line, end='', flush=True)
                         stdout_lines.append(line)
+                        if suppress_logs:
+                            is_test_result = (
+                                '::' in line and ('PASSED' in line or 'FAILED' in line or 'ERROR' in line) or
+                                '=' * 10 in line or
+                                line.strip().startswith('tower/tests/contracts/')
+                            )
+                            is_not_log_spam = not log_spam_re.search(line)
+                            if is_test_result or is_not_log_spam:
+                                print(line, end='', flush=True)
+                        else:
+                            print(line, end='', flush=True)
                 
                 while not stderr_queue.empty():
                     line, _ = stderr_queue.get_nowait()
                     if line is not None:
-                        print(line, end='', flush=True, file=sys.stderr)
                         stderr_lines.append(line)
+                        if suppress_logs:
+                            is_not_log_spam = not log_spam_re.search(line)
+                            if is_not_log_spam:
+                                print(line, end='', flush=True, file=sys.stderr)
+                        else:
+                            print(line, end='', flush=True, file=sys.stderr)
                 
                 break
         
@@ -158,9 +214,19 @@ def parse_pytest_output(stdout, stderr):
     # First, extract summary from pytest's final summary line
     # Format: "================== X failed, Y passed, Z warnings in TIME =================="
     # or: "================== X passed, Y warnings in TIME =================="
+    # Also handle: "X passed in Y.XXs" or "X failed, Y passed in Z.XXs"
     summary_line = None
     for line in reversed(output.split('\n')):
-        if '=' * 10 in line and ('passed' in line.lower() or 'failed' in line.lower()):
+        line_lower = line.lower()
+        # Look for summary line with equals signs and test counts
+        if (('=' * 10 in line or '=' * 20 in line) and 
+            ('passed' in line_lower or 'failed' in line_lower or 'error' in line_lower)):
+            summary_line = line
+            break
+        # Also check for summary without equals (some pytest formats)
+        if (('passed' in line_lower or 'failed' in line_lower) and 
+            ('in ' in line_lower and ('s' in line_lower or 'second' in line_lower))):
+            # This looks like a summary line: "X passed in Y.XXs"
             summary_line = line
             break
     
@@ -333,32 +399,126 @@ def main():
         action="store_true",
         help="Show all tests including passing tests (default: only show failing tests)"
     )
+    parser.add_argument(
+        "--show-logs",
+        action="store_true",
+        help="Show all log output during test execution (default: suppress log spam)"
+    )
     args = parser.parse_args()
     
-    stdout, stderr, returncode = run_pytest()
-    
-    print("Parsing test results...")
-    tests, passed, failed, errors, total, full_output = parse_pytest_output(stdout, stderr)
-    
-    print("Generating audit report...")
-    report = generate_report(tests, passed, failed, errors, total, full_output, show_all=args.all)
-    
-    # Write to file
-    with open("CONTRACT_TEST_AUDIT_REPORT.md", "w") as f:
-        f.write(report)
+    stdout, stderr, returncode = run_pytest(suppress_logs=not args.show_logs)
     
     print()
     print("=" * 60)
-    print("AUDIT REPORT SUMMARY")
+    print("PARSING TEST RESULTS")
     print("=" * 60)
+    sys.stdout.flush()
+    
+    try:
+        tests, passed, failed, errors, total, full_output = parse_pytest_output(stdout, stderr)
+        print(f"✓ Parsed {len(tests)} tests: {passed} passed, {failed} failed, {errors} errors")
+    except Exception as e:
+        print(f"⚠ Error parsing test results: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback: create minimal report
+        tests = []
+        passed = 0
+        failed = 0
+        errors = 0
+        total = 0
+        full_output = stdout + "\n" + stderr
+    
+    sys.stdout.flush()
+    
+    print()
+    print("=" * 60)
+    print("GENERATING AUDIT REPORT")
+    print("=" * 60)
+    sys.stdout.flush()
+    
+    # Determine report file path (in script's directory)
+    report_path = Path(__file__).parent / "CONTRACT_TEST_AUDIT_REPORT.md"
+    
+    try:
+        report = generate_report(tests, passed, failed, errors, total, full_output, show_all=args.all)
+        
+        # Ensure report is not empty
+        if not report or len(report.strip()) == 0:
+            report = "=== CONTRACT TEST AUDIT ===\n\nTests executed: 0  | Passed: 0 | Failed: 0 | Errors: 0\n\n(Report generation failed - no content)\n\n--- Full Test Output ---\n" + full_output
+        
+        # Write to file using absolute path
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"✓ Report generated ({len(report)} characters)")
+            print(f"✓ Report written to: {report_path}")
+        except Exception as write_error:
+            print(f"⚠ Error writing report file: {write_error}")
+            import traceback
+            traceback.print_exc()
+            # Try writing to current directory as fallback
+            fallback_path = Path.cwd() / "CONTRACT_TEST_AUDIT_REPORT.md"
+            try:
+                with open(fallback_path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                print(f"⚠ Wrote report to fallback location: {fallback_path}")
+            except Exception as fallback_error:
+                print(f"✗ Failed to write report to fallback location: {fallback_error}")
+    except Exception as e:
+        print(f"⚠ Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
+        # Write minimal error report
+        error_report = f"=== CONTRACT TEST AUDIT ===\n\nERROR: Failed to generate report: {e}\n\n--- Raw Output ---\n{full_output[:5000]}\n"
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(error_report)
+            print(f"✓ Error report written to: {report_path}")
+        except Exception as write_error:
+            print(f"⚠ Error writing error report: {write_error}")
+            # Try fallback
+            fallback_path = Path.cwd() / "CONTRACT_TEST_AUDIT_REPORT.md"
+            try:
+                with open(fallback_path, "w", encoding="utf-8") as f:
+                    f.write(error_report)
+                print(f"⚠ Wrote error report to fallback location: {fallback_path}")
+            except Exception:
+                pass
+        report = error_report
+    
+    print()
+    print()
+    print("=" * 80)
+    print(" " * 20 + "AUDIT REPORT SUMMARY")
+    print("=" * 80)
     print()
     # Print just the summary, not the full report (which can be huge)
     summary_lines = report.split('\n')[:10]  # First 10 lines (header + summary)
-    print('\n'.join(summary_lines))
+    if summary_lines:
+        for line in summary_lines:
+            print(line)
+    else:
+        print("(No summary available - report may be empty)")
     print()
-    print(f"Full report written to: CONTRACT_TEST_AUDIT_REPORT.md")
-    print("=" * 60)
+    print("=" * 80)
+    # Verify report file exists (already determined above)
+    if report_path.exists():
+        file_size = report_path.stat().st_size
+        print(f"✓ Report file confirmed: {report_path}")
+        print(f"✓ Report file size: {file_size} bytes")
+    else:
+        # Check if it was written to current directory instead
+        fallback_path = Path.cwd() / "CONTRACT_TEST_AUDIT_REPORT.md"
+        if fallback_path.exists():
+            print(f"⚠ WARNING: Report file found at fallback location: {fallback_path}")
+            print(f"  Expected location: {report_path}")
+        else:
+            print(f"⚠ WARNING: Report file was not created at expected location: {report_path}")
+            print(f"  Also checked: {fallback_path}")
+    print("=" * 80)
     print()
+    sys.stdout.flush()  # Ensure summary is flushed
     
     return returncode
 

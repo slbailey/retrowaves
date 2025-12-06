@@ -183,7 +183,12 @@ class TestTowerServiceStartupSequence:
     @pytest.fixture
     def service(self):
         """Create TowerService instance."""
-        return TowerService()
+        service = TowerService()
+        yield service
+        try:
+            service.stop()
+        except Exception:
+            pass
     
     @pytest.mark.timeout(10)
     def test_i7_startup_order_critical(self, service):
@@ -264,7 +269,12 @@ class TestTowerServiceInterfaceCompliance:
     @pytest.fixture
     def service(self):
         """Create TowerService instance."""
-        return TowerService()
+        service = TowerService()
+        yield service
+        try:
+            service.stop()
+        except Exception:
+            pass
     
     def test_i9_audiopump_only_calls_encoder_manager(self, service):
         """Test [I9]: AudioPump only calls encoder_manager.write_pcm()."""
@@ -379,7 +389,12 @@ class TestTowerServiceShutdown:
     @pytest.fixture
     def service(self):
         """Create TowerService instance."""
-        return TowerService()
+        service = TowerService()
+        yield service
+        try:
+            service.stop()
+        except Exception:
+            pass
     
     @pytest.mark.timeout(10)
     def test_i12_shutdown_order_reverse(self, service):
@@ -412,7 +427,12 @@ class TestTowerServiceAudioPumpLifecycle:
     @pytest.fixture
     def service(self):
         """Create TowerService instance."""
-        return TowerService()
+        service = TowerService()
+        yield service
+        try:
+            service.stop()
+        except Exception:
+            pass
     
     @pytest.mark.timeout(5)
     def test_a0_tower_service_creates_audiopump(self, service):

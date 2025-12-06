@@ -23,7 +23,7 @@ Tower operates in one of the following modes at any given time:
 **Behavior**:
 - System is initializing components.
 - No encoder process exists.
-- `EncoderManager.get_frame()` MUST return `None` or prebuilt silence MP3 frames.
+- `EncoderManager.get_frame()` SHOULD return prebuilt silence MP3 frames. It MAY return `None` only in non-broadcast or test configurations before the fallback path is initialized. For broadcast-grade deployments, `get_frame()` MUST always return a valid MP3 frame (silence if necessary) per [M10].
 - HTTP broadcast loop MUST continue operating (may send silence or wait for first frame per [T2]).
 - Mode transitions to [O2] BOOTING when encoder process is spawned per [S19].
 

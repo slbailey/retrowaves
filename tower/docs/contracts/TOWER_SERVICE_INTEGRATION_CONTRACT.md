@@ -31,11 +31,13 @@ This contract defines the integration and wiring of TowerService components per 
   3. Start AudioPump thread (begins writing PCM to encoder)
   4. Start HTTP server thread (accepts client connections)
   5. Start HTTP tick/broadcast thread (begins streaming MP3 frames)
+- [I7.1] **AudioPump startup timing**: EncoderManager MAY start before AudioPump, but the system MUST feed initial silence per [S19] step 4, and AudioPump MUST begin ticking within ≤1 grace period (≈24ms) to ensure continuous PCM delivery per [S7.1] and [M19]. This prevents undefined boot windows where FFmpeg receives no PCM input.
 - [I8] This order ensures:
   - Buffers exist before components use them
   - FFmpeg process and stdin exist before AudioPump writes
   - EncoderOutputDrain is ready before encoding begins
   - HTTP server is ready before broadcast loop starts
+  - Initial silence covers the gap between FFmpeg spawn and AudioPump's first tick per [S19] step 4
 - [I26] No startup phase may block waiting on dependencies from later phases. 
   Startup must be strictly forward-directed with no reverse wait cycles.
 
@@ -57,6 +59,13 @@ This contract defines the integration and wiring of TowerService components per 
   3. Stop AudioPump thread
   4. Stop EncoderManager (stops supervisor and drain thread)
   5. Release resources
+- [I27] Service Shutdown Contract:
+  `TowerService.stop()` MUST:
+  1. Stop AudioPump (metronome halts - AudioPump thread must be stopped and joined).
+  2. Stop EncoderManager (which stops Supervisor per [M30] and [S31]).
+  3. Stop HTTP connection manager (close client sockets - all active connections must be closed gracefully).
+  4. Wait for all threads to exit (join - all background threads must be joined with appropriate timeouts).
+  5. Return only after a fully quiescent system state (no active threads, no running processes, system is fully stopped).
 
 ## Required Tests
 
@@ -65,9 +74,12 @@ This contract defines the integration and wiring of TowerService components per 
   - [I4]–[I6], [I5.1]–[I5.2]: Construction order and supervisor encapsulation
   - [I7]–[I8], [I26]: Critical startup sequence
   - [I9]–[I11], [I23]–[I24]: Interface compliance
-  - [I12]: Shutdown sequence
+  - [I12], [I27]: Shutdown sequence and service shutdown contract
   - [I13]–[I17], [I25]: Component isolation for testing
   - [I18]–[I22]: Operational modes + test mode separation
+  - New test expectations for [I27]:
+    - `test_shutdown_halts_audiopump_ticks`: Verify that after `tower_service.stop()`, AudioPump metronome halts (no further ticks occur).
+    - `test_shutdown_allows_garbage_collection_within_timeout`: Verify that after shutdown completes, system reaches a fully quiescent state allowing garbage collection within a reasonable timeout (no lingering threads or resources).
 
 ## 6. Component Isolation for Testing
 

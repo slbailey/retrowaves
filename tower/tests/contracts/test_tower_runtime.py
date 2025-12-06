@@ -93,14 +93,20 @@ class TestTowerRuntimeLiveVsFallback:
     
     def test_t5_1_detects_absence_within_timeout(self, service):
         """Test [T5.1]: Detects absence of frames within TOWER_FRAME_TIMEOUT_MS."""
-        # AudioPump uses timeout in pop_frame() call
+        # EncoderManager.next_frame() uses timeout in pop_frame() call
         import inspect
-        from tower.encoder import audio_pump
+        from tower.encoder import encoder_manager
         
-        source = inspect.getsource(audio_pump.AudioPump._run)
+        source = inspect.getsource(encoder_manager.EncoderManager.next_frame)
         
-        # Should use timeout parameter
-        assert 'pop_frame(timeout=' in source or 'pop_frame(timeout=' in source
+        # Should use timeout parameter in pop_frame() call
+        assert 'pop_frame(timeout=' in source, \
+            "EncoderManager.next_frame() should use timeout in pop_frame() call per [T5.1]"
+        
+        # Verify that _check_pcm_loss() is called to detect PCM stop
+        # This ensures TowerRuntime detects PCM stop and enters fallback per [BG11], [BG12]
+        assert '_check_pcm_loss' in source, \
+            "EncoderManager.next_frame() should call _check_pcm_loss() to detect PCM stop per [BG11]"
     
     def test_t5_2_uses_silence_during_grace(self, service):
         """Test [T5.2]: Uses silence frames during grace period (TOWER_PCM_GRACE_SEC)."""

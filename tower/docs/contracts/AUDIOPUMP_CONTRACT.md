@@ -7,7 +7,7 @@ This contract defines the behavior of AudioPump, which pumps PCM frames to the e
 - [A0] TowerService is responsible for creating and starting AudioPump. AudioPump MUST run continuously for the entire lifetime of Tower. System MP3 output depends on AudioPump providing continuous PCM.
 - [A1] AudioPump is Tower's **sole metronome** - the only clock in the system.
 - [A2] AudioPump **never interacts with FFmpegSupervisor directly**.
-- [A3] AudioPump only calls `encoder_manager.write_pcm(frame: bytes)`.
+- [A3] AudioPump DOES NOT route audio. AudioPump MUST ONLY call `encoder_manager.next_frame(pcm_buffer)` each tick. AudioPump MUST NEVER call `encoder_manager.write_pcm()` or `encoder_manager.write_fallback()` directly. All routing decisions (PCM vs fallback, thresholds, operational modes) are made entirely inside EncoderManager's `next_frame()` method.
 - [A4] Timing loop operates at exactly **24ms intervals** (1152 samples at 48kHz).
 
 ## 2. Interface Contract
@@ -22,11 +22,21 @@ This contract defines the behavior of AudioPump, which pumps PCM frames to the e
 
 ## 3. Frame Selection Logic
 
-- [A7] At each tick (24ms):
-  1. Try to pull frame from `pcm_buffer.pop_frame()`
-  2. If None → get frame from `fallback_generator.get_frame()`
-  3. Call `encoder_manager.write_pcm(frame)`
-- [A8] Frame selection is non-blocking - never waits indefinitely.
+- [A7] At each tick (24ms), AudioPump MUST:
+  1. Call `encoder_manager.next_frame(pcm_buffer)` exactly once
+  2. Return immediately (non-blocking)
+  3. AudioPump does NOT make any routing decisions:
+     - AudioPump does NOT check PCM buffer availability
+     - AudioPump does NOT determine operational mode
+     - AudioPump does NOT apply PCM validity thresholds
+     - AudioPump does NOT choose between PCM vs fallback
+     - AudioPump does NOT call `write_pcm()` or `write_fallback()` directly
+  4. All routing logic is internal to EncoderManager's `next_frame()` method, which:
+     - Checks PCM buffer availability internally
+     - Determines operational mode
+     - Applies PCM validity threshold per [M16A]
+     - Routes to write_pcm() or write_fallback() as appropriate
+- [A8] Frame selection is non-blocking - never waits indefinitely. `next_frame()` MUST return immediately.
 
 ## 4. Timing Model
 

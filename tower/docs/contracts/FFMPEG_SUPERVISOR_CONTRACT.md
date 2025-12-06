@@ -58,12 +58,16 @@ An encoder is considered "live" when **all** of the following are true:
       - Start the 500ms first-frame timer as in [S7], using wall-clock time per [S7B].
       - Only transition to RUNNING after at least one complete MP3 frame has been received within the startup window.
       - RESTARTING state covers the window between detecting a failure and successfully spawning the replacement process. Once the new process is spawned, state MUST become BOOTING, not RUNNING, until [S7] is satisfied.
-  - [S13.8A] Observable restart state sequence: For each restart attempt, the externally observable state sequence MUST include a transition through BOOTING after RESTARTING, even if the newly spawned process fails immediately. In other words, for any single restart attempt, the state sequence MUST be:
-      - … → RESTARTING → BOOTING → (RUNNING | RESTARTING | FAILED)
+  - [S13.8A] **Observable restart state sequence**:
+      - For each restart attempt, the externally observable state sequence MUST include a transition through BOOTING after RESTARTING, even if the newly spawned process fails immediately:
+        - `… → RESTARTING → BOOTING → (RUNNING | RESTARTING | FAILED)`
       - Tests MAY rely on BOOTING being visible (even briefly) before any subsequent failure handling transitions the supervisor back to RESTARTING or FAILED.
-      - This matches the current implementation's "force BOOTING, then defer failure handling" behavior and makes it intentional instead of accidental.
-  - [S13.9] On any unexpected ffmpeg exit — including during BOOTING — the supervisor MUST enter RESTARTING state immediately before scheduling the restart or attempting a new launch. BOOTING may only occur upon actual process start after restart.
-      - This eliminates ambiguity & matches broadcast-grade behavior: failure must be observable, not hidden inside fast restart.
+      - This requirement does NOT imply any special failure deferral in BOOTING beyond [S19.14]; failures detected after BOOTING is reached MUST still be handled immediately by [S13].
+  - [S13.9] On any unexpected ffmpeg exit — including during BOOTING — the supervisor MUST enter RESTARTING state before scheduling the restart or attempting a new launch. During a restart attempt, the state machine MUST still emit the sequence RESTARTING → BOOTING → … per [S13.8A]; "immediately" here means "as soon as that sequence is satisfied", not "prior to BOOTING being observable". This ensures failures are processed promptly while maintaining the observable state sequence required by [S13.8A].
+  - [S13R] On restart, FFmpegSupervisor MUST transition states in order:
+    - RUNNING → RESTARTING → BOOTING → RUNNING
+    - This sequence MUST be encapsulated and observable to EncoderManager via callback.
+    - Tests MAY rely on this complete state sequence being visible during restart operations.
 
 ## 5. Stderr Capture
 
@@ -117,8 +121,10 @@ An encoder is considered "live" when **all** of the following are true:
   - This ensures tests fail loudly when FFmpeg is started inappropriately, while allowing explicit opt-in.
 - [S19.13] **Supervisor start() completion guarantee**:
   Upon return from `start()`, the supervisor state as observable via `get_state()` MUST be BOOTING (not RESTARTING and not FAILED), regardless of any asynchronous stderr/stdout events during initialization. Subsequent failure detection may transition the state away from BOOTING immediately after `start()` returns, but callers are guaranteed to see BOOTING at least once.
-- [S19.14] **Deferred failure handling during STARTING**:
-  If a liveness or process failure is detected while `state == STARTING`, failure handling MUST be queued or deferred. `start()` MUST complete the transition to BOOTING first per [S19.13], after which deferred failure processing MAY proceed normally and transition the state to RESTARTING or FAILED according to [S13].
+- [S19.14] **Deferred failure handling during the initial STARTING window**:
+  - If any liveness or process failure is detected while `state == STARTING` during the initial `start()` call, failure handling MUST be queued or deferred.
+  - `start()` MUST complete the transition to BOOTING first per [S19.13]. After state has become BOOTING (and `start()` has returned), any deferred failures MUST be processed immediately, transitioning to RESTARTING or FAILED according to [S13].
+  - This deferral rule applies ONLY while `state == STARTING` in the initial startup. It MUST NOT be applied to the BOOTING state or to restart attempts. During BOOTING and all restarts, failures (including EOF, process_exit, and startup_timeout) MUST be handled immediately by [S13].
 - [S19.15] **Method boundary neutrality**: The startup sequence in [S19] specifies observable behavior, not internal method boundaries. Implementations MAY distribute these steps across `start()`, `_start_encoder_process()`, restart workers, or other helpers, provided that:
   - From the outside, the sequence of process spawn, initial silence write, non-blocking configuration, drain-thread startup, BOOTING state entry, and first-frame timing behaves as specified.
   - Tests MUST target the behavior (state transitions, timing, logging, restart semantics), not the presence of a specific private method or call graph.
@@ -151,7 +157,7 @@ An encoder is considered "live" when **all** of the following are true:
 - [S21] On process exit, supervisor must attempt to read and log all available stderr output before restarting.
 - [S21.2] **Non-string stderr/exit log hygiene**:
   - Supervisor MUST defensively handle cases where `exit_code` or stderr data is not a plain string (e.g., unittest mocks). Logs MUST degrade gracefully without logging MagicMock representations.
-- [S21.1] Exit code logging on stdin failures:
+- [S21.1] Exit code logging on stdout/stderr EOF and stdin failures:
   - On any failure where FFmpeg stdout reaches EOF or the process is detected as exited (poll() is not None), the supervisor MUST:
     - Attempt to retrieve and log the encoder process return code.
     - If the return code is unavailable (None) due to process being killed, terminated abnormally, or race conditions, the supervisor MUST log a clear message indicating the exit code could not be determined (e.g. "exit code: unknown - process may have been killed").
@@ -164,6 +170,9 @@ An encoder is considered "live" when **all** of the following are true:
     - If exit code is unavailable, log a clear message indicating it could not be determined.
     - Include wording indicating an stdin failure, e.g. containing "stdin" or "broken".
     - This is in addition to any generic "ffmpeg exited immediately at startup (exit code: X)" messages.
+  - **For state machine purposes, an EOF on stdout that indicates encoder termination MUST be treated as a liveness failure equivalent to `process_exit` and handled via [S13]:**
+    - State MUST transition to RESTARTING or FAILED (per restart policy).
+    - Implementations MUST NOT silently swallow EOF as a non-failure condition, even during BOOTING.
 
 ## 9. Public API Visibility
 
@@ -267,6 +276,16 @@ To support deterministic debugging and avoid guess-driven changes, the encoder l
 - [S29] After restart spawn, Supervisor MUST enter BOOTING [O2], not RUNNING, until first MP3 frame is confirmed per [S13.8].
 - [S30] Supervisor MUST continuously emit frames into buffer even if input is silence or tone (per [S7.1]).
 
+## 12. Shutdown Guarantees
+
+- [S31] Supervisor Shutdown Guarantees:
+  On `supervisor.stop()`:
+  1. stdin/stdout/stderr drain threads MUST terminate (threads must exit cleanly, no hanging or blocking).
+  2. FFmpeg process MUST be killed if alive (process must be terminated, not left running).
+  3. Restart logic MUST be disabled (no further restart attempts may be scheduled or executed).
+  4. No background threads may remain running (all threads associated with supervisor must be stopped).
+  5. Shutdown MUST complete within 200ms in test mode (for deterministic test behavior, shutdown must be bounded in time).
+
 ## Required Tests
 
 - `tests/contracts/test_tower_ffmpeg_supervisor.py` MUST cover:
@@ -275,7 +294,7 @@ To support deterministic debugging and avoid guess-driven changes, the encoder l
   - [S7A]: Hard startup timeout configuration and enforcement.
   - [S7B]: First-frame timer uses wall-clock time.
   - [S9]–[S12]: Failure detection mechanisms.
-  - [S13]: Restart behavior and state transitions.
+  - [S13], [S13R]: Restart behavior and state transitions.
   - [S13.3B]–[S13.3C]: Restart continuity (MP3 output remains continuous, frame delivery continues from buffer).
   - [S14]: Stderr capture functionality.
   - [S14.7]: Stdout drain thread ordering and non-blocking termination.
@@ -292,5 +311,8 @@ To support deterministic debugging and avoid guess-driven changes, the encoder l
   - [S25]: Debug mode behavior and environment variable handling.
   - [S26]: PCM validation harness functionality (if implemented as part of contract tests).
   - [S27]–[S30]: Operational mode mapping and behavior.
+  - [S31]: Supervisor shutdown guarantees (thread termination, process kill, restart disable, timing).
+  - New test expectations for [S31]:
+    - `test_shutdown_leaves_no_supervisor_threads`: Verify that after `supervisor.stop()`, no background threads (stdin/stdout/stderr drain threads) remain running.
 
 
