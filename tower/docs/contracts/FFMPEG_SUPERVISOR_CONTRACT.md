@@ -24,15 +24,20 @@ An encoder is considered "live" when **all** of the following are true:
   - DEFAULT: 1500ms
   - If timeout exceeded → trigger restart per [S13].
 - [S7B] First-frame timer MUST use wall-clock time, not frame timestamps or asyncio loop time.
-- [S7.1] **PCM input during BOOTING**: During BOOTING, encoder MUST receive continuous PCM frames (Tower format, 4608 bytes) even if live PCM is absent. Supervisor does not generate or inject PCM; it only receives PCM frames from EncoderManager via `write_pcm()`. The source of PCM (silence, tone, or live) is determined by AudioPump and EncoderManager per operational modes contract, not by the supervisor.
-- [S7.1A] **Default BOOTING input is silence**: The default BOOTING input MUST be standardized silence frames, not tone. Silence frames are valid PCM input and enable rapid encoder startup. Tone is introduced only via operational modes (EncoderManager) once grace period expires, not as part of BOOTING.
-- [S7.1B] **First MP3 frame from any PCM source**: The first MP3 frame produced from any PCM (silence, tone, or live) satisfies [S6A]/[S7] and transitions the supervisor to RUNNING. Supervisor does not distinguish between PCM sources; it only tracks MP3 frame arrival timing.
-- [S7.1C] **Tone via operational modes only**: Tone MUST be introduced only via operational modes (EncoderManager) once grace period expires, not as part of BOOTING. Supervisor has no knowledge of whether incoming PCM is silence, tone, or live; it treats all valid Tower-format PCM frames identically.
+🔥 S7.1 – Encoder Boot Admission Rules
+
+- [S7.1A] BOOTING state begins when ffmpeg is launched.
+- [S7.1B] EncoderManager + Supervisor MUST feed PCM every frame during BOOTING.
+- [S7.1C] Silence is the default input during BOOTING.
+- [S7.1D] Continuous feed prevents starvation but DOES NOT imply RUNNING.
+- [S7.1E] **RUNNING Transition Requirement**: RUNNING MUST NOT be entered until first MP3 frame is detected on stdout. Supervisor must promote state → RUNNING only after first MP3 frame observed, NOT after boot start. The transition occurs in `_stdout_drain()` when the first complete MP3 frame is received from the packetizer.
+- [S7.1F] If MP3 is not observed before startup timeout → RESTARTING.
+- [S7.1G] After max restarts → FAILED, continuity maintained via silence.
 - [S8] **Continuous frames are received**: After the first frame, subsequent frames arrive within `FRAME_INTERVAL` tolerance (default 24ms for 1152-sample frames at 48kHz, with tolerance of ±50% = 12ms to 36ms between frames).
 
 ## 3. Failure Detection
 
-- [S9] **Process failure**: Detected when `process.poll() != None` (process exited).
+- [S9] **Process failure**: Detected when `process.poll() != None` (process exited). Immediate exit detection MUST NOT skip BOOTING. After BOOTING is reached, failure may trigger restart per [S13]. During STARTING, failure handling MUST be deferred per [S19.14].
 - [S10] **Startup timeout**: Detected when first MP3 frame does not arrive within the hard startup timeout per [S7A] (`TOWER_FFMPEG_STARTUP_TIMEOUT_MS`, default 1500ms). On startup timeout exceeding the configured maximum startup window, restart per [S13].
 - [S11] **Stall detection**: Detected when no MP3 frames are received for `TOWER_ENCODER_STALL_THRESHOLD_MS` (default 2000ms) after the first frame.
 - [S12] **Frame interval violation**: Detected when time between consecutive frames exceeds `FRAME_INTERVAL * 1.5` (150% of expected interval).
@@ -105,6 +110,7 @@ An encoder is considered "live" when **all** of the following are true:
   9. If no frame arrives by 500ms → log LEVEL=WARN "slow startup" per [S7] (not a restart condition).
   10. If first frame arrives within hard timeout → transition to RUNNING state per [S6A], encoder is "live".
   11. If timeout exceeds hard timeout per [S7A] → treat as failure per [S10]/[S9]/[S13].
+- [S19.4] **Supervisor MUST accept priming burst without terminating**: Supervisor MUST accept the priming burst (per [S7.3]) without terminating the FFmpeg process. The supervisor MUST NOT treat the priming burst as an error condition or cause process termination. The priming burst is a required part of the startup sequence and must be handled gracefully.
 - [S19.11] Because raw PCM has no headers, FFmpeg MUST be instructed to begin MP3 encoding without waiting for `avformat_find_stream_info()`. The encoding command MUST include:
   - `-frame_size 1152`
   This forces MP3 packetization at correct Tower frame boundaries and guarantees first-frame emission within the configured startup timeout [S7]. Without this flag, FFmpeg may wait indefinitely in PROBE phase, causing startup timeout and continuous supervisor restarts.
@@ -120,15 +126,17 @@ An encoder is considered "live" when **all** of the following are true:
   - RuntimeError from test isolation check MUST propagate (not be caught and swallowed) per [I25].
   - This ensures tests fail loudly when FFmpeg is started inappropriately, while allowing explicit opt-in.
 - [S19.13] **Supervisor start() completion guarantee**:
-  Upon return from `start()`, the supervisor state as observable via `get_state()` MUST be BOOTING (not RESTARTING and not FAILED), regardless of any asynchronous stderr/stdout events during initialization. Subsequent failure detection may transition the state away from BOOTING immediately after `start()` returns, but callers are guaranteed to see BOOTING at least once.
-- [S19.14] **Deferred failure handling during the initial STARTING window**:
-  - If any liveness or process failure is detected while `state == STARTING` during the initial `start()` call, failure handling MUST be queued or deferred.
+  Supervisor.start() MUST synchronously transition to BOOTING before returning, regardless of ffmpeg exit timing. Upon return from `start()`, the supervisor state as observable via `get_state()` MUST be BOOTING (not RESTARTING and not FAILED), regardless of any asynchronous stderr/stdout events during initialization. Subsequent failure detection may transition the state away from BOOTING immediately after `start()` returns, but callers are guaranteed to see BOOTING at least once.
+- [S19.14] **Deferred failure handling during STARTING and before BOOTING**:
+  - If ffmpeg exits during STARTING or before first-frame detection, failure handling MUST be deferred until after BOOTING state is set.
+  - Exit detection MUST NOT override BOOTING during STARTING. Failure must be queued/deferred until BOOTING has been observed.
   - `start()` MUST complete the transition to BOOTING first per [S19.13]. After state has become BOOTING (and `start()` has returned), any deferred failures MUST be processed immediately, transitioning to RESTARTING or FAILED according to [S13].
-  - This deferral rule applies ONLY while `state == STARTING` in the initial startup. It MUST NOT be applied to the BOOTING state or to restart attempts. During BOOTING and all restarts, failures (including EOF, process_exit, and startup_timeout) MUST be handled immediately by [S13].
+  - Once BOOTING is visible → normal restart rules apply. This deferral rule applies ONLY while `state == STARTING` in the initial startup. It MUST NOT be applied to the BOOTING state or to restart attempts. During BOOTING and all restarts, failures (including EOF, process_exit, and startup_timeout) MUST be handled immediately by [S13].
 - [S19.15] **Method boundary neutrality**: The startup sequence in [S19] specifies observable behavior, not internal method boundaries. Implementations MAY distribute these steps across `start()`, `_start_encoder_process()`, restart workers, or other helpers, provided that:
   - From the outside, the sequence of process spawn, initial silence write, non-blocking configuration, drain-thread startup, BOOTING state entry, and first-frame timing behaves as specified.
   - Tests MUST target the behavior (state transitions, timing, logging, restart semantics), not the presence of a specific private method or call graph.
   - This is important for keeping your "contract → tests → implementation" discipline while still allowing refactors (like moving thread start logic between `start()` and `_restart_worker`) without rewriting the contract every time.
+- [S19.16] **Drain thread ordering before initial PCM write**: The supervisor MUST attach stdout/stderr drain threads BEFORE writing initial PCM into stdin. Rationale: FFmpeg output buffers can deadlock or close early if no reader is attached, causing firmware-level shutdown. This requirement ensures that both stdout and stderr drain threads are running and actively reading from their respective pipes before any PCM data is written to stdin. The ordering MUST be: (1) Process spawned, (2) Stdout drain thread started, (3) Stderr drain thread started, (4) Initial silence frame written to stdin. This applies to both initial startup and restart sequences per [S13.8].
 
 ### 7.1 Operational Mode Integration (cross-referenced with ENCODER_OPERATION_MODES.md)
 
@@ -140,6 +148,103 @@ An encoder is considered "live" when **all** of the following are true:
 | BOOTING → first frame (silence during grace) | RUNNING → operational mode determined by EncoderManager (typically BOOTING [O2] until grace expires) |
 | BOOTING → first frame (live PCM arrives) | RUNNING → LIVE_INPUT [O3] |
 | RUNNING (any PCM source) | Operational mode determined by EncoderManager based on PCM source availability |
+
+🔥 S7.2 – PCM Continuity Rules
+
+- [S7.2] **Continuous Feed Requirement**: FFmpeg must receive a PCM frame at every FRAME_INTERVAL without exception. No gaps, no conditional pauses, no "wait for audio to arrive". Silence must always be available as fallback. Violation → restart behavior is permitted, but only after feed requirements are satisfied.
+  - **During BOOTING state**: EncoderManager.next_frame() MUST provide continuous PCM frames (typically silence frames) at FRAME_INTERVAL cadence until real PCM becomes available. Supervisor only writes what it is given. This ensures FFmpeg receives a steady stream of data during startup, preventing encoder starvation or initialization failures.
+
+- [S7.2A] **Allowed PCM Sources**: The Supervisor may receive PCM from only these providers:
+  - Station PCM (primary)
+  - Tone Generator (fallback)
+  - Silence Generator (base fallback)
+  - Other sources prohibited.
+
+- [S7.2B] **Selection Hierarchy (strict priority)**: The PCM source selection hierarchy (Station PCM > Tone > Silence) is enforced in EncoderManager, not in Supervisor. At every tick, EncoderManager MUST select PCM using this exact rule:
+  - If Station PCM available → use Station PCM
+  - Else if fallback_mode == TONE → use Tone
+  - Else → use Silence
+  - This hierarchy is stable, stateless per tick, and no special-case branches may bypass it.
+  - Supervisor receives already-selected frames and MUST NOT override or modify the selection priority.
+
+- [S7.2C] **Boot-State Agnostic Behavior**: The PCM selection rules (enforced in EncoderManager) apply identically whether Supervisor is:
+  - BOOTING
+  - RUNNING
+  - RESTARTING (during process spawn)
+  - FAILED
+  - Supervisor forwards frames regardless of its state; selection priority is determined upstream in EncoderManager.
+
+- [S7.2D] **Silence During Startup**: During BOOTING:
+  - Silence is valid default PCM source
+  - It must continue until first Station PCM OR tone fallback triggers
+  - Silence must not stop once initial frame is written
+  - (Single-frame silence is noncompliant.)
+
+- [S7.2E] **Fallback Tone Activation Rule**: Tone may activate only if:
+  - Supervisor is RUNNING
+  - AND station PCM is unavailable
+  - AND grace window has expired
+  - Tone must not be used in BOOTING unless explicitly contracted later.
+
+- [S7.2F] **Zero PCM Availability Never Halts Feed**: If Station PCM missing and tone generator not operational:
+  - Feed = Silence (mandatory)
+  - FFmpeg must still receive data.
+
+- [S7.2G] **Minimum Sustained Feed Duration During BOOTING**: A single burst is NOT sufficient. During BOOTING, the supervisor MUST maintain a minimum sustained feed duration of ≥5 frames at FRAME_INTERVAL cadence for test simulation continuity. This requirement ensures that the continuous feed mechanism is properly established and can be verified by tests that wait for multiple frame intervals. The sustained feed must continue until real PCM becomes available or the supervisor transitions to RUNNING state.
+  - **Clarification**: Minimum sustained feed (S7.2G) is evaluated at the system level, not enforced by Supervisor internally. Supervisor's compliance means accepting sustained PCM without blocking. Supervisor does not generate frames; it receives frames from EncoderManager and forwards them to FFmpeg. The ≥5 frame requirement is verified by tests that observe system behavior, not by Supervisor's internal logic.
+
+- [S7.2H] **Seamless Transition to Live PCM**: Transition to live PCM must happen without a timing gap ≥1 FRAME_INTERVAL. When Station PCM becomes available during BOOTING, EncoderManager.next_frame() MUST switch from silence frames to live PCM frames within the same FRAME_INTERVAL window, and Supervisor MUST write the frames it receives without delay, ensuring no gap in the continuous feed. The transition must be immediate and must not cause any delay that would violate the continuous feed requirement per [S7.2].
+
+- [S7.2I] **Continuous feed requirement is fulfilled by EncoderManager+AudioPump, not internally by Supervisor**: Supervisor may not generate PCM. It only writes what it is given.
+
+🔥 S7.3 – Encoder Boot Priming Requirements
+
+**Purpose**: Guarantee FFmpeg receives enough PCM during startup to initialize the MP3 encoder and emit first frame before timeout.
+
+- [S7.3] **Boot Priming is Mandatory During BOOTING**: Boot priming is mandatory during BOOTING. System MUST write ≥N PCM frames within T ms of BOOTING state entry (where T = 50ms per [S7.3D] requirement #2). System MUST complete priming before first PCM routing decision.
+
+- [S7.3A] **Priming Trigger**: Priming occurs only when entering BOOTING state and before first FRAME_INTERVAL tick.
+
+- [S7.3B] **Priming Content**: Priming frames follow the selection hierarchy defined in [S7.2B].
+
+- [S7.3C] **Burst Size**: A minimum of N PCM frames MUST be written back-to-back without delay to pre-fill FFmpeg input buffers.
+  - N initially fixed = 5 frames
+  - Value becomes tunable later but contract requires ≥1 frame and enough to meet encoder startup needs
+
+- [S7.3D] **Priming Burst Timing Requirements**:
+  1. Boot priming MUST write ≥N frames back-to-back with no intentional sleep.
+  2. The total priming burst MUST complete within 50ms of entering BOOTING.
+  3. The interval between writes MAY exceed 1ms for the FIRST interval only, due to FFmpeg cold-start initialization and OS pipe wake-up.
+  4. All subsequent intervals (writes 2→3, 3→4, ..., N-1→N) SHOULD be <5ms under normal scheduler conditions. A sub-millisecond interval is ideal but not required for correctness.
+  5. Compliance is measured by burst completion time (requirement #2) and write immediacy (requirement #1), not strict microsecond precision.
+
+- [S7.3E] **Continuous Feed After Priming**: After the priming burst completes, EncoderManager.next_frame() MUST continue providing PCM frames (typically silence frames) at FRAME_INTERVAL cadence without waiting for any external trigger or pipeline readiness event. A minimum of 2 post-priming frames MUST be provided within the normal write cadence (~20–30ms) following the burst. Supervisor only writes what it is given. This ensures:
+  - Priming burst = rapid ≤1ms writes
+  - Continuous feed resumes automatically via EncoderManager.next_frame()
+  - First write occurs immediately after burst
+  - ≥2 additional frames prove cadence resumed
+  - **Note**: Continuous feed is maintained by EncoderManager+AudioPump. Supervisor must continue to accept/carry PCM writes uninterrupted. Per [S7.2] and [S7.4], continuous feed is guaranteed at the system level, and Supervisor's role is to forward PCM frames without blocking.
+
+- [S7.3F] **Observability**: Supervisor MUST log:
+  - start of priming
+  - number of frames written
+  - completion of priming
+  - first MP3 frame observed OR startup timeout
+
+- [S7.3G] **Testable Outcomes**:
+  - **Boot success criteria**:
+    - ffmpeg MUST remain alive past priming
+    - First MP3 frame MUST appear before startup timeout
+    - Supervisor MUST reach RUNNING if MP3 observed
+  - **Boot failure criteria**:
+    - If ffmpeg exits before priming completes → BOOTING → RESTARTING
+    - If timeout hits without MP3 → startup_timeout failure
+    - Restart attempts must follow existing restart contract
+
+🔥 S7.4 – Cadence Source of Truth
+
+- [S7.4] **PCM cadence MUST be driven exclusively by AudioPump**: PCM cadence MUST be driven exclusively by AudioPump calling EncoderManager.next_frame(). Supervisor MUST NOT generate timing-based writes. Silence threads are prohibited.
+- [S7.4A] **Supervisor SHALL NOT operate a cadence or write silence autonomously**: Supervisor SHALL NOT operate a cadence or write silence autonomously. Continuous feed MUST originate from AudioPump → EncoderManager.write_pcm(). Supervisor.write_pcm(bytes) is sink-only.
 
 ## 8. Error Logging
 
@@ -154,6 +259,7 @@ An encoder is considered "live" when **all** of the following are true:
   - Stdin broken: `"🔥 FFmpeg stdin broken (exit code: {code})"`.
   - Stdout EOF: `"🔥 FFmpeg stdout EOF (exit code: {code})"`.
   - **When exit code is unavailable** (process killed, terminated abnormally, or race condition): Supervisor MUST log a clear message indicating the exit code is unknown, e.g. `"exit code: unknown - process may have been killed"` or similar wording that indicates the exit code could not be determined.
+- [S20.2] **PCM flow during BOOTING**: During BOOTING, supervisor MUST receive PCM frames from AudioPump (via EncoderManager.write_pcm()) and MUST forward them to ffmpeg stdin without gaps longer than FRAME_INTERVAL. PCM frames must continue flowing during BOOTING regardless of whether the first MP3 frame has been received. The supervisor MUST NOT wait for the BOOTING → RUNNING transition before forwarding PCM frames; PCM flow is independent of the state transition and must be continuous.
 - [S21] On process exit, supervisor must attempt to read and log all available stderr output before restarting.
 - [S21.2] **Non-string stderr/exit log hygiene**:
   - Supervisor MUST defensively handle cases where `exit_code` or stderr data is not a plain string (e.g., unittest mocks). Logs MUST degrade gracefully without logging MagicMock representations.
@@ -173,6 +279,7 @@ An encoder is considered "live" when **all** of the following are true:
   - **For state machine purposes, an EOF on stdout that indicates encoder termination MUST be treated as a liveness failure equivalent to `process_exit` and handled via [S13]:**
     - State MUST transition to RESTARTING or FAILED (per restart policy).
     - Implementations MUST NOT silently swallow EOF as a non-failure condition, even during BOOTING.
+- [S21.3] **FFmpeg stderr diagnostics on spawn failure**: FFmpeg MUST produce diagnostic stderr output on spawn failure (e.g., when FFmpeg exits immediately due to invalid command, missing codec, or other startup errors). The supervisor MUST capture and expose this stderr output so that the exit reason is visible. When FFmpeg fails at startup, the supervisor MUST ensure stderr is read and made available (either via logging or through a queryable interface) before the process is considered failed. This enables debugging of FFmpeg startup failures by exposing the actual error messages from FFmpeg itself.
 
 ## 9. Public API Visibility
 
@@ -180,7 +287,7 @@ An encoder is considered "live" when **all** of the following are true:
   - `write_pcm(frame: bytes)` → used internally by EncoderManager
   - `get_stdin() -> Optional[BinaryIO]` → **INTERNAL ONLY**, used by EncoderManager.write_pcm()
   - `get_state() -> SupervisorState` → used internally by EncoderManager
-- [S22A] Supervisor MUST NOT know about noise/silence generation — it only handles PCM→MP3 encoding. Silence fallback is handled above at EncoderManager per Operational Modes contract.
+- [S22A] Supervisor MUST NOT know about noise/silence generation — it only handles PCM→MP3 encoding. Silence fallback is handled above at EncoderManager per Operational Modes contract. Supervisor is source-agnostic and MUST forward frames exactly as provided by EncoderManager without modifying priority or selection decisions.
 - [S23] External components must **never** call FFmpegSupervisor methods directly:
   - AudioPump must call `encoder_manager.write_pcm()`, not `supervisor.write_pcm()`
   - TowerService must not access `supervisor.get_stdin()` or any supervisor methods
@@ -274,7 +381,7 @@ To support deterministic debugging and avoid guess-driven changes, the encoder l
   - `FAILED` → [O7] DEGRADED
 - [S28] Supervisor MUST NOT attempt to decide fallback behavior; fallback is handled at EncoderManager layer via Operational Modes.
 - [S29] After restart spawn, Supervisor MUST enter BOOTING [O2], not RUNNING, until first MP3 frame is confirmed per [S13.8].
-- [S30] Supervisor MUST continuously emit frames into buffer even if input is silence or tone (per [S7.1]).
+- [S30] Supervisor MUST continuously write frames it receives into buffer even if input is silence or tone (per [S7.1]). EncoderManager.next_frame() always provides something.
 
 ## 12. Shutdown Guarantees
 

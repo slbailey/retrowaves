@@ -41,6 +41,10 @@ SAMPLE_RATE = 48000
 FRAME_INTERVAL_SEC = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # 0.024s
 FRAME_INTERVAL_MS = FRAME_INTERVAL_SEC * 1000.0  # 24ms
 
+# Per contract [S7.4]: PCM cadence is driven by AudioPump/EncoderManager, not Supervisor.
+# Per contract [S22A]/[M25]: Supervisor is source-agnostic and never generates PCM frames
+# (silence, tone, or live). All Tower-format 4608-byte PCM frames must be supplied upstream.
+
 # Startup timeout per contract [S7], [S7A]
 # Soft target: 500ms (WARN only, not restart condition) per [S7]
 SOFT_STARTUP_TARGET_MS = 500
@@ -145,6 +149,11 @@ class FFmpegSupervisor:
         self._stdout_thread: Optional[threading.Thread] = None
         self._restart_thread: Optional[threading.Thread] = None
         
+        # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor
+        # Supervisor only writes what it receives via write_pcm()
+        self._last_write_ts: Optional[float] = None
+        self._write_lock = threading.Lock()  # Protects _last_write_ts (used for telemetry)
+        
         # Shutdown event
         self._shutdown_event = threading.Event()
         
@@ -152,7 +161,8 @@ class FFmpegSupervisor:
         self._restart_disabled = False
         
         # Liveness tracking per contract [S7], [S8], [S17]
-        self._first_frame_received = False
+        # Per contract [S7.1E]: RUNNING requires first MP3 frame observed from stdout
+        self._first_frame_received = False  # Also serves as _mp3_seen_yet flag
         self._first_frame_time: Optional[float] = None
         self._last_frame_time: Optional[float] = None
         self._startup_time: Optional[float] = None
@@ -171,9 +181,17 @@ class FFmpegSupervisor:
         # semantics per [S19.13]/[S19.14]. Restarts do not reuse this flag.
         self._startup_complete = False
         
+        # Per contract [S19.14]: Pending failures counter for deferring failures during STARTING
+        self._pending_failures = 0
+        self._pending_failure_details: Optional[tuple] = None  # (failure_type, kwargs)
+        self._pending_failure_lock = threading.Lock()
+        
         # Telemetry flags for first byte tracking
         self._debug_first_stdin_logged = False
         self._debug_first_stdout_logged = False
+        
+        # Per contract [S21.3]: Stderr capture for diagnostics
+        self._last_stderr = ""
     
     def start(self) -> None:
         """
@@ -208,20 +226,23 @@ class FFmpegSupervisor:
         if self._on_state_change:
             self._on_state_change(SupervisorState.STARTING)
         
-        # Per contract [S19.13]: Set state to BOOTING BEFORE launching process
-        # This ensures start() always returns with state == BOOTING, even if process exits immediately
-        with self._state_lock:
-            self._state = SupervisorState.BOOTING
-        if self._on_state_change:
-            self._on_state_change(SupervisorState.BOOTING)
-        
-        # Step 1-3: Start encoder process
+        # Step 1-3: Start encoder process FIRST (before setting BOOTING state)
+        # This ensures writer hooks (stdin) are installed before priming burst is triggered
         self._start_encoder_process()
         
         if self._process is None:
             logger.error("Failed to start encoder process")
             self._set_state(SupervisorState.FAILED)
             return
+        
+        # Per contract [S19.13]: Set state to BOOTING AFTER process is started
+        # This ensures start() always returns with state == BOOTING, even if process exits immediately
+        # CRITICAL: State must be set AFTER _start_encoder_process() so that stdin is ready
+        # when the state change callback triggers priming burst
+        with self._state_lock:
+            self._state = SupervisorState.BOOTING
+        if self._on_state_change:
+            self._on_state_change(SupervisorState.BOOTING)
         
         # Step 5: Start stdout drain thread
         # Per contract [S14.7]: stdout drain thread MUST start before or concurrently with stderr drain.
@@ -247,6 +268,19 @@ class FFmpegSupervisor:
             self._stderr_thread.start()
             logger.info("Encoder stderr drain thread started")
         
+        # Per contract [S7.4]/[S22A]/[M25]: Supervisor does not generate or inject PCM.
+        # All Tower-format 4608-byte PCM frames (silence, tone, live) MUST be supplied
+        # by AudioPump/EncoderManager. This includes any priming burst required to keep
+        # FFmpeg alive during BOOTING per [S19.4]; Supervisor remains source-agnostic.
+        logger.debug(
+            "FFMPEG_SUPERVISOR: no internal priming PCM; upstream must supply PCM "
+            "during BOOTING per [S7.4]/[S22A]/[M25]"
+        )
+        
+        # Per contract [S7.4]: PCM cadence is driven by AudioPump via EncoderManager.next_frame()
+        # Supervisor only writes what it receives via write_pcm(). No silence feed loop.
+        self._last_write_ts = None  # Reset write tracking (used for telemetry)
+        
         # Step 8-9: Start timer for first-frame detection per contract [S7], [S7A]
         # Per contract [S7B]: First-frame timer MUST use wall-clock time, not frame timestamps
         # or asyncio loop time. Because async clocks can pause under scheduler pressure,
@@ -260,25 +294,9 @@ class FFmpegSupervisor:
         )
         self._startup_timeout_thread.start()
         
-        # Per [S19.13]: Upon return from start(), state MUST be BOOTING (not RESTARTING and not FAILED),
-        # regardless of any asynchronous stderr/stdout events during initialization.
-        # Subsequent failure detection may transition the state away from BOOTING immediately after
-        # start() returns, but callers are guaranteed to see BOOTING at least once.
-        # State was already set to BOOTING before launching process, so this is just a safety check.
-        final_state = self.get_state()
-        if final_state != SupervisorState.BOOTING:
-            # Force BOOTING per [S19.13] - failures can transition to RESTARTING after start() returns
-            logger.debug(f"Normalizing state to BOOTING per [S19.13] (was {final_state})")
-            self._force_booting(tag="start() completion guarantee [S19.13]")
-        
-        # Per contract [S19.14]: Mark startup as complete AFTER threads are launched and initialized
-        # Yield once to ensure threads have time to initialize before failure detection fires
-        # This ensures start() return commits BOOTING as an atomic event
-        time.sleep(0)  # Yield once (cheap contract-safe fix)
-        
-        # This must be the very last line of start() - enables failure handling only after return
-        with self._state_lock:
-            self._startup_complete = True
+        # Per contract [S19.13]: Complete startup and force state → BOOTING before returning
+        # Even if FFmpeg died milliseconds ago, start() must return with state == BOOTING
+        self._complete_startup()
     
     def stop(self, timeout: float = 5.0) -> None:
         """
@@ -317,6 +335,7 @@ class FFmpegSupervisor:
         
         # Per contract [S31] #1: Stop threads - ensure all drain threads terminate
         thread_timeout = 0.1 if is_test_mode else 1.0  # Tighter timeout in test mode per [S31] #5
+        
         if self._stdout_thread is not None and self._stdout_thread.is_alive():
             self._stdout_thread.join(timeout=thread_timeout)
             if self._stdout_thread.is_alive():
@@ -424,6 +443,27 @@ class FFmpegSupervisor:
         """Get encoder stdin for writing PCM frames."""
         return self._stdin
     
+    def mark_boot_priming_complete(self) -> None:
+        """
+        Mark boot priming as complete per contract [S7.3A].
+        
+        Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor.
+        This method is kept for API compatibility but has no effect since Supervisor
+        no longer operates a silence feed loop.
+        """
+        # No-op: Per [S7.4], Supervisor does not generate timing-based writes
+        logger.debug("FFMPEG_SUPERVISOR: Boot priming complete [S7.3A] (no-op per [S7.4])")
+    
+    @property
+    def last_stderr(self) -> str:
+        """
+        Return most recent stderr buffer per contract [S21.3].
+        
+        Returns the captured stderr output from the most recent FFmpeg process,
+        enabling debugging of startup failures and other errors.
+        """
+        return self._last_stderr
+    
     def write_pcm(self, frame: bytes) -> None:
         """
         Write PCM frame to encoder stdin.
@@ -436,6 +476,9 @@ class FFmpegSupervisor:
         
         Per contract [S22A]: Supervisor MUST NOT know about noise/silence generation.
         It treats all valid Tower-format PCM frames identically.
+        
+        Per contract [S22B]: Non-blocking write semantics - BlockingIOError and BrokenPipeError
+        are silently swallowed during shutdown/teardown.
         
         Args:
             frame: PCM frame bytes to write (Tower format, 4608 bytes)
@@ -461,24 +504,30 @@ class FFmpegSupervisor:
             
             self._stdin.write(frame)
             self._stdin.flush()
+            
+            # Visibility: Log PCM write rate for debugging
+            # Check interval since last write to verify ~23ms cadence
+            with self._write_lock:
+                current_time = time.monotonic()
+                if self._last_write_ts is not None:
+                    interval_ms = (current_time - self._last_write_ts) * 1000.0
+                    logger.debug(
+                        "FFMPEG_SUPERVISOR: PCM write %d bytes (interval: %.1fms)",
+                        len(frame),
+                        interval_ms,
+                    )
+                else:
+                    logger.debug(
+                        "FFMPEG_SUPERVISOR: PCM write %d bytes (first write)",
+                        len(frame),
+                    )
+                self._last_write_ts = current_time
+        except BlockingIOError:  # errno 11
+            # Per contract [S22B]: Swallow silently during shutdown/teardown
+            return
         except BrokenPipeError:
-            # Per contract [S21.1]: Log failure type and return code
-            exit_code = None
-            if self._process is not None:
-                # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None
-                poll_result = self._process.poll()
-                if poll_result is not None and isinstance(poll_result, int):
-                    exit_code = self._process.returncode
-            # Defensively handle MagicMock objects in tests per [S21.2]
-            if exit_code is not None and isinstance(exit_code, int):
-                exit_code_str = str(exit_code)
-            else:
-                exit_code_str = "unknown"
-            logger.warning(
-                f"FFmpeg stdin write failed with BrokenPipeError "
-                f"(failure type: stdin_broken, exit code: {exit_code_str})"
-            )
-            self._handle_failure("stdin_broken", exit_code=exit_code)
+            # Per contract [S22B]: Swallow silently during shutdown/teardown
+            return
     
     def _set_state(self, new_state: SupervisorState) -> None:
         """Set state and notify callback."""
@@ -641,12 +690,6 @@ class FFmpegSupervisor:
             
             # Step 2: Log process PID per contract [S19]
             logger.info(f"Started ffmpeg PID={self._process.pid}")
-            
-            # Per contract [M25]: All PCM generation MUST go through AudioPump.
-            # Supervisor MUST NOT write PCM directly to stdin. The initial silence frame
-            # that was previously written here has been removed to comply with [M25].
-            # AudioPump will provide the first PCM frame via EncoderManager.next_frame()
-            # -> write_pcm() -> supervisor.write_pcm() path.
             
             # Check if process exited immediately per contract [S9], [S21]
             time.sleep(0.2)  # Give FFmpeg a moment to start
@@ -848,6 +891,8 @@ class FFmpegSupervisor:
                         # Per contract [S25.1]: Also log at DEBUG level when debug mode enabled
                         if self._debug_mode:
                             logger.debug(f"[FFMPEG] {decoded_line}")
+                        # Per contract [S21.3]: Capture stderr for exposure
+                        self._last_stderr += decoded_line + "\n"
                 except BlockingIOError:
                     # No data available (non-blocking mode) - sleep briefly and retry
                     time.sleep(0.01)  # 10ms sleep to prevent CPU spinning
@@ -878,18 +923,21 @@ class FFmpegSupervisor:
                 if self._process is not None:
                     poll_result = self._process.poll()
                     if poll_result is not None and isinstance(poll_result, int):
-                        # Telemetry: Log unexpected process exit during startup (in monitor loop)
+                        exit_code = self._process.returncode
+                        # Per contract [S19.14]: Queue if STARTING, process if BOOTING+
                         current_state = self.get_state()
                         if current_state == SupervisorState.BOOTING:
-                            exit_code = self._process.returncode
                             exit_code_str = str(exit_code) if exit_code is not None and isinstance(exit_code, int) else "unknown"
                             logger.error(
                                 "FFMPEG_SUPERVISOR: ffmpeg exited during startup",
                                 extra={"pid": self._process.pid, "returncode": exit_code_str, "phase": "BOOTING"}
                             )
-                        logger.warning("Encoder process exited - triggering restart")
-                        self._handle_failure("process_exit", exit_code=self._process.returncode)
-                        break
+                        self._on_process_failure("process_exit", exit_code=exit_code)
+                        if self.get_state() != SupervisorState.STARTING:
+                            # Was processed (not STARTING), break monitoring
+                            logger.warning("Encoder process exited - triggering restart")
+                            break
+                        # Was deferred (STARTING), continue monitoring
                 
                 # Read from stdout (non-blocking)
                 try:
@@ -901,8 +949,12 @@ class FFmpegSupervisor:
                     continue
                 except (OSError, ValueError) as e:
                     logger.warning(f"Read error in drain thread: {e}")
-                    self._handle_failure("read_error", error=str(e))
-                    break
+                    # Per contract [S19.14]: Queue if STARTING, process if BOOTING+
+                    self._on_process_failure("read_error", error=str(e))
+                    if self.get_state() != SupervisorState.STARTING:
+                        # Was processed (not STARTING), break
+                        break
+                    # Was deferred (STARTING), continue monitoring
                 
                 if not data:
                     # EOF - encoder died per contract [S9], [S21.1]
@@ -947,8 +999,12 @@ class FFmpegSupervisor:
                         f"Encoder stdout EOF - encoder process ended "
                         f"(exit code: {exit_code_str})"
                     )
-                    self._handle_failure("eof", exit_code=exit_code)
-                    break
+                    # Per contract [S19.14]: Defer if STARTING, process if BOOTING+
+                    self._on_process_failure("eof", exit_code=exit_code)
+                    if self.get_state() != SupervisorState.STARTING:
+                        # Was processed (not STARTING), break
+                        break
+                    # Was deferred (STARTING), continue monitoring
                 
                 logger.debug(f"[ENC-OUT] {len(data)} bytes from ffmpeg")
                 
@@ -965,19 +1021,24 @@ class FFmpegSupervisor:
                         # Push to buffer per contract [S4] (preserve buffer contents)
                         self._mp3_buffer.push_frame(frame)
                         
-                        # Track first frame per contract [S7]
-                        # Per contract [S7B]: Use wall-clock time for timing calculations
-                        # Per contract [S7.1B]: First MP3 frame from any PCM source (silence, tone, or live)
-                        # satisfies [S6A]/[S7] and transitions supervisor to RUNNING.
-                        # Supervisor does not distinguish between PCM sources; it only tracks MP3 frame arrival timing.
-                        now = time.time()  # Use wall-clock time per [S7B]
+                        # Per contract [S7.1E]: Detect first MP3 frame and trigger RUNNING transition
+                        # RUNNING MUST NOT be entered until first MP3 frame is detected on stdout
                         if not self._first_frame_received:
-                            self._first_frame_received = True
+                            # First MP3 frame detected - trigger RUNNING transition
+                            self._first_frame_received = True  # Mark MP3 as seen
+                            
+                            # Track first frame per contract [S7]
+                            # Per contract [S7B]: Use wall-clock time for timing calculations
+                            # Per contract [S7.1B]: First MP3 frame from any PCM source (silence, tone, or live)
+                            # satisfies [S6A]/[S7] and transitions supervisor to RUNNING.
+                            # Supervisor does not distinguish between PCM sources; it only tracks MP3 frame arrival timing.
+                            now = time.time()  # Use wall-clock time per [S7B]
                             self._first_frame_time = now
                             elapsed_ms = (now - self._startup_time) * 1000.0 if self._startup_time else 0
                             logger.info(f"First MP3 frame received after {elapsed_ms:.1f}ms")
                             
                             # Step 11 per contract [S19]: Transition BOOTING → RUNNING per [S6A]
+                            # Per contract [S7.1E]: RUNNING transition occurs only after first MP3 frame observed
                             # Per contract [S7.1B]: First frame from any PCM source triggers RUNNING transition
                             # Per contract [S20.1]: This transition MUST log "Encoder LIVE (first frame received)"
                             self._transition_to_running()
@@ -1014,7 +1075,8 @@ class FFmpegSupervisor:
                 
         except Exception as e:
             logger.error(f"Unexpected error in drain thread: {e}", exc_info=True)
-            self._handle_failure("drain_error", error=str(e))
+            # Per contract [S19.14]: Defer if STARTING, process if BOOTING+
+            self._on_process_failure("drain_error", error=str(e))
         finally:
             logger.debug("Encoder output drain thread stopped")
     
@@ -1036,7 +1098,8 @@ class FFmpegSupervisor:
         
         if elapsed_ms >= self._stall_threshold_ms:
             logger.warning(f"🔥 FFmpeg stall detected: {elapsed_ms:.0f}ms without frames")
-            self._handle_failure("stall", elapsed_ms=elapsed_ms)
+            # Per contract [S19.14]: Defer if STARTING, process if BOOTING+
+            self._on_process_failure("stall", elapsed_ms=elapsed_ms)
     
     def _monitor_startup_timeout(self) -> None:
         """
@@ -1046,6 +1109,11 @@ class FFmpegSupervisor:
         This is not a restart condition.
         
         Per contract [S7A]: Hard timeout (default 1500ms) triggers restart per [S13].
+        Per contract [S7.1E]: Startup timeout should only fire if MP3 not yet seen.
+        
+        Thread safety: This method runs in a daemon thread and does not hold locks
+        for extended periods. Failure handling is delegated via _queue_failure_if_starting()
+        which safely handles state transitions without deadlock risk.
         """
         if self._startup_time is None:
             return
@@ -1054,6 +1122,7 @@ class FFmpegSupervisor:
         time.sleep(SOFT_STARTUP_TARGET_SEC)
         
         # Check if first frame arrived within soft target (500ms)
+        # Per contract [S7.1E]: Only check if MP3 not yet seen
         if not self._first_frame_received and not self._slow_startup_warn_logged:
             # Per contract [S7], [S20]: Log WARN at 500ms (not a restart condition)
             logger.warning("⚠ FFmpeg slow startup: first frame not received within 500ms")
@@ -1064,6 +1133,7 @@ class FFmpegSupervisor:
         if remaining_time > 0:
             time.sleep(remaining_time)
         
+        # Per contract [S7.1E]: Startup timeout should only fire if MP3 not yet seen
         # Check if first frame arrived within hard timeout
         if not self._first_frame_received:
             # Telemetry: Log startup timeout firing
@@ -1073,7 +1143,154 @@ class FFmpegSupervisor:
             )
             # Per contract [S7A], [S20]: Log error and restart per [S13]
             logger.error(f"🔥 FFmpeg did not produce first MP3 frame within {STARTUP_TIMEOUT_MS}ms")
-            self._handle_failure("startup_timeout")
+            # Observability: Log captured stderr to diagnose startup failures
+            logger.error("FFMPEG_SUPERVISOR: last_stderr at startup timeout: %s", self.last_stderr or "<empty>")
+            # Per contract [S19.14]: Defer if STARTING, process if BOOTING+
+            # This delegates failure handling safely without deadlock risk
+            self._on_process_failure("startup_timeout")
+    
+    def _on_process_failure(
+        self,
+        failure_type: str,
+        exit_code: Optional[int] = None,
+        elapsed_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Handle process failure, deferring if in STARTING state.
+        
+        Per contract [S19.14]: If ffmpeg exits during STARTING or before first-frame detection,
+        failure handling MUST be deferred until after BOOTING state is set.
+        
+        Args:
+            failure_type: Type of failure (process_exit, startup_timeout, stall, etc.)
+            exit_code: Process exit code (for process_exit)
+            elapsed_ms: Elapsed time in ms (for stall/timeout)
+            error: Error message (for read_error, etc.)
+        """
+        should_log_exit = False
+        should_read_stderr = False
+        exit_code_str = None
+        is_deferred = False
+        
+        with self._state_lock:
+            # Per contract [S19.14]: Defer failures during STARTING state OR if startup
+            # is not yet complete (even if state is BOOTING, _complete_startup() may have
+            # just been called but start() hasn't returned yet). This ensures start() returns
+            # with state == BOOTING per [S19.13].
+            if self._state == SupervisorState.STARTING or not self._startup_complete:
+                is_deferred = True
+                # Queue this event to run after BOOTING promotion and startup completion
+                with self._pending_failure_lock:
+                    self._pending_failures += 1
+                    # Store failure details (keep last failure if multiple occur)
+                    self._pending_failure_details = (failure_type, {
+                        'exit_code': exit_code,
+                        'elapsed_ms': elapsed_ms,
+                        'error': error,
+                    })
+                logger.debug(f"Deferred failure during startup: {failure_type} (state={self._state.name}, startup_complete={self._startup_complete}, will process after BOOTING)")
+                
+                # Per contract [S20], [S21]: Log exit code and stderr immediately when process exits
+                # during STARTING/BOOTING, even though state transition is deferred
+                if failure_type in ("process_exit", "eof", "stdin_broken"):
+                    should_log_exit = True
+                    if exit_code is not None and isinstance(exit_code, int):
+                        exit_code_str = str(exit_code)
+        
+        # Check if stderr thread is alive (outside lock to avoid deadlock)
+        if should_log_exit:
+            stderr_thread_alive = False
+            if self._stderr_thread is not None:
+                try:
+                    stderr_thread_alive = self._stderr_thread.is_alive()
+                except Exception:
+                    pass
+            should_read_stderr = not stderr_thread_alive
+        
+        # Log exit code and read stderr outside the lock per contract [S20], [S21]
+        if should_log_exit:
+            if failure_type == "process_exit":
+                if exit_code_str is not None:
+                    logger.error(
+                        f"🔥 FFmpeg exited immediately at startup (exit code: {exit_code_str})"
+                    )
+                else:
+                    logger.error(
+                        "🔥 FFmpeg exited immediately at startup "
+                        "(exit code: unknown - process may have been killed)"
+                    )
+            elif failure_type == "eof":
+                if exit_code_str is not None:
+                    logger.error(f"🔥 FFmpeg stdout EOF (exit code: {exit_code_str})")
+                else:
+                    logger.error(
+                        "🔥 FFmpeg stdout EOF (exit code: unknown - process may have been "
+                        "killed or terminated abnormally)"
+                    )
+            elif failure_type == "stdin_broken":
+                if exit_code_str is not None:
+                    logger.error(f"🔥 FFmpeg stdin broken (exit code: {exit_code_str})")
+                else:
+                    logger.error(
+                        "🔥 FFmpeg stdin broken (exit code: unknown - process may have been killed)"
+                    )
+            
+            # Per contract [S21]: Read and log stderr immediately when process exits
+            # during STARTING, even though failure handling is deferred
+            if should_read_stderr:
+                self._read_and_log_stderr()
+        
+        if is_deferred:
+            return
+        
+        # Not in STARTING, process asynchronously (not inline) to avoid deadlock
+        kwargs = {
+            'exit_code': exit_code,
+            'elapsed_ms': elapsed_ms,
+            'error': error,
+        }
+        threading.Thread(
+            target=self._handle_failure,
+            args=(failure_type,),
+            kwargs=kwargs,
+            daemon=True
+        ).start()
+    
+    def _complete_startup(self) -> None:
+        """
+        Complete startup sequence and transition to BOOTING.
+        
+        Per contract [S19.13]: start() MUST force state → BOOTING before returning,
+        even if FFmpeg died milliseconds ago.
+        
+        Per contract [S19.14]: After BOOTING is set, any deferred failures are processed.
+        """
+        # Force state → BOOTING per [S19.13]
+        with self._state_lock:
+            self._state = SupervisorState.BOOTING
+        
+        if self._on_state_change:
+            self._on_state_change(SupervisorState.BOOTING)
+        
+        # Now process any deferred failures
+        pending_count = 0
+        failure_details = None
+        with self._pending_failure_lock:
+            if self._pending_failures > 0:
+                pending_count = self._pending_failures
+                failure_details = self._pending_failure_details
+                self._pending_failures = 0
+                self._pending_failure_details = None
+        
+        if pending_count > 0 and failure_details is not None:
+            failure_type, kwargs = failure_details
+            logger.debug(f"Processing {pending_count} deferred failure(s) after BOOTING: {failure_type}")
+            self._handle_failure(failure_type, **kwargs)
+        
+        # Mark startup as complete
+        with self._state_lock:
+            self._startup_complete = True
     
     def _handle_failure(
         self,
@@ -1096,11 +1313,25 @@ class FFmpegSupervisor:
             error: Error message (for read_error, etc.)
         """
         with self._state_lock:
-            # Contract [S19.14]: If we're still in the initial startup window,
-            # failure handling MUST be deferred. We satisfy this by *only*
-            # logging here and returning without changing state or scheduling
-            # restarts. This guarantees start() returns with BOOTING
-            # (per [S19.13]) even if ffmpeg dies immediately.
+            # Contract [S19.14]: If we're in STARTING state, failure handling MUST be deferred.
+            # This ensures start() always returns with state == BOOTING per [S19.13].
+            # Note: This check should not be needed if all callers use _on_process_failure(),
+            # but we keep it as a safety check.
+            if self._state == SupervisorState.STARTING:
+                # This should not happen if callers use _on_process_failure() correctly
+                # But as a safety measure, defer it here
+                with self._pending_failure_lock:
+                    self._pending_failures += 1
+                    self._pending_failure_details = (failure_type, {
+                        'exit_code': exit_code,
+                        'elapsed_ms': elapsed_ms,
+                        'error': error,
+                    })
+                logger.debug(f"Safety defer: failure {failure_type} detected during STARTING (should have been deferred earlier)")
+                return
+            
+            # Legacy check: If startup not complete, defer (for backwards compatibility)
+            # This is redundant with STARTING check above, but kept for safety
             if not self._startup_complete:
                 exit_code_str = None
                 if exit_code is not None and isinstance(exit_code, int):
@@ -1170,6 +1401,9 @@ class FFmpegSupervisor:
             elif failure_type == "startup_timeout":
                 # Per contract [S7A], [S20]: Log hard timeout exceeded
                 logger.error(f"🔥 FFmpeg did not produce first MP3 frame within {STARTUP_TIMEOUT_MS}ms")
+                # Observability: Log captured stderr when transitioning from BOOTING to RESTARTING due to timeout
+                if self._state == SupervisorState.BOOTING:
+                    logger.error("FFMPEG_SUPERVISOR: last_stderr at BOOTING→RESTARTING (startup_timeout): %s", self.last_stderr or "<empty>")
             elif failure_type == "stall":
                 logger.error(f"🔥 FFmpeg stall detected: {elapsed_ms:.0f}ms without frames")
             elif failure_type == "frame_interval_violation":
@@ -1190,6 +1424,9 @@ class FFmpegSupervisor:
             # Per contract [S13.7]: Set state directly since we already hold the lock.
             # MUST NOT call _set_state() which would also acquire _state_lock (deadlock).
             old_state = self._state
+            # Observability: Log captured stderr when transitioning from BOOTING to RESTARTING
+            if old_state == SupervisorState.BOOTING:
+                logger.error("FFMPEG_SUPERVISOR: last_stderr at BOOTING→RESTARTING: %s", self.last_stderr or "<empty>")
             self._state = SupervisorState.RESTARTING
             
             # Per contract [S13.5]: Check max restarts
@@ -1295,6 +1532,9 @@ class FFmpegSupervisor:
         self._debug_first_stdin_logged = False
         self._debug_first_stdout_logged = False
         
+        # Per contract [S21.3]: Reset stderr capture for new process
+        self._last_stderr = ""
+        
         # Start new encoder process
         self._start_encoder_process()
         
@@ -1369,6 +1609,10 @@ class FFmpegSupervisor:
         )
         self._startup_timeout_thread.start()
         
+        # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor
+        # No silence feed loop - Supervisor only writes what it receives via write_pcm()
+        self._last_write_ts = None  # Reset write tracking for new process (used for telemetry)
+        
         # Reset restart attempts on successful restart
         with self._state_lock:
             self._restart_attempts = 0
@@ -1388,6 +1632,8 @@ class FFmpegSupervisor:
         self._shutdown_event.set()
         
         # Stop threads
+        # Per contract [S7.4]: No silence feed thread to stop
+        
         if self._stdout_thread is not None and self._stdout_thread.is_alive():
             self._stdout_thread.join(timeout=1.0)
         
@@ -1480,6 +1726,8 @@ class FFmpegSupervisor:
                     # (not a mock object in tests)
                     if isinstance(err, str) and err.strip():  # Only log if there's actual content
                         logger.error("FFmpeg stderr at exit:\n" + err)
+                        # Per contract [S21.3]: Capture stderr for exposure
+                        self._last_stderr += err
                 except (AttributeError, TypeError):
                     # In tests, decode() or join() might return a mock object - skip logging
                     # This prevents test noise from MagicMock string representations per [S21.2]
