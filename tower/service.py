@@ -1,470 +1,220 @@
-"""
-TowerService - Main service that wires all components together.
+# tower/service.py
 
-Coordinates tone generation, FFmpeg encoding, and HTTP streaming.
-"""
-
+import os
 import logging
-import signal
-import sys
 import threading
 import time
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from tower.audio_input_router import AudioInputRouter
-from tower.config import TowerConfig, get_config
-from tower.encoder import Encoder
-from tower.encoder_manager import EncoderManager
-from tower.fallback import ToneGenerator
-from tower.http_conn import HTTPConnectionManager
-from tower.http_server import TowerHTTPServer
-from tower.silent_mp3 import generate_silent_mp3_chunk
-from tower.source_manager import SourceManager
-from tower.sources import SourceMode
+from tower.encoder.encoder_manager import EncoderManager, EncoderState
+from tower.encoder.ffmpeg_supervisor import SupervisorState
+from tower.audio.ring_buffer import FrameRingBuffer
+from tower.audio.input_router import AudioInputRouter
+from tower.encoder.audio_pump import AudioPump
+from tower.fallback.generator import FallbackGenerator
+from tower.http.server import HTTPServer
 
 logger = logging.getLogger(__name__)
 
 
 class TowerService:
-    """
-    Main Tower service.
-    
-    Coordinates all components:
-    - Tone generator (PCM source)
-    - FFmpeg encoder (PCM -> MP3)
-    - HTTP server (streaming to clients)
-    - Connection manager (client tracking)
-    """
-    
-    def __init__(self, config: Optional[TowerConfig] = None):
+    def __init__(self, encoder_enabled: Optional[bool] = None):
         """
-        Initialize Tower service.
+        Initialize TowerService.
         
         Args:
-            config: Tower configuration (defaults to loading from env)
+            encoder_enabled: Optional flag to enable/disable encoder (default: None, reads from TOWER_ENCODER_ENABLED)
+                           If False or TOWER_ENCODER_ENABLED=0, operates in OFFLINE_TEST_MODE [O6] per [I19]
         """
-        self.config = config or get_config()
-        self._shutdown = False
-        self._start_time = time.time()
+        # Create buffers
+        self.pcm_buffer = FrameRingBuffer(capacity=100)
+        # Create MP3 buffer explicitly (configurable via TOWER_MP3_BUFFER_CAPACITY_FRAMES)
+        mp3_buffer_capacity = int(os.getenv("TOWER_MP3_BUFFER_CAPACITY_FRAMES", "400"))
+        self.mp3_buffer = FrameRingBuffer(capacity=mp3_buffer_capacity)
+        # Pass MP3 buffer to EncoderManager with encoder_enabled flag per [I19]
+        # In production, allow_ffmpeg=True per [I25] (tests must explicitly disable)
+        self.encoder = EncoderManager(
+            pcm_buffer=self.pcm_buffer,
+            mp3_buffer=self.mp3_buffer,
+            encoder_enabled=encoder_enabled,
+            allow_ffmpeg=True,  # Production code allows FFmpeg per [I25]
+        )
         
-        # Components
-        self.tone_generator: Optional[ToneGenerator] = None  # Kept for backwards compatibility
-        self.source_manager: Optional[SourceManager] = None
-        self.audio_input_router: Optional[AudioInputRouter] = None  # Phase 3
-        self.encoder: Optional[Encoder] = None  # Kept for backwards compatibility
-        self.encoder_manager: Optional[EncoderManager] = None  # Phase 4
-        self.connection_manager: Optional[HTTPConnectionManager] = None
-        self.http_server: Optional[TowerHTTPServer] = None
+        # Create audio input router and fallback generator
+        self.router = AudioInputRouter()
+        self.fallback = FallbackGenerator()
         
-        # Phase 4: Silent MP3 for FAILED state
-        self._silent_mp3_chunk: Optional[bytes] = None
+        # Create audio pump (feeds PCM to encoder)
+        self.audio_pump = AudioPump(
+            pcm_buffer=self.pcm_buffer,
+            fallback_generator=self.fallback,
+            encoder_manager=self.encoder
+        )
         
-        # Threads
-        self.pcm_writer_thread: Optional[threading.Thread] = None
-        self.encoder_reader_thread: Optional[threading.Thread] = None
-        self.failed_state_thread: Optional[threading.Thread] = None
-    
-    def start(self) -> None:
-        """Start Tower service."""
-        if self.source_manager is not None:
-            raise RuntimeError("Service already started")
+        # Create HTTP server (manages its own connection manager internally)
+        self.http_server = HTTPServer(host="0.0.0.0", port=8000, frame_source=self.encoder)
         
-        logger.info("Starting Tower service...")
+        self.running = False
+
+    def start(self):
+        """Start encoder + HTTP server threads."""
+        logger.info("=== Tower starting ===")
         
-        # Initialize SourceManager with priority-based default source selection:
-        # 1. MP3 file (if TOWER_SILENCE_MP3_PATH is set and exists) - note: FileSource only handles WAV,
-        #    so MP3 files will need to be converted or this will fall through to tone
-        # 2. Tone generator (if MP3 file not available or invalid)
-        # 3. Silence (if tone generation fails)
-        default_mode = None
-        default_file_path = None
+        # Start encoder (this also starts the drain thread internally)
+        self.encoder.start()
+        logger.info("Encoder started")
         
-        # Priority 1: Check for MP3 file in TOWER_SILENCE_MP3_PATH
-        # Note: FileSource only handles WAV files, so if this is an MP3, it will fail
-        # and fall through to tone. This is intentional - MP3 files would need special handling.
-        if self.config.silence_mp3_path and Path(self.config.silence_mp3_path).exists():
-            # Check if it's a WAV file (FileSource requirement)
-            file_path = Path(self.config.silence_mp3_path)
-            if file_path.suffix.lower() == '.wav':
-                logger.info(f"Using WAV file as default source: {self.config.silence_mp3_path}")
-                default_mode = SourceMode.FILE
-                default_file_path = self.config.silence_mp3_path
-            else:
-                # MP3 file - FileSource can't handle it, will fall through to tone
-                logger.info(f"MP3 file found but FileSource only handles WAV, using tone generator: {self.config.silence_mp3_path}")
-                default_mode = SourceMode.TONE
-                default_file_path = None
-        else:
-            # Priority 2: Use tone generator (default)
-            default_mode_str = self.config.default_source.lower()
-            try:
-                default_mode = SourceMode(default_mode_str)
-            except ValueError:
-                raise ValueError(
-                    f"Invalid TOWER_DEFAULT_SOURCE: {default_mode_str} "
-                    f"(must be 'tone', 'silence', or 'file')"
-                )
+        # Start audio pump
+        self.audio_pump.start()
+        logger.info("AudioPump started")
+        
+        # Note: EncoderManager.start() already starts the drain thread internally
+        # So we just log that it's started as part of encoder startup
+        logger.info("EncoderOutputDrain started")
+        
+        # Start HTTP server (in daemon thread)
+        threading.Thread(target=self.http_server.serve_forever, daemon=True).start()
+        logger.info("HTTP server listening")
+        
+        self.running = True
+        self.main_loop()
+
+    def main_loop(self):
+        """
+        Main broadcast loop with MP3 frame-rate pacing.
+        
+        Per contract [I23]: HTTP broadcast MUST run on a wall-clock interval tick 
+        (default 24ms pacing), NOT only when new frames are available. 
+        Lack of frames MUST NOT stall transmission.
+        
+        Per contract [I24]: During encoder restart, HTTP broadcast MUST continue 
+        uninterrupted using existing MP3 buffer frames or fallback frames. 
+        Restart events MUST NOT stop streaming.
+        """
+        logger.info("Main broadcast loop started")
+        # Audio math for 128kbps MP3:
+        # 128000 bits/sec = 16000 bytes/sec
+        # typical frame = 417 bytes
+        # 41 frames/sec → 24ms spacing
+        FRAME_INTERVAL = 0.024  # real MP3 frame clock per [I23]
+        
+        count = 0
+        while self.running:
+            frame = self.encoder.get_frame()
             
-            default_file_path = self.config.default_file_path if default_mode == SourceMode.FILE else None
-        
-        # Priority 3: If initialization fails, fall back to silence
+            # Per contract [O2.1], broadcast MUST begin instantly on cold start
+            # get_frame() now always returns frames (silence during BOOTING/COLD_START, real frames during LIVE_INPUT)
+            # Never returns None per [O9] (continuous output requirement)
+            # Per contract [I24]: Handle None gracefully to ensure broadcast continues during restart
+            if frame is None:
+                # Should not happen per [O9], but handle gracefully per [I24]
+                logger.warning("get_frame() returned None - using silence frame")
+                frame = self.encoder._silence_frame
+            
+            # TEMPORARY: Verify output buffer is filling
+            mp3_buffer = self.encoder.mp3_buffer
+            if len(mp3_buffer) > 0 and count % 50 == 0:
+                stats = mp3_buffer.stats()
+                # Estimate bytes: typical MP3 frame is ~417 bytes at 128kbps
+                estimated_bytes = stats.count * 417  # Use count, not size per [B20]
+                logger.info(f"MP3 buffer size: {stats.count} frames, ~{estimated_bytes} bytes")
+            
+            self.http_server.broadcast(frame)
+            count += 1
+            # Per contract [I23]: Sleep unconditionally on every iteration to ensure
+            # clock-driven pacing regardless of frame availability
+            time.sleep(FRAME_INTERVAL)
+
+    def run_forever(self):
+        """Block forever like systemd would."""
         try:
-            self.source_manager = SourceManager(
-                self.config,
-                default_mode=default_mode,
-                default_file_path=default_file_path
-            )
-        except (FileNotFoundError, ValueError) as e:
-            logger.warning(f"Failed to initialize source with {default_mode.value}: {e}")
-            # Fall back to silence if initialization fails
-            if default_mode != SourceMode.SILENCE:
-                logger.info("Falling back to silence source")
-                try:
-                    self.source_manager = SourceManager(
-                        self.config,
-                        default_mode=SourceMode.SILENCE,
-                        default_file_path=None
-                    )
-                except Exception as fallback_error:
-                    logger.error(f"Failed to initialize silence source: {fallback_error}")
-                    raise
-            else:
-                # Already trying silence and it failed
-                raise
-        
-        # Keep tone_generator for backwards compatibility (Phase 1 tests)
-        # In Phase 2, we use source_manager, but tone_generator is still referenced
-        # by tests that check for its existence
-        self.tone_generator = ToneGenerator(self.config)
-        
-        # Initialize AudioInputRouter (Phase 3)
-        try:
-            self.audio_input_router = AudioInputRouter(
-                self.config,
-                self.config.socket_path
-            )
-            self.audio_input_router.start()
-            logger.info("AudioInputRouter started")
-        except (OSError, PermissionError) as e:
-            # Permission errors are OK in test environments
-            # Tower can still work with fallback only
-            logger.warning(f"Could not start AudioInputRouter (permission error): {e}")
-            logger.warning("Tower will continue with fallback audio only")
-            self.audio_input_router = None
-        except Exception as e:
-            logger.error(f"Failed to start AudioInputRouter: {e}")
-            # Don't fail startup if router fails - Tower can still work with fallback
-            self.audio_input_router = None
-        
-        # Initialize other components
-        # Phase 4: Use EncoderManager instead of direct Encoder
-        self.encoder_manager = EncoderManager(self.config)
-        
-        # Keep encoder reference for backwards compatibility (Phase 1-3 tests)
-        # Will be set after encoder_manager.start()
-        self.encoder = None
-        
-        self.connection_manager = HTTPConnectionManager(
-            client_timeout_ms=self.config.client_timeout_ms,
-            client_buffer_bytes=self.config.client_buffer_bytes,
-            test_mode=self.config.test_mode,
-            force_slow_client_test=self.config.force_slow_client_test
-        )
-        self.connection_manager.start()  # Start flush thread
-        
-        self.http_server = TowerHTTPServer(
-            self.config.host,
-            self.config.port,
-            self.connection_manager,
-            source_manager=self.source_manager,
-            encoder=self.encoder_manager,  # Pass encoder_manager
-            start_time=self._start_time
-        )
-        
-        # Generate silent MP3 chunk for FAILED state
-        try:
-            self._silent_mp3_chunk = generate_silent_mp3_chunk(self.config)
-            logger.debug(f"Generated silent MP3 chunk ({len(self._silent_mp3_chunk)} bytes)")
-        except Exception as e:
-            logger.warning(f"Failed to generate silent MP3 chunk: {e}")
-            self._silent_mp3_chunk = None
-        
-        # Start encoder through EncoderManager
-        try:
-            self.encoder_manager.start()
-            # Update encoder reference after start (for backwards compatibility)
-            self.encoder = self.encoder_manager.encoder
-        except RuntimeError as e:
-            logger.error(f"Failed to start encoder: {e}")
-            # Don't raise - Tower should continue even if encoder fails initially
-            # EncoderManager will attempt restarts
-            pass
-        
-        # Start HTTP server
-        self.http_server.start()
-        
-        # Give server a moment to start
-        time.sleep(0.1)
-        
-        # Start PCM writer thread (feeds tone to FFmpeg)
-        self.pcm_writer_thread = threading.Thread(
-            target=self._pcm_writer_loop,
-            daemon=False,
-            name="PCMWriter"
-        )
-        self.pcm_writer_thread.start()
-        
-        # Start encoder reader thread (reads MP3 from FFmpeg, broadcasts)
-        self.encoder_reader_thread = threading.Thread(
-            target=self._encoder_reader_loop,
-            daemon=False,
-            name="EncoderReader"
-        )
-        self.encoder_reader_thread.start()
-        
-        logger.info("Tower service started")
-    
-    def _pcm_writer_loop(self):
-        """
-        PCM writer thread (AudioPump): coordinates between live PCM and fallback.
-        
-        Phase 3: Attempts to get frame from AudioInputRouter first, falls back
-        to SourceManager if None is returned.
-        """
-        logger.debug("PCM writer thread (AudioPump) started")
-        
-        # Calculate frame period: 1024 samples / 48000 Hz ≈ 21.3 ms
-        frame_period = self.config.frame_size / self.config.sample_rate
-        
-        # Timeout for router.get_next_frame() - 50ms as per contract
-        router_timeout_ms = 50.0
-        
-        try:
-            while not self._shutdown:
-                frame_start_time = time.time()
-                
-                # Phase 4: Check encoder state
-                encoder_state = self.encoder_manager.get_state()
-                if encoder_state.value in ("restarting", "failed"):
-                    # Encoder is down (RESTARTING or FAILED) - write but ignore errors
-                    # Per contract: AudioPump MUST discard PCM frames when encoder is unavailable
-                    # But we still attempt write in RESTARTING to avoid blocking
-                    try:
-                        frame: Optional[bytes] = None
-                        
-                        # Still generate frame to maintain real-time pace
-                        # Phase 3: Try to get frame from AudioInputRouter first
-                        # Use grace period to prevent tone blips during short gaps
-                        if self.audio_input_router is not None:
-                            if self.audio_input_router.router_dead:
-                                # Router is dead - force fallback by setting frame to None
-                                frame = None
-                            elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
-                                # PCM available within grace period - try to get frame
-                                frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
-                                # If None but still within grace period, use silence instead of tone
-                                if frame is None:
-                                    # Check again if still within grace period (may have expired during get_next_frame)
-                                    if self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
-                                        # Within grace period but no frame available - use silence
-                                        import numpy as np
-                                        frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
-                                    # else: grace period expired, frame stays None to trigger tone fallback
-                            else:
-                                # Grace period expired - no PCM available
-                                frame = None
-                        
-                        # Only fallback to tone when no PCM AND grace expired
-                        if frame is None:
-                            # Get current source (thread-safe, may change between calls)
-                            source = self.source_manager.get_current_source()
-                            
-                            # Generate frame from current source (tone fallback)
-                            frame = source.generate_frame()
-                        
-                        # Validate frame size
-                        if len(frame) != self.config.frame_bytes:
-                            import numpy as np
-                            frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
-                        
-                        # Attempt write (EncoderManager will ignore BrokenPipeError in RESTARTING)
-                        self.encoder_manager.write_pcm(frame)
-                        # Frame is written or discarded - this maintains real-time pace
-                        
-                    except Exception as e:
-                        logger.debug(f"Error generating frame (encoder down): {e}")
-                        # Continue to maintain pace
-                    
-                    # Maintain real-time pace even when discarding
-                    elapsed = time.time() - frame_start_time
-                    sleep_time = frame_period - elapsed
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    continue
-                
-                # Encoder is running - normal operation
-                try:
-                    frame: Optional[bytes] = None
-                    
-                    # Phase 3: Try to get frame from AudioInputRouter first
-                    # Use grace period to prevent tone blips during short gaps
-                    if self.audio_input_router is not None:
-                        if self.audio_input_router.router_dead:
-                            # Router is dead - force fallback by setting frame to None
-                            frame = None
-                        elif self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
-                            # PCM available within grace period - try to get frame
-                            frame = self.audio_input_router.get_next_frame(timeout_ms=router_timeout_ms)
-                            # If None but still within grace period, use silence instead of tone
-                            if frame is None:
-                                # Check again if still within grace period (may have expired during get_next_frame)
-                                if self.audio_input_router.pcm_available(grace_sec=self.config.pcm_grace_sec):
-                                    # Within grace period but no frame available - use silence
-                                    import numpy as np
-                                    frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
-                                # else: grace period expired, frame stays None to trigger tone fallback
-                        else:
-                            # Grace period expired - no PCM available
-                            frame = None
-                    
-                    # Only fallback to tone when no PCM AND grace expired
-                    if frame is None:
-                        # Get current source (thread-safe, may change between calls)
-                        source = self.source_manager.get_current_source()
-                        
-                        # Generate frame from current source (tone fallback)
-                        frame = source.generate_frame()
-                    
-                    # Validate frame size (fallback to silence if invalid)
-                    if len(frame) != self.config.frame_bytes:
-                        logger.warning(
-                            f"Invalid frame size: {len(frame)} bytes, "
-                            f"expected {self.config.frame_bytes} bytes. Using silence."
-                        )
-                        # Fallback to silence
-                        import numpy as np
-                        frame = np.zeros(self.config.frame_bytes, dtype=np.int16).tobytes()
-                    
-                    # Write frame to encoder via EncoderManager
-                    if not self.encoder_manager.write_pcm(frame):
-                        # Write failed - encoder may have died
-                        # EncoderManager will handle restart
-                        logger.debug("Failed to write PCM frame (encoder may be restarting)")
-                    else:
-                        logger.debug(f"Wrote PCM frame ({len(frame)} bytes) to encoder")
-                    
-                except Exception as e:
-                    logger.error(f"Unexpected error in PCM writer: {e}")
-                    # Continue to next iteration (source may have changed)
-                
-                # Maintain real-time pace: sleep for remaining time in frame period
-                elapsed = time.time() - frame_start_time
-                sleep_time = frame_period - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                # If we're behind schedule, continue immediately (don't accumulate latency)
-        
-        except Exception as e:
-            logger.error(f"PCM writer thread error: {e}")
-        finally:
-            logger.debug("PCM writer thread stopped")
-    
-    def _encoder_reader_loop(self):
-        """Encoder reader thread: reads MP3 chunks from encoder and broadcasts."""
-        logger.debug("Encoder reader thread started")
-        
-        chunk_size = self.config.read_chunk_size
-        
-        try:
-            while not self._shutdown:
-                # Phase 4: Use get_chunk() which ALWAYS returns data (never None)
-                # This ensures broadcast loop never starves
-                chunk = self.encoder_manager.get_chunk(chunk_size)
-                
-                # Only broadcast if we have clients
-                if self.connection_manager.get_client_count() > 0:
-                    # Broadcast chunk (always has data)
-                    self.connection_manager.broadcast(chunk)
-                
-                # Sleep to maintain reasonable broadcast rate
-                # At 128kbps, 8192 bytes ≈ 0.5 seconds
-                # Sleep shorter to ensure fast clients get data quickly
-                # But not too short to avoid CPU spinning
-                # Reduced to 10ms to ensure tests receive at least 20-30 chunks in 0.5s
-                time.sleep(0.01)  # 10ms - ensures ~100 chunks/second
-        
-        except Exception as e:
-            logger.error(f"Encoder reader thread error: {e}")
-        finally:
-            logger.debug("Encoder reader thread stopped")
-    
-    def stop(self) -> None:
-        """Stop Tower service."""
-        if self._shutdown:
-            return
-        
-        logger.info("Stopping Tower service...")
-        self._shutdown = True
-        
-        # Stop HTTP server (closes all client connections)
-        if self.http_server:
-            self.http_server.stop()
-        
-        # Close all client connections
-        if self.connection_manager:
-            self.connection_manager.close_all()
-        
-        # Stop encoder manager (Phase 4)
-        if self.encoder_manager:
-            self.encoder_manager.stop()
-        
-        # Stop encoder (for backwards compatibility)
-        if self.encoder:
-            try:
-                self.encoder.stop()
-            except Exception:
-                pass
-        
-        # Clean up source manager
-        if self.source_manager:
-            self.source_manager.cleanup()
-        
-        # Stop AudioInputRouter (Phase 3)
-        if self.audio_input_router:
-            try:
-                self.audio_input_router.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping AudioInputRouter: {e}")
-        
-        # Wait for threads to finish
-        if self.pcm_writer_thread:
-            self.pcm_writer_thread.join(timeout=2.0)
-        
-        if self.encoder_reader_thread:
-            self.encoder_reader_thread.join(timeout=2.0)
-        
-        if self.failed_state_thread:
-            self.failed_state_thread.join(timeout=2.0)
-        
-        logger.info("Tower service stopped")
-    
-    def run_forever(self) -> None:
-        """Run service until shutdown signal."""
-        # Set up signal handlers
-        def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}, shutting down...")
-            self.stop()
-            sys.exit(0)
-        
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-        
-        try:
-            # Keep main thread alive
-            while not self._shutdown:
-                time.sleep(1.0)
+            while True:
+                time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("Keyboard interrupt, shutting down...")
             self.stop()
 
+    def get_mode(self) -> str:
+        """
+        Get current operational mode per [I18], [I22], [O22].
+        
+        Per contract [I22]: TowerService MUST be the root owner of Operational Mode state.
+        EncoderManager and Supervisor MAY update internal state, but TowerService is responsible
+        for exposing and publishing the final operational mode externally.
+        
+        Returns current operational mode as string:
+        - "COLD_START" [O1]: Initial system startup before encoder process is spawned
+        - "BOOTING" [O2]: Startup liveness proving - encoder process is running but first MP3 frame has not yet been received
+        - "LIVE_INPUT" [O3]: Primary operation - encoder is producing MP3 frames from live PCM input
+        - "FALLBACK" [O4]: Tone or silence injection - no live PCM input available
+        - "RESTART_RECOVERY" [O5]: Encoder restart in progress
+        - "OFFLINE_TEST_MODE" [O6]: Testing mode - FFmpeg encoder is disabled
+        - "DEGRADED" [O7]: Maximum restart attempts reached - encoder has failed permanently
+        
+        Returns:
+            str: Current operational mode name
+        """
+        # Per contract [I18], TowerService exposes mode selection & status
+        # Per contract [I22], TowerService is the root owner of operational mode state
+        # Per contract [S27], SupervisorState maps to Operational Modes
+        
+        if not self.encoder._encoder_enabled:
+            return "OFFLINE_TEST_MODE"
+        
+        if self.encoder._supervisor is None:
+            encoder_state = self.encoder.get_state()
+            if encoder_state == EncoderState.STOPPED:
+                return "COLD_START"
+            # Should not happen, but fallback
+            return "COLD_START"
+        
+        supervisor_state = self.encoder._supervisor.get_state()
+        
+        # Per contract [S27], SupervisorState maps to Operational Modes:
+        if supervisor_state in (SupervisorState.STOPPED, SupervisorState.STARTING):
+            return "COLD_START"
+        elif supervisor_state == SupervisorState.BOOTING:
+            return "BOOTING"
+        elif supervisor_state == SupervisorState.RUNNING:
+            # TODO: Could check PCM input status to determine FALLBACK vs LIVE_INPUT
+            # For now, assume LIVE_INPUT if RUNNING
+            return "LIVE_INPUT"
+        elif supervisor_state == SupervisorState.RESTARTING:
+            return "RESTART_RECOVERY"
+        elif supervisor_state == SupervisorState.FAILED:
+            return "DEGRADED"
+        
+        # Fallback
+        return "COLD_START"
+    
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get current system state including operational mode per [I18], [O22].
+        
+        Returns:
+            dict: System state including mode, frame rate, fallback status, etc.
+        """
+        mode = self.get_mode()
+        
+        # Calculate frame rate (fps) - 24ms intervals = ~41.6 fps
+        FRAME_INTERVAL_MS = 24.0
+        fps = 1000.0 / FRAME_INTERVAL_MS
+        
+        # Get buffer stats
+        mp3_stats = self.mp3_buffer.stats()
+        
+        return {
+            "mode": mode,
+            "fps": fps,
+            "fallback": mode in ("FALLBACK", "BOOTING", "RESTART_RECOVERY", "DEGRADED", "OFFLINE_TEST_MODE"),
+            "encoder_state": self.encoder.get_state().name if self.encoder else "UNKNOWN",
+            "mp3_buffer_count": mp3_stats.count,
+            "mp3_buffer_capacity": mp3_stats.capacity,
+            "mp3_buffer_overflow_count": mp3_stats.overflow_count,
+        }
+    
+    def stop(self):
+        logger.info("Shutting down Tower...")
+        self.running = False
+        self.audio_pump.stop()
+        self.encoder.stop()
+        self.http_server.stop()

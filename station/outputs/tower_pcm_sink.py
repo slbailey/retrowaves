@@ -47,8 +47,119 @@ class TowerPCMSink(BaseSink):
         self._connected = False
         self._reconnect_delay = 1.0  # Seconds to wait before reconnecting
         self._last_reconnect_attempt = 0.0
+        self._connection_start_time: Optional[float] = None
+        self._total_connections = 0
+        self._total_disconnections = 0
         
-        logger.info(f"TowerPCMSink initialized (socket={socket_path})")
+        # Internal byte buffer for framing PCM data correctly
+        # Accumulates bytes until we have complete 4096-byte frames
+        self._buffer = bytearray()
+        
+        # Frame statistics (for close() logging only)
+        self._frames_sent = 0
+        
+        # Track last write time to detect track transitions (gaps > 1 second)
+        self._last_write_time: Optional[float] = None
+        self._track_transition_threshold = 1.0  # 1 second gap = track transition
+        
+        logger.info(f"TowerPCMSink initialized (socket={socket_path}, frame_size={frame_size} samples, frame_bytes={self.frame_bytes})")
+    
+    def write_unpaced(self, frame: np.ndarray) -> None:
+        """
+        Write PCM frame to Tower's Unix socket without pacing (burst mode).
+        
+        Similar to write() but sends exactly ONE frame immediately without waiting.
+        Controlled bursts are handled in the playout loop, not here.
+        
+        Args:
+            frame: numpy array containing PCM audio data (must be 1024 samples, 2 channels, s16le)
+        """
+        # Ensure we're connected
+        if not self._connected:
+            if not self._connect():
+                # Not connected and can't reconnect - drop frame silently
+                return
+        
+        # Validate frame size
+        expected_samples = self.frame_size * self.channels
+        if frame.size != expected_samples:
+            logger.warning(
+                f"[PCM] Invalid frame size: {frame.size} samples, "
+                f"expected {expected_samples} samples. Dropping frame."
+            )
+            return
+        
+        # Convert numpy array to bytes (s16le format) and append to buffer
+        try:
+            pcm_bytes = frame.astype(np.int16).tobytes()
+            self._buffer.extend(pcm_bytes)
+        except Exception as e:
+            logger.error(f"[PCM] Error converting frame to bytes: {e}")
+            return
+        
+        # Send exactly ONE complete frame if available (controlled burst - no blasting)
+        if len(self._buffer) >= self.frame_bytes:
+            # Extract exactly one complete frame
+            frame_bytes = bytes(self._buffer[:self.frame_bytes])
+            self._buffer = self._buffer[self.frame_bytes:]
+            
+            # Send complete frame to socket immediately (no pacing)
+            try:
+                if self._socket:
+                    self._socket.sendall(frame_bytes)
+                    self._frames_sent += 1
+            except BrokenPipeError:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.warning(
+                        f"[PCM] Socket broken pipe - Tower may have disconnected "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.warning("[PCM] Socket broken pipe - Tower may have disconnected")
+                self._total_disconnections += 1
+                self._connected = False
+                self._socket = None
+                self._connection_start_time = None
+                return
+            except OSError as e:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.warning(
+                        f"[PCM] Socket error: {e} "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.warning(f"[PCM] Socket error: {e}")
+                self._total_disconnections += 1
+                self._connected = False
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+                self._connection_start_time = None
+                return
+            except Exception as e:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.error(
+                        f"[PCM] Unexpected error writing to socket: {e} "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.error(f"[PCM] Unexpected error writing to socket: {e}")
+                self._total_disconnections += 1
+                self._connected = False
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+                self._connection_start_time = None
+                return
     
     def _connect(self) -> bool:
         """
@@ -79,12 +190,21 @@ class TowerPCMSink(BaseSink):
             # Create Unix domain socket
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             
-            # Connect to Tower's socket
+            # Connect to Tower's socket (blocking connect for Unix sockets)
             sock.connect(self.socket_path)
+            
+            # Keep socket blocking - Tower's reader should be fast enough to prevent buffer fill
+            # If buffer fills, it indicates Tower is not reading fast enough (investigate Tower side)
             
             self._socket = sock
             self._connected = True
-            logger.info(f"[TOWER] Connected to Tower socket: {self.socket_path}")
+            self._connection_start_time = time.time()
+            self._total_connections += 1
+            logger.debug(
+                f"[TOWER] Connected to Tower socket: {self.socket_path} "
+                f"(connection #{self._total_connections}, "
+                f"previous disconnections: {self._total_disconnections})"
+            )
             return True
             
         except FileNotFoundError:
@@ -102,13 +222,44 @@ class TowerPCMSink(BaseSink):
     
     def write(self, frame: np.ndarray) -> None:
         """
-        Write PCM frame to Tower's Unix socket.
+        Write PCM frame to Tower's Unix socket with proper framing.
         
-        Non-blocking: attempts to reconnect if disconnected.
+        Maintains internal byte buffer and only sends complete 4096-byte frames.
+        On track transitions (gaps > 1 second), discards remaining buffer.
+        Station handles real-time pacing, so no sleeps here.
         
         Args:
             frame: numpy array containing PCM audio data (must be 1024 samples, 2 channels, s16le)
         """
+        now = time.time()
+        
+        # Detect track transitions: if gap > 1 second, discard buffer
+        # Note: Tower's grace period is 5 seconds, so we discard buffer on transitions
+        # to prevent sending stale data from previous track
+        track_transition = False
+        if self._last_write_time is not None:
+            gap = now - self._last_write_time
+            if gap > self._track_transition_threshold:
+                # Track transition detected - discard remaining buffer
+                track_transition = True
+                if len(self._buffer) > 0:
+                    logger.debug(f"[PCM] Track transition detected (gap={gap:.2f}s), discarding {len(self._buffer)} bytes from buffer")
+                    self._buffer.clear()
+        self._last_write_time = now
+        
+        # If this is a track transition, immediately send a silence frame to keep Tower's grace period alive
+        # This prevents tone blips during track changes
+        if track_transition:
+            silence_frame = np.zeros((self.frame_size, self.channels), dtype=np.int16)
+            # Send silence frame immediately (bypasses buffer to ensure immediate delivery)
+            try:
+                silence_bytes = silence_frame.astype(np.int16).tobytes()
+                if self._connected and self._socket:
+                    self._socket.sendall(silence_bytes)
+                    logger.debug(f"[PCM] Sent immediate silence frame after track transition to keep Tower grace period alive")
+            except Exception as e:
+                logger.debug(f"[PCM] Could not send silence frame after transition: {e}")
+        
         # Ensure we're connected
         if not self._connected:
             if not self._connect():
@@ -119,48 +270,108 @@ class TowerPCMSink(BaseSink):
         expected_samples = self.frame_size * self.channels
         if frame.size != expected_samples:
             logger.warning(
-                f"[TOWER] Invalid frame size: {frame.size} samples, "
+                f"[PCM] Invalid frame size: {frame.size} samples, "
                 f"expected {expected_samples} samples. Dropping frame."
             )
             return
         
-        # Convert numpy array to bytes (s16le format)
+        # Convert numpy array to bytes (s16le format) and append to buffer
         try:
             pcm_bytes = frame.astype(np.int16).tobytes()
+            self._buffer.extend(pcm_bytes)
         except Exception as e:
-            logger.error(f"[TOWER] Error converting frame to bytes: {e}")
+            logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
-        # Write to socket
-        try:
-            if self._socket:
-                self._socket.sendall(pcm_bytes)
-        except BrokenPipeError:
-            logger.warning("[TOWER] Socket broken pipe - Tower may have disconnected")
-            self._connected = False
-            self._socket = None
-        except OSError as e:
-            logger.warning(f"[TOWER] Socket error: {e}")
-            self._connected = False
-            if self._socket:
-                try:
-                    self._socket.close()
-                except Exception:
-                    pass
+        # Extract and send complete 4096-byte frames from buffer
+        # NEVER send partial frames - if <4096 remain, wait for next decode cycle
+        # CRITICAL: Only send ONE frame per write() call to prevent burst flooding
+        # PlayoutEngine is the metronome - it calls write() at the correct rate (21.33ms per frame)
+        # The sink should NOT add pacing - it just writes frames as provided by the engine
+        
+        # Send exactly ONE frame if available (no pacing - engine handles timing)
+        if len(self._buffer) >= self.frame_bytes:
+            # Extract exactly one complete frame
+            frame_bytes = bytes(self._buffer[:self.frame_bytes])
+            self._buffer = self._buffer[self.frame_bytes:]
+            
+            # Send complete frame to socket immediately
+            # PlayoutEngine has already paced this correctly
+            try:
+                if self._socket:
+                    self._socket.sendall(frame_bytes)
+                    self._frames_sent += 1
+            except BrokenPipeError:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.warning(
+                        f"[PCM] Socket broken pipe - Tower may have disconnected "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.warning("[PCM] Socket broken pipe - Tower may have disconnected")
+                self._total_disconnections += 1
+                self._connected = False
                 self._socket = None
-        except Exception as e:
-            logger.error(f"[TOWER] Unexpected error writing to socket: {e}")
-            self._connected = False
-            if self._socket:
-                try:
-                    self._socket.close()
-                except Exception:
-                    pass
-                self._socket = None
+                self._connection_start_time = None
+                return
+            except OSError as e:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.warning(
+                        f"[PCM] Socket error: {e} "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.warning(f"[PCM] Socket error: {e}")
+                self._total_disconnections += 1
+                self._connected = False
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+                self._connection_start_time = None
+                return
+            except Exception as e:
+                if self._connection_start_time:
+                    connection_duration = time.time() - self._connection_start_time
+                    logger.error(
+                        f"[PCM] Unexpected error writing to socket: {e} "
+                        f"(connection duration: {connection_duration:.1f}s)"
+                    )
+                else:
+                    logger.error(f"[PCM] Unexpected error writing to socket: {e}")
+                self._total_disconnections += 1
+                self._connected = False
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+                self._connection_start_time = None
+                return
     
     def close(self) -> None:
         """Close the socket connection to Tower."""
-        logger.info("[TOWER] Closing Tower PCM socket connection")
+        # On close, discard remaining buffer (don't flush partial frames)
+        if len(self._buffer) > 0:
+            logger.debug(f"[PCM] Closing sink, discarding {len(self._buffer)} bytes from buffer")
+            self._buffer.clear()
+        
+        if self._connection_start_time:
+            connection_duration = time.time() - self._connection_start_time
+            logger.info(
+                f"[PCM] Closing Tower PCM socket connection "
+                f"(connection duration: {connection_duration:.1f}s, "
+                f"total connections: {self._total_connections}, "
+                f"total disconnections: {self._total_disconnections}, "
+                f"total frames sent: {self._frames_sent})"
+            )
+        else:
+            logger.info(f"[PCM] Closing Tower PCM socket connection (total frames sent: {self._frames_sent})")
         self._connected = False
         if self._socket:
             try:
@@ -168,5 +379,6 @@ class TowerPCMSink(BaseSink):
             except Exception:
                 pass
             self._socket = None
-        logger.info("[TOWER] Tower PCM socket closed")
+        self._connection_start_time = None
+        logger.info("[PCM] Tower PCM socket closed")
 

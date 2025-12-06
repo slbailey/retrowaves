@@ -105,7 +105,7 @@ class PlayoutEngine:
     Architecture 3.2 Reference: Section 5
     """
     
-    def __init__(self, dj_callback: Optional[DJCallback] = None, output_sink: Optional[BaseSink] = None):
+    def __init__(self, dj_callback: Optional[DJCallback] = None, output_sink: Optional[BaseSink] = None, tower_control: Optional = None):
         """
         Initialize the playout engine.
         
@@ -113,16 +113,28 @@ class PlayoutEngine:
             dj_callback: Optional DJ callback object that implements
                         on_segment_started and on_segment_finished methods
             output_sink: Output sink to write audio frames to (required for real audio playback)
+            tower_control: Optional TowerControlClient for buffer monitoring and adaptive pacing
         """
         self._queue = PlayoutQueue()
         self._dj_callback = dj_callback
         self._output_sink = output_sink
+        self._tower_control = tower_control
         self._current_segment: Optional[AudioEvent] = None
         self._is_playing = False
         self._is_running = False
         self._stop_event = threading.Event()
         self._play_thread: Optional[threading.Thread] = None
         self._mixer = Mixer()
+        
+        # Monitoring: track queue stats for debugging
+        self._last_queue_log_time = time.time()
+        self._queue_log_interval = 5.0  # Log queue stats every 5 seconds
+        
+        # Buffer monitoring for adaptive pacing
+        self._last_buffer_check_time = 0.0  # Start at 0 to force immediate check
+        self._buffer_check_interval = 0.5    # Check buffer every 500ms (slow control loop)
+        self._current_buffer_fill = None
+        self._current_buffer_capacity = None
         
         # Fallback segment durations (in seconds) if we can't detect real duration
         self._default_segment_duration = 180.0  # 3 minutes default for songs
@@ -243,6 +255,15 @@ class PlayoutEngine:
         logger.info("Playout loop started")
         
         while self._is_running and not self._stop_event.is_set():
+            # Periodic queue monitoring (every 5 seconds)
+            now = time.time()
+            if now - self._last_queue_log_time >= self._queue_log_interval:
+                queue_size = self._queue.size()
+                logger.info(
+                    f"[QUEUE_MONITOR] PlayoutQueue: {queue_size} segments waiting"
+                )
+                self._last_queue_log_time = now
+            
             # Try to get next segment from queue
             segment = self._queue.dequeue()
             
@@ -272,27 +293,21 @@ class PlayoutEngine:
         """
         Decode and play an audio segment.
         
-        The decoder reads frames as fast as possible, but we need to rate-limit
-        playback to real-time. We calculate the expected duration and ensure
-        we don't finish until that time has elapsed.
+        Decodes frames and writes them with absolute-timing pacing at exactly 21.333ms per frame.
+        Uses absolute clock timing to prevent cumulative drift.
         
         Args:
             segment: AudioEvent to play
         """
         if not self._output_sink:
             logger.warning("No output sink configured - cannot play audio")
-            # Fall back to simulated playback
+            # Fall back to simulated playback (minimal timing for simulation only)
             duration = self._get_segment_duration(segment)
             logger.debug(f"Simulating playback for {duration:.1f} seconds (no sink)")
-            elapsed = 0.0
-            check_interval = 0.1
-            while elapsed < duration and self._is_running and not self._stop_event.is_set():
-                sleep_time = min(check_interval, duration - elapsed)
-                time.sleep(sleep_time)
-                elapsed += sleep_time
+            time.sleep(duration)
             return
         
-        # Get expected duration for rate-limiting
+        # Get expected duration for logging
         expected_duration = self._get_segment_duration(segment)
         logger.info(f"[PLAYOUT] Decoding and playing: {segment.path} (expected duration: {expected_duration:.1f}s)")
         
@@ -300,7 +315,13 @@ class PlayoutEngine:
         frame_count = 0
         frame_size = 1024  # samples per frame
         sample_rate = 48000  # Hz
-        frames_per_second = sample_rate / frame_size  # ~46.875 frames/sec
+        
+        # Calculate frame period: 1024 samples / 48000 Hz = exactly 21.333ms
+        # Station paces frames at exactly this rate using absolute clock timing
+        FRAME_DURATION = frame_size / sample_rate  # 0.021333... seconds (exactly 21.333ms)
+        
+        # Absolute clock timing - prevents cumulative drift
+        next_frame_time = time.time()
         
         try:
             # Create decoder for this segment
@@ -308,41 +329,73 @@ class PlayoutEngine:
             decoder = FFmpegDecoder(segment.path, frame_size=frame_size)
             logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
             
-            # Decode and play frames with rate limiting
+            # Initial buffer check - get thresholds before starting playback
+            # Initial buffer check before starting playback
+            if self._tower_control:
+                buffer_status = self._tower_control.get_buffer()
+                if buffer_status:
+                    self._current_buffer_fill = buffer_status.get("fill")
+                    self._current_buffer_capacity = buffer_status.get("capacity")
+                self._last_buffer_check_time = time.time()
+            
+            # Decode and write frames with proportional (P-controller) rate adjustment
             for frame in decoder.read_frames():
                 # Check if we should stop
                 if not self._is_running or self._stop_event.is_set():
                     logger.info(f"[PLAYOUT] Stopping playback early (stop requested)")
                     break
                 
+                # Check buffer status periodically for proportional rate adjustment
+                now = time.time()
+                if self._tower_control and (now - self._last_buffer_check_time) >= self._buffer_check_interval:
+                    buffer_status = self._tower_control.get_buffer()
+                    if buffer_status:
+                        self._current_buffer_fill = buffer_status.get("fill")
+                        self._current_buffer_capacity = buffer_status.get("capacity")
+                    self._last_buffer_check_time = now
+                
                 # Apply gain via mixer
                 processed_frame = self._mixer.mix(frame, gain=segment.gain)
                 
-                # Write to output sink (non-blocking, sink handles buffering)
+                # Write frame
                 self._output_sink.write(processed_frame)
                 frame_count += 1
                 
-                # Rate limit: calculate when this frame should be played
-                # We want to play frames at real-time speed
-                expected_elapsed = frame_count / frames_per_second
-                actual_elapsed = time.time() - start_time
+                # ---- Simple zone-based pacing based on Tower ring buffer ----
+                if (
+                    self._current_buffer_fill is not None and
+                    self._current_buffer_capacity not in (None, 0)
+                ):
+                    fill = self._current_buffer_fill
+                    cap = self._current_buffer_capacity
+
+                    low_threshold  = int(0.20 * cap)   # <20% → we're too low
+                    high_threshold = int(0.70 * cap)   # >70% → we're getting too full
+
+                    if fill <= low_threshold:
+                        # 🔴 Buffer low → push as fast as possible (no sleep)
+                        adaptive_sleep = 0.0
+
+                    elif fill >= high_threshold:
+                        # 🟢 Buffer high → slow down so we don't overflow
+                        adaptive_sleep = 0.030  # 30ms
+
+                    else:
+                        # ⚪ Sweet spot (20–70% full) → run slightly faster than Tower
+                        # Tower consumes at ~21.33ms per frame; we aim ~18ms
+                        adaptive_sleep = 0.018
+                else:
+                    # No buffer info → fall back to nominal pacing
+                    adaptive_sleep = FRAME_DURATION
                 
-                # If we're ahead of schedule, sleep a bit
-                if expected_elapsed > actual_elapsed:
-                    sleep_time = expected_elapsed - actual_elapsed
-                    if sleep_time > 0.001:  # Only sleep if more than 1ms
-                        time.sleep(sleep_time)
+                # Sleep for calculated time
+                if adaptive_sleep > 0.001:
+                    time.sleep(adaptive_sleep)
                 
-                # Log progress every 1000 frames (~20 seconds at 48kHz)
+                # Log progress every 1000 frames (~21.3 seconds at 21.333ms per frame)
                 if frame_count % 1000 == 0:
+                    actual_elapsed = time.time() - start_time
                     logger.debug(f"[PLAYOUT] Played {frame_count} frames ({actual_elapsed:.1f}s elapsed)")
-            
-            # Wait for remaining duration if we finished decoding early
-            actual_elapsed = time.time() - start_time
-            if actual_elapsed < expected_duration:
-                remaining = expected_duration - actual_elapsed
-                logger.debug(f"[PLAYOUT] Decoding finished early, waiting {remaining:.1f}s for playback to complete")
-                time.sleep(remaining)
             
             total_time = time.time() - start_time
             logger.info(f"[PLAYOUT] Finished playing {segment.path} ({frame_count} frames, {total_time:.1f}s)")

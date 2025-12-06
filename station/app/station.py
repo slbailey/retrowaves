@@ -72,7 +72,7 @@ class Station:
         logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
 
         # Real playout engine with DJ callback and output sink (Architecture 3.2)
-        self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink)
+        self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink, tower_control=self.tower_control)
         
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)

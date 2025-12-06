@@ -36,6 +36,10 @@ class TowerControlClient:
         self.base_url = f"http://{tower_host}:{tower_port}"
         self.timeout = 5.0  # 5 second timeout for API calls
         
+        # Suppress httpx INFO level logging (reduce noise from frequent buffer polling)
+        httpx_logger = logging.getLogger("httpx")
+        httpx_logger.setLevel(logging.WARNING)
+        
         logger.info(f"TowerControlClient initialized (url={self.base_url})")
     
     def switch_source(self, mode: str, file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -84,5 +88,25 @@ class TowerControlClient:
             return None
         except Exception as e:
             logger.error(f"[TOWER] Unexpected error getting status: {e}")
+            return None
+    
+    def get_buffer(self) -> Optional[Dict[str, Any]]:
+        """
+        Get Tower ring buffer status.
+        
+        Returns:
+            Buffer dict with 'fill' and 'capacity' keys, or None if request failed
+        """
+        url = f"{self.base_url}/tower/buffer"
+        
+        try:
+            response = httpx.get(url, timeout=self.timeout)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as e:
+            logger.debug(f"[TOWER] Failed to get buffer status: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"[TOWER] Unexpected error getting buffer status: {e}")
             return None
 

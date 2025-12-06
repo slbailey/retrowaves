@@ -117,6 +117,72 @@ Record a rolling 24-hour version of the station:
 - Troubleshooting
 - Fun playback
 
+### 4.5 Advanced Buffer Management with PID Controller
+
+**Future Goal:** Replace the current simple 3-zone buffer controller with a proper PID (Proportional-Integral-Derivative) feedback loop for smoother, more precise rate control.
+
+**Current Status:**
+- Station uses a simple 3-zone controller (low/normal/high) with fixed sleep times
+- Buffer polling happens every 500ms
+- Works but can be improved for better stability
+
+**Desired Future Behavior:**
+- Implement a full PID controller for continuous rate adjustment
+- **Proportional (P) term:** Responds to current buffer fill deviation from target
+- **Integral (I) term:** Accumulates error over time to eliminate steady-state offset
+- **Derivative (D) term:** Predicts future error based on rate of change
+- Smooth, continuous rate adjustment without discrete zone transitions
+- Better handling of varying network conditions and Tower consumption rates
+- Tunable PID coefficients for different buffer sizes and network conditions
+
+**Benefits:**
+- Eliminates stuttering from discrete zone transitions
+- More responsive to rapid buffer changes
+- Better long-term stability (I term prevents drift)
+- Industry-standard approach used in streaming media encoders
+
+**Implementation Notes:**
+- PID controller would replace the current zone-based logic in `PlayoutEngine._play_audio_segment()`
+- Coefficients (Kp, Ki, Kd) should be configurable
+- May need different tuning for different buffer capacities
+- Should maintain safety limits (min/max sleep times)
+
+### 4.6 Pre-Fill Stage for Tower Buffer
+
+**Future Goal:** Implement a pre-fill stage that builds up the Tower ring buffer before starting normal playback to prevent dropped frames when Tower comes online.
+
+**Current Status:**
+- Station starts sending frames immediately when playback begins
+- If Tower buffer is empty (0/50), frames are sent at normal rate
+- This can cause stuttering and dropped frames (e.g., 7940 dropped frames observed)
+- No pre-fill phase exists
+
+**Desired Future Behavior:**
+- Before starting normal playback, check Tower buffer fill level
+- If buffer is below target (e.g., < 50% capacity), enter pre-fill mode
+- During pre-fill:
+  - Decode and send frames as fast as possible (no sleep)
+  - Monitor buffer fill level periodically
+  - Continue until buffer reaches target fill (e.g., 50% = 25/50 frames)
+- Once target is reached, transition to normal adaptive pacing
+- Pre-fill should happen automatically when:
+  - Station starts up
+  - Tower restarts/reconnects
+  - Buffer drops below threshold during playback
+
+**Benefits:**
+- Prevents initial stuttering when Tower comes online
+- Eliminates dropped frames during startup
+- Ensures smooth playback from the first frame
+- Better user experience with no audio gaps
+
+**Implementation Notes:**
+- Pre-fill should be integrated into `PlayoutEngine._play_audio_segment()`
+- Should work seamlessly with the adaptive pacing system
+- May need to coordinate with Tower's buffer status endpoint
+- Should have a timeout/safety limit to prevent infinite pre-fill
+- Could be combined with PID controller for smooth transition
+
 ---
 
 ## 5. DJ Intelligence & Content Logic

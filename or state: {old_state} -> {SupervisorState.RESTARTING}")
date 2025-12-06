@@ -1,0 +1,1118 @@
+[1mdiff --git a/tower/encoder/ffmpeg_supervisor.py b/tower/encoder/ffmpeg_supervisor.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..8416d2f[m
+[1m--- /dev/null[m
+[1m+++ b/tower/encoder/ffmpeg_supervisor.py[m
+[36m@@ -0,0 +1,1283 @@[m
+[32m+[m[32m"""[m
+[32m+[m[32mFFmpeg Supervisor for Tower encoding subsystem.[m
+[32m+[m
+[32m+[m[32mThis module provides FFmpegSupervisor, which monitors encoder health and ensures[m
+[32m+[m[32mcontinuous MP3 output according to the FFMPEG_SUPERVISOR_CONTRACT.[m
+[32m+[m
+[32m+[m[32mSee docs/contracts/FFMPEG_SUPERVISOR_CONTRACT.md for full specification.[m
+[32m+[m[32m"""[m
+[32m+[m
+[32m+[m[32mfrom __future__ import annotations[m
+[32m+[m
+[32m+[m[32mimport enum[m
+[32m+[m[32mimport logging[m
+[32m+[m[32mimport os[m
+[32m+[m[32mimport select[m
+[32m+[m[32mimport subprocess[m
+[32m+[m[32mimport sys[m
+[32m+[m[32mimport threading[m
+[32m+[m[32mimport time[m
+[32m+[m[32mfrom typing import BinaryIO, Callable, List, Optional[m
+[32m+[m
+[32m+[m[32mfrom tower.audio.mp3_packetizer import MP3Packetizer[m
+[32m+[m[32mfrom tower.audio.ring_buffer import FrameRingBuffer[m
+[32m+[m
+[32m+[m[32mlogger = logging.getLogger(__name__)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass SupervisorState(enum.Enum):[m
+[32m+[m[32m    """Supervisor state enumeration per contract [S19], [S6A]."""[m
+[32m+[m[32m    STARTING = 1[m
+[32m+[m[32m    BOOTING = 2  # Per contract [S6A]: BOOTING state until first MP3 frame received[m
+[32m+[m[32m    RUNNING = 3[m
+[32m+[m[32m    RESTARTING = 4[m
+[32m+[m[32m    FAILED = 5[m
+[32m+[m[32m    STOPPED = 6[m
+[32m+[m
+[32m+[m
+[32m+[m[32m# Frame timing constants per contract [S15][m
+[32m+[m[32mFRAME_SIZE_SAMPLES = 1152[m
+[32m+[m[32mSAMPLE_RATE = 48000[m
+[32m+[m[32mFRAME_INTERVAL_SEC = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # 0.024s[m
+[32m+[m[32mFRAME_INTERVAL_MS = FRAME_INTERVAL_SEC * 1000.0  # 24ms[m
+[32m+[m
+[32m+[m[32m# Startup timeout per contract [S7], [S7A][m
+[32m+[m[32m# Soft target: 500ms (WARN only, not restart condition) per [S7][m
+[32m+[m[32mSOFT_STARTUP_TARGET_MS = 500[m
+[32m+[m[32mSOFT_STARTUP_TARGET_SEC = SOFT_STARTUP_TARGET_MS / 1000.0[m
+[32m+[m
+[32m+[m[32m# Hard timeout: configurable via TOWER_FFMPEG_STARTUP_TIMEOUT_MS, default 1500ms per [S7A][m
+[32m+[m[32mdef _get_startup_timeout_ms() -> int:[m
+[32m+[m[32m    """Get startup timeout from environment or use default per contract [S7A]."""[m
+[32m+[m[32m    return int(os.getenv("TOWER_FFMPEG_STARTUP_TIMEOUT_MS", "1500"))[m
+[32m+[m
+[32m+[m[32mSTARTUP_TIMEOUT_MS = _get_startup_timeout_ms()[m
+[32m+[m[32mSTARTUP_TIMEOUT_SEC = STARTUP_TIMEOUT_MS / 1000.0[m
+[32m+[m
+[32m+[m[32m# Default FFmpeg command for PCM to MP3 encoding (live-mode)[m
+[32m+[m[32m# Per contract [S19.11]: Must include -frame_size 1152 to force MP3 packetization[m
+[32m+[m[32m# at correct Tower frame boundaries and guarantee first-frame emission within startup timeout[m
+[32m+[m[32mDEFAULT_FFMPEG_CMD = [[m
+[32m+[m[32m    "ffmpeg",[m
+[32m+[m[32m    "-hide_banner",[m
+[32m+[m[32m    "-nostdin",[m
+[32m+[m[32m    "-loglevel", "warning",[m
+[32m+[m[32m    "-f", "s16le",[m
+[32m+[m[32m    "-ar", "48000",[m
+[32m+[m[32m    "-ac", "2",[m
+[32m+[m[32m    "-i", "pipe:0",[m
+[32m+[m[32m    "-c:a", "libmp3lame",[m
+[32m+[m[32m    "-b:a", "128k",[m
+[32m+[m[32m    "-frame_size", "1152",  # Per contract [S19.11]: Required for raw PCM encoding[m
+[32m+[m[32m    "-f", "mp3",[m
+[32m+[m[32m    "-fflags", "+nobuffer",[m
+[32m+[m[32m    "-flush_packets", "1",[m
+[32m+[m[32m    "-write_xing", "0",[m
+[32m+[m[32m    "pipe:1",[m
+[32m+[m[32m][m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass FFmpegSupervisor:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    FFmpeg encoder supervisor implementing FFMPEG_SUPERVISOR_CONTRACT.[m
+[32m+[m[41m    [m
+[32m+[m[32m    Monitors encoder health, detects failures, and manages restarts with[m
+[32m+[m[32m    exponential backoff. Ensures continuous MP3 output regardless of encoder[m
+[32m+[m[32m    health issues.[m
+[32m+[m[41m    [m
+[32m+[m[32m    Per contract [S22A]: Supervisor MUST NOT know about noise/silence generation.[m
+[32m+[m[32m    It is source-agnostic and treats all valid Tower-format PCM frames identically.[m
+[32m+[m[32m    PCM source selection (silence, tone, or live) is handled by AudioPump/EncoderManager.[m
+[32m+[m[41m    [m
+[32m+[m[32m    Contract compliance:[m
+[32m+[m[32m    - [S1] Encoder is "live" only when all liveness criteria are met[m
+[32m+[m[32m    - [S2] Restarts encoder on any liveness failure with error logging[m
+[32m+[m[32m    - [S3] Never blocks output path (MP3 frame delivery)[m
+[32m+[m[32m    - [S4] Preserves MP3 buffer contents during restarts[m
+[32m+[m[32m    - [S7.1] Receives PCM frames via write_pcm(), does not generate or inject PCM[m
+[32m+[m[32m    - [S22A] Source-agnostic: does not distinguish between silence, tone, or live PCM[m
+[32m+[m[32m    """[m
+[32m+[m[41m    [m
+[32m+[m[32m    def __init__([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        mp3_buffer: FrameRingBuffer,[m
+[32m+[m[32m        ffmpeg_cmd: Optional[List[str]] = None,[m
+[32m+[m[32m        stall_threshold_ms: int = 2000,[m
+[32m+[m[32m        backoff_schedule_ms: Optional[List[int]] = None,[m
+[32m+[m[32m        max_restarts: int = 5,[m
+[32m+[m[32m        on_state_change: Optional[Callable[[SupervisorState], None]] = None,[m
+[32m+[m[32m        allow_ffmpeg: bool = False,[m
+[32m+[m[32m    ) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Initialize FFmpeg supervisor.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            mp3_buffer: FrameRingBuffer for MP3 output frames (preserved during restarts)[m
+[32m+[m[32m            ffmpeg_cmd: Optional FFmpeg command to execute (default: DEFAULT_FFMPEG_CMD)[m
+[32m+[m[32m            stall_threshold_ms: Stall detection threshold (default: 2000ms per [S11])[m
+[32m+[m[32m            backoff_schedule_ms: Exponential backoff delays (default: [1000,2000,4000,8000,10000])[m
+[32m+[m[32m            max_restarts: Maximum restart attempts before FAILED state (default: 5 per [S13.5])[m
+[32m+[m[32m            on_state_change: Optional callback when state changes[m
+[32m+[m[32m            allow_ffmpeg: Whether FFmpeg startup is allowed (default: False for test safety per [I25])[m
+[32m+[m[32m        """[m
+[32m+[m[32m        self._allow_ffmpeg = allow_ffmpeg[m
+[32m+[m[32m        self._mp3_buffer = mp3_buffer[m
+[32m+[m[32m        # Use default command if not provided, ensuring -frame_size 1152 is present per [S19.11][m
+[32m+[m[32m        self._ffmpeg_cmd = ffmpeg_cmd if ffmpeg_cmd is not None else DEFAULT_FFMPEG_CMD.copy()[m
+[32m+[m[32m        self._stall_threshold_ms = stall_threshold_ms[m
+[32m+[m[32m        self._backoff_schedule_ms = backoff_schedule_ms or [1000, 2000, 4000, 8000, 10000][m
+[32m+[m[32m        self._max_restarts = max_restarts[m
+[32m+[m[32m        self._on_state_change = on_state_change[m
+[32m+[m[41m        [m
+[32m+[m[32m        # State management per contract [S13.2][m
+[32m+[m[32m        self._state = SupervisorState.STOPPED[m
+[32m+[m[32m        self._state_lock = threading.Lock()[m
+[32m+[m[32m        self._restart_attempts = 0[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Process management[m
+[32m+[m[32m        self._process: Optional[subprocess.Popen] = None[m
+[32m+[m[32m        self._stdin: Optional[BinaryIO] = None[m
+[32m+[m[32m        self._stdout: Optional[BinaryIO] = None[m
+[32m+[m[32m        self._stderr: Optional[BinaryIO] = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Threads per contract [S14][m
+[32m+[m[32m        self._stderr_thread: Optional[threading.Thread] = None[m
+[32m+[m[32m        self._stdout_thread: Optional[threading.Thread] = None[m
+[32m+[m[32m        self._restart_thread: Optional[threading.Thread] = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Shutdown event[m
+[32m+[m[32m        self._shutdown_event = threading.Event()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Liveness tracking per contract [S7], [S8], [S17][m
+[32m+[m[32m        self._first_frame_received = False[m
+[32m+[m[32m        self._first_frame_time: Optional[float] = None[m
+[32m+[m[32m        self._last_frame_time: Optional[float] = None[m
+[32m+[m[32m        self._startup_time: Optional[float] = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # MP3Packetizer (created on encoder start)[m
+[32m+[m[32m        self._packetizer: Optional[MP3Packetizer] = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Startup timeout monitoring per contract [S7], [S7A][m
+[32m+[m[32m        self._startup_timeout_thread: Optional[threading.Thread] = None[m
+[32m+[m[32m        self._slow_startup_warn_logged = False  # Track if 500ms WARN has been logged per [S7][m
+[32m+[m[41m        [m
+[32m+[m[32m        # Debug mode per contract [S25][m
+[32m+[m[32m        self._debug_mode = os.getenv("TOWER_ENCODER_DEBUG", "0") == "1"[m
+[32m+[m[41m    [m
+[32m+[m[32m    def start(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Start supervisor and encoder process per contract [S19].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Follows exact startup sequence:[m
+[32m+[m[32m        1. Create FFmpeg subprocess[m
+[32m+[m[32m        2. Log process PID[m
+[32m+[m[32m        3. Transition to BOOTING state per [S6A][m
+[32m+[m[32m        4. Write initial silence frame[m
+[32m+[m[32m        5. Set stdin, stdout, and stderr file descriptors to non-blocking mode[m
+[32m+[m[32m        6. Start stderr drain thread immediately[m
+[32m+[m[32m        7. Start stdout drain thread[m
+[32m+[m[32m        8. Start timer for first-frame detection (timeout: TOWER_FFMPEG_STARTUP_TIMEOUT_MS, default 1500ms per [S7A])[m
+[32m+[m[32m        9. Monitor for first MP3 frame arrival[m
+[32m+[m[32m        10. If no frame arrives by 500ms → log LEVEL=WARN "slow startup" per [S7] (not a restart condition)[m
+[32m+[m[32m        11. If first frame arrives within hard timeout → transition to RUNNING state per [S6A][m
+[32m+[m[32m        12. If timeout exceeds hard timeout per [S7A] → log error, restart encoder per [S13][m
+[32m+[m[32m        """[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            if self._state != SupervisorState.STOPPED:[m
+[32m+[m[32m                raise RuntimeError(f"Cannot start supervisor in state: {self._state}")[m
+[32m+[m[32m            self._state = SupervisorState.STARTING[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Notify state change outside lock[m
+[32m+[m[32m        if self._on_state_change:[m
+[32m+[m[32m            self._on_state_change(SupervisorState.STARTING)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 1-3: Start encoder process[m
+[32m+[m[32m        self._start_encoder_process()[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._process is None:[m
+[32m+[m[32m            logger.error("Failed to start encoder process")[m
+[32m+[m[32m            self._set_state(SupervisorState.FAILED)[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 5: Start stdout drain thread[m
+[32m+[m[32m        # Per contract [S14.7]: stdout drain thread MUST start before or concurrently with stderr drain.[m
+[32m+[m[32m        # Stopping either thread MUST NOT block process termination.[m
+[32m+[m[32m        if self._stdout is not None:[m
+[32m+[m[32m            self._packetizer = MP3Packetizer()[m
+[32m+[m[32m            self._stdout_thread = threading.Thread([m
+[32m+[m[32m                target=self._stdout_drain,[m
+[32m+[m[32m                daemon=True,  # Per contract [S14.7]: Non-blocking termination[m
+[32m+[m[32m                name="FFmpegStdoutDrain"[m
+[32m+[m[32m            )[m
+[32m+[m[32m            self._stdout_thread.start()[m
+[32m+[m[32m            logger.info("Encoder stdout drain thread started")[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 4: Start stderr drain thread IMMEDIATELY per contract [S14.1][m
+[32m+[m[32m        # Per contract [S14.7]: stdout starts before stderr (or concurrently)[m
+[32m+[m[32m        if self._stderr is not None:[m
+[32m+[m[32m            self._stderr_thread = threading.Thread([m
+[32m+[m[32m                target=self._stderr_drain,[m
+[32m+[m[32m                daemon=True,  # Per contract [S14.4], [S14.7]: Non-blocking termination[m
+[32m+[m[32m                name="FFmpegStderrDrain"[m
+[32m+[m[32m            )[m
+[32m+[m[32m            self._stderr_thread.start()[m
+[32m+[m[32m            logger.info("Encoder stderr drain thread started")[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 3 per contract [S19]: Transition to BOOTING state per [S6A][m
+[32m+[m[32m        # Per contract [S19], [S6A]: State MUST be BOOTING immediately after start() returns[m
+[32m+[m[32m        # This ensures tests can verify the state is BOOTING before any async failure handling[m
+[32m+[m[32m        self._set_state(SupervisorState.BOOTING)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 8-9: Start timer for first-frame detection per contract [S7], [S7A][m
+[32m+[m[32m        # Per contract [S7B]: First-frame timer MUST use wall-clock time, not frame timestamps[m
+[32m+[m[32m        # or asyncio loop time. Because async clocks can pause under scheduler pressure,[m
+[32m+[m[32m        # wall clock cannot.[m
+[32m+[m[32m        self._startup_time = time.time()  # Use wall-clock time per [S7B][m
+[32m+[m[32m        self._slow_startup_warn_logged = False[m
+[32m+[m[32m        self._startup_timeout_thread = threading.Thread([m
+[32m+[m[32m            target=self._monitor_startup_timeout,[m
+[32m+[m[32m            daemon=True,[m
+[32m+[m[32m            name="StartupTimeoutMonitor"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        self._startup_timeout_thread.start()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S19.13]: Upon return from start(), Supervisor state MUST be BOOTING[m
+[32m+[m[32m        # (not RESTARTING and not FAILED), regardless of asynchronous stderr/stdout events[m
+[32m+[m[32m        # during initialization.[m
+[32m+[m[32m        # This is critical for tests that check state immediately after start()[m
+[32m+[m[32m        # Even if async threads detect failures, the state should be BOOTING at this point[m
+[32m+[m[32m        final_state = self.get_state()[m
+[32m+[m[32m        if final_state != SupervisorState.BOOTING:[m
+[32m+[m[32m            # State was changed by async thread (shouldn't happen with STARTING deferral, but be defensive)[m
+[32m+[m[32m            # Per contract [S19.13]: Force state to BOOTING before returning[m
+[32m+[m[32m            logger.warning([m
+[32m+[m[32m                f"State changed to {final_state} during start() - resetting to BOOTING per contract [S19.13]"[m
+[32m+[m[32m            )[m
+[32m+[m[32m            self._set_state(SupervisorState.BOOTING)[m
+[32m+[m[41m    [m
+[32m+[m[32m    def stop(self, timeout: float = 5.0) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Stop supervisor and encoder process.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            timeout: Maximum time to wait for cleanup[m
+[32m+[m[32m        """[m
+[32m+[m[32m        logger.info("Stopping FFmpegSupervisor...")[m
+[32m+[m[41m        [m
+[32m+[m[32m        self._shutdown_event.set()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Set state without calling _set_state to avoid deadlock[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            old_state = self._state[m
+[32m+[m[32m            self._state = SupervisorState.STOPPED[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Notify outside lock[m
+[32m+[m[32m        if old_state != SupervisorState.STOPPED and self._on_state_change:[m
+[32m+[m[32m            self._on_state_change(SupervisorState.STOPPED)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Stop threads[m
+[32m+[m[32m        if self._stdout_thread is not None and self._stdout_thread.is_alive():[m
+[32m+[m[32m            self._stdout_thread.join(timeout=1.0)[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._stderr_thread is not None and self._stderr_thread.is_alive():[m
+[32m+[m[32m            self._stderr_thread.join(timeout=1.0)[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._startup_timeout_thread is not None and self._startup_timeout_thread.is_alive():[m
+[32m+[m[32m            self._startup_timeout_thread.join(timeout=0.5)[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._restart_thread is not None and self._restart_thread.is_alive():[m
+[32m+[m[32m            self._restart_thread.join(timeout=2.0)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Close stdin[m
+[32m+[m[32m        if self._stdin is not None:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                self._stdin.close()[m
+[32m+[m[32m            except Exception:[m
+[32m+[m[32m                pass[m
+[32m+[m[32m            self._stdin = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Terminate process[m
+[32m+[m[32m        if self._process is not None:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                self._process.terminate()[m
+[32m+[m[32m                self._process.wait(timeout=timeout)[m
+[32m+[m[32m            except subprocess.TimeoutExpired:[m
+[32m+[m[32m                logger.warning("Encoder process did not terminate, killing")[m
+[32m+[m[32m                self._process.kill()[m
+[32m+[m[32m                self._process.wait()[m
+[32m+[m[32m            except Exception as e:[m
+[32m+[m[32m                logger.warning(f"Error stopping encoder process: {e}")[m
+[32m+[m[32m            finally:[m
+[32m+[m[32m                self._process = None[m
+[32m+[m[32m                self._stdout = None[m
+[32m+[m[32m                self._stderr = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        logger.info("FFmpegSupervisor stopped")[m
+[32m+[m[41m    [m
+[32m+[m[32m    def get_state(self) -> SupervisorState:[m
+[32m+[m[32m        """Get current supervisor state."""[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            return self._state[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _transition_to_running(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Transition from BOOTING to RUNNING state per contract [S6A], [S19], [S20.1], [S20.1A].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S20.1]: On every successful RUNNING transition from BOOTING,[m
+[32m+[m[32m        MUST log INFO "Encoder LIVE (first frame received)".[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S20.1A]: Log emission MUST be atomic with state change.[m
+[32m+[m[32m        Per contract [S13.7]: State change callbacks MUST run outside the lock.[m
+[32m+[m[41m        [m
+[32m+[m[32m        This method handles the state transition and log emission atomically within the lock,[m
+[32m+[m[32m        then invokes the callback outside the lock.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        callback = None[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            if self._state == SupervisorState.BOOTING:[m
+[32m+[m[32m                self._state = SupervisorState.RUNNING[m
+[32m+[m[32m                # Per contract [S20.1A]: Log emission MUST be atomic with state change[m
+[32m+[m[32m                # Both state change and log occur inside the lock to ensure atomicity[m
+[32m+[m[32m                logger.debug("Supervisor state: BOOTING -> RUNNING (first frame received)")[m
+[32m+[m[32m                # Per contract [S20.1]: On every successful RUNNING transition,[m
+[32m+[m[32m                # log INFO "Encoder LIVE (first frame received)"[m
+[32m+[m[32m                logger.info("Encoder LIVE (first frame received)")[m
+[32m+[m[32m                # Store callback to invoke outside lock per [S13.7][m
+[32m+[m[32m                callback = self._on_state_change[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.7]: State change callbacks MUST run strictly outside the lock[m
+[32m+[m[32m        if callback:[m
+[32m+[m[32m            callback(SupervisorState.RUNNING)[m
+[32m+[m[41m    [m
+[32m+[m[32m    def get_stdin(self) -> Optional[BinaryIO]:[m
+[32m+[m[32m        """Get encoder stdin for writing PCM frames."""[m
+[32m+[m[32m        return self._stdin[m
+[32m+[m[41m    [m
+[32m+[m[32m    def write_pcm(self, frame: bytes) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Write PCM frame to encoder stdin.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S7.1]: During BOOTING, encoder MUST receive continuous PCM frames[m
+[32m+[m[32m        (Tower format, 4608 bytes) even if live PCM is absent. Supervisor does not generate[m
+[32m+[m[32m        or inject PCM; it only receives PCM frames from EncoderManager via write_pcm().[m
+[32m+[m[32m        The source of PCM (silence, tone, or live) is determined by AudioPump and[m
+[32m+[m[32m        EncoderManager per operational modes contract, not by the supervisor.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S22A]: Supervisor MUST NOT know about noise/silence generation.[m
+[32m+[m[32m        It treats all valid Tower-format PCM frames identically.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            frame: PCM frame bytes to write (Tower format, 4608 bytes)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        # Per contract [S7.1], [S22A]: Supervisor is source-agnostic and receives PCM frames[m
+[32m+[m[32m        # from EncoderManager. The PCM source (silence, tone, or live) is determined upstream.[m
+[32m+[m[32m        # Allow writing during BOOTING state (for any PCM source) and RUNNING state (for live PCM).[m
+[32m+[m[32m        current_state = self.get_state()[m
+[32m+[m[32m        if current_state not in (SupervisorState.BOOTING, SupervisorState.RUNNING):[m
+[32m+[m[32m            return  # Only write during BOOTING or RUNNING[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None[m
+[32m+[m[32m        if not self._process:[m
+[32m+[m[32m            return  # Process not created[m
+[32m+[m[32m        poll_result = self._process.poll()[m
+[32m+[m[32m        if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m            return  # Process exited with valid exit code[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            self._stdin.write(frame)[m
+[32m+[m[32m            self._stdin.flush()[m
+[32m+[m[32m        except BrokenPipeError:[m
+[32m+[m[32m            # Per contract [S21.1]: Log failure type and return code[m
+[32m+[m[32m            exit_code = None[m
+[32m+[m[32m            if self._process is not None:[m
+[32m+[m[32m                # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None[m
+[32m+[m[32m                poll_result = self._process.poll()[m
+[32m+[m[32m                if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m                    exit_code = self._process.returncode[m
+[32m+[m[32m            # Defensively handle MagicMock objects in tests per [S21.2][m
+[32m+[m[32m            if exit_code is not None and isinstance(exit_code, int):[m
+[32m+[m[32m                exit_code_str = str(exit_code)[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                exit_code_str = "unknown"[m
+[32m+[m[32m            logger.warning([m
+[32m+[m[32m                f"FFmpeg stdin write failed with BrokenPipeError "[m
+[32m+[m[32m                f"(failure type: stdin_broken, exit code: {exit_code_str})"[m
+[32m+[m[32m            )[m
+[32m+[m[32m            self._handle_failure("stdin_broken", exit_code=exit_code)[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _set_state(self, new_state: SupervisorState) -> None:[m
+[32m+[m[32m        """Set state and notify callback."""[m
+[32m+[m[32m        old_state = None[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            old_state = self._state[m
+[32m+[m[32m            self._state = new_state[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Notify outside lock to avoid deadlock[m
+[32m+[m[32m        if old_state != new_state:[m
+[32m+[m[32m            logger.debug(f"Supervisor state: {old_state} -> {new_state}")[m
+[32m+[m[32m            if self._on_state_change:[m
+[32m+[m[32m                self._on_state_change(new_state)[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _check_test_isolation(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Contract [I25] enforcement — FFmpeg start is opt-in only.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [I25]: The system MUST prevent FFmpeg from starting during tests[m
+[32m+[m[32m        unless the test is explicitly marked as an integration test. If FFmpeg would[m
+[32m+[m[32m        otherwise start implicitly, the system MUST fail loudly.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Enforcement is via explicit configuration (allow_ffmpeg parameter) and[m
+[32m+[m[32m        environment variable override. Production code does NOT detect test context.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if self._allow_ffmpeg:[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        if os.getenv("TOWER_ALLOW_FFMPEG_IN_TESTS") == "1":[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        raise RuntimeError([m
+[32m+[m[32m            "FFmpegSupervisor attempted to start without encoder permission. "[m
+[32m+[m[32m            "Tests must disable encoder or enable explicitly using "[m
+[32m+[m[32m            "TOWER_ALLOW_FFMPEG_IN_TESTS=1 or allow_ffmpeg=True in DI. "[m
+[32m+[m[32m            "See contract [I25]."[m
+[32m+[m[32m        )[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _start_encoder_process(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Start FFmpeg encoder process per contract [S19].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Steps per [S19]:[m
+[32m+[m[32m        1. Test isolation check per [I25], [S19.12][m
+[32m+[m[32m        2. Create FFmpeg subprocess with subprocess.Popen()[m
+[32m+[m[32m        3. Log process PID: logger.info(f"Started ffmpeg PID={process.pid}")[m
+[32m+[m[32m        4. Write initial silence frame to stdin to keep FFmpeg alive[m
+[32m+[m[32m        5. Set stdin, stdout, and stderr file descriptors to non-blocking mode[m
+[32m+[m[32m        6. Start stderr drain thread immediately[m
+[32m+[m[32m        7. Start stdout drain thread[m
+[32m+[m[32m        8. Enter BOOTING state per [S6A] and start the 500ms first-frame timer [S7][m
+[32m+[m[32m        9. Monitor for first MP3 frame arrival[m
+[32m+[m[32m        10. If no frame arrives by 500ms → log LEVEL=WARN "slow startup" per [S7][m
+[32m+[m[32m        11. If first frame arrives within hard timeout → transition to RUNNING state per [S6A][m
+[32m+[m[32m        12. If timeout exceeds hard timeout per [S7A] → treat as failure per [S10]/[S9]/[S13][m
+[32m+[m[32m        """[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            # Per contract [I25]: Check test isolation before starting FFmpeg[m
+[32m+[m[32m            # This must raise RuntimeError if FFmpeg is started without permission[m
+[32m+[m[32m            self._check_test_isolation()[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S25]: Modify FFmpeg command for debug mode[m
+[32m+[m[32m            ffmpeg_cmd = self._build_ffmpeg_cmd()[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S25.1]: Log full FFmpeg command at startup in debug mode[m
+[32m+[m[32m            if self._debug_mode:[m
+[32m+[m[32m                logger.info(f"[DEBUG] Executing FFmpeg command: {' '.join(ffmpeg_cmd)}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Step 1: Create subprocess[m
+[32m+[m[32m            self._process = subprocess.Popen([m
+[32m+[m[32m                ffmpeg_cmd,[m
+[32m+[m[32m                stdin=subprocess.PIPE,[m
+[32m+[m[32m                stdout=subprocess.PIPE,[m
+[32m+[m[32m                stderr=subprocess.PIPE,[m
+[32m+[m[32m                bufsize=0,[m
+[32m+[m[32m            )[m
+[32m+[m[41m            [m
+[32m+[m[32m            self._stdin = self._process.stdin[m
+[32m+[m[32m            self._stdout = self._process.stdout[m
+[32m+[m[32m            self._stderr = self._process.stderr[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Step 2: Log process PID per contract [S19][m
+[32m+[m[32m            logger.info(f"Started ffmpeg PID={self._process.pid}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Step 3: Write initial silence frame per contract [S19] step 4[m
+[32m+[m[32m            # This is a one-time initial frame to keep FFmpeg alive during startup.[m
+[32m+[m[32m            # Continuous PCM frames (silence, tone, or live) are provided by AudioPump/EncoderManager[m
+[32m+[m[32m            # via write_pcm() per contract [S7.1], [S22A]. Supervisor does not generate continuous PCM.[m
+[32m+[m[32m            if self._stdin is not None:[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    initial_silence = b'\x00' * 4608  # 1152 samples * 2 channels * 2 bytes[m
+[32m+[m[32m                    self._stdin.write(initial_silence)[m
+[32m+[m[32m                    self._stdin.flush()[m
+[32m+[m[32m                    logger.debug("Wrote initial silence frame to keep FFmpeg alive")[m
+[32m+[m[32m                except BrokenPipeError:[m
+[32m+[m[32m                    # Per contract [S21.1]: Log stdin broken failure with explicit wording[m
+[32m+[m[32m                    exit_code = None[m
+[32m+[m[32m                    # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None[m
+[32m+[m[32m                    if self._process is not None:[m
+[32m+[m[32m                        poll_result = self._process.poll()[m
+[32m+[m[32m                        if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m                            exit_code = self._process.returncode[m
+[32m+[m[32m                    # Defensively handle MagicMock objects in tests[m
+[32m+[m[32m                    if exit_code is not None and isinstance(exit_code, int):[m
+[32m+[m[32m                        exit_code_str = str(exit_code)[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        exit_code_str = "unknown"[m
+[32m+[m[32m                    logger.error([m
+[32m+[m[32m                        f"🔥 FFmpeg stdin broken during initial frame write "[m
+[32m+[m[32m                        f"(exit code: {exit_code_str})"[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                    self._read_and_log_stderr()[m
+[32m+[m[32m                    self._handle_failure("stdin_broken", exit_code=exit_code)[m
+[32m+[m[32m                    return[m
+[32m+[m[32m                except Exception as e:[m
+[32m+[m[32m                    logger.warning(f"Failed to write initial frame: {e}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Check if process exited immediately per contract [S9], [S21][m
+[32m+[m[32m            time.sleep(0.2)  # Give FFmpeg a moment to start[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None (e.g., MagicMock)[m
+[32m+[m[32m            poll_result = self._process.poll()[m
+[32m+[m[32m            if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m                # Process exited with valid exit code[m
+[32m+[m[32m                exit_code = self._process.returncode[m
+[32m+[m[32m                # Defensively handle MagicMock objects in tests[m
+[32m+[m[32m                if exit_code is not None and isinstance(exit_code, int):[m
+[32m+[m[32m                    exit_code_str = str(exit_code)[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    exit_code_str = "unknown"[m
+[32m+[m[32m                logger.error(f"🔥 FFmpeg exited immediately at startup (exit code: {exit_code_str})")[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Read and log stderr per contract [S21][m
+[32m+[m[32m                self._read_and_log_stderr()[m
+[32m+[m[32m                # Note: Don't call _handle_failure() here - let start() complete first[m
+[32m+[m[32m                # The stdout drain thread will detect EOF and handle the failure[m
+[32m+[m[32m                # This ensures state is set to BOOTING before any restart logic runs[m
+[32m+[m[32m                return[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Set stdin to non-blocking mode[m
+[32m+[m[32m            if self._stdin is not None:[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    if hasattr(os, 'set_blocking'):[m
+[32m+[m[32m                        os.set_blocking(self._stdin.fileno(), False)[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        import fcntl[m
+[32m+[m[32m                        flags = fcntl.fcntl(self._stdin.fileno(), fcntl.F_GETFL)[m
+[32m+[m[32m                        O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0x800)[m
+[32m+[m[32m                        fcntl.fcntl(self._stdin.fileno(), fcntl.F_SETFL, flags | O_NONBLOCK)[m
+[32m+[m[32m                except (OSError, AttributeError, ImportError):[m
+[32m+[m[32m                    pass[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Set stdout to non-blocking mode[m
+[32m+[m[32m            if self._stdout is not None:[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    if hasattr(os, 'set_blocking'):[m
+[32m+[m[32m                        os.set_blocking(self._stdout.fileno(), False)[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        import fcntl[m
+[32m+[m[32m                        flags = fcntl.fcntl(self._stdout.fileno(), fcntl.F_GETFL)[m
+[32m+[m[32m                        O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0x800)[m
+[32m+[m[32m                        fcntl.fcntl(self._stdout.fileno(), fcntl.F_SETFL, flags | O_NONBLOCK)[m
+[32m+[m[32m                except (OSError, AttributeError, ImportError):[m
+[32m+[m[32m                    pass[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Set stderr to non-blocking mode per contract [S14.2][m
+[32m+[m[32m            # This ensures reliable capture of FFmpeg error messages, especially when FFmpeg exits quickly[m
+[32m+[m[32m            if self._stderr is not None:[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    if hasattr(os, 'set_blocking'):[m
+[32m+[m[32m                        os.set_blocking(self._stderr.fileno(), False)[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        import fcntl[m
+[32m+[m[32m                        flags = fcntl.fcntl(self._stderr.fileno(), fcntl.F_GETFL)[m
+[32m+[m[32m                        O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0x800)[m
+[32m+[m[32m                        fcntl.fcntl(self._stderr.fileno(), fcntl.F_SETFL, flags | O_NONBLOCK)[m
+[32m+[m[32m                except (OSError, AttributeError, ImportError):[m
+[32m+[m[32m                    pass[m
+[32m+[m[41m            [m
+[32m+[m[32m        except RuntimeError as e:[m
+[32m+[m[32m            # Per contract [I25]: RuntimeError from test isolation check must propagate[m
+[32m+[m[32m            # This ensures tests fail loudly when FFmpeg is started inappropriately[m
+[32m+[m[32m            if "FFmpegSupervisor attempted to start without encoder permission" in str(e):[m
+[32m+[m[32m                # Re-raise test isolation errors per [I25][m
+[32m+[m[32m                raise[m
+[32m+[m[32m            # Other RuntimeErrors are treated as general failures[m
+[32m+[m[32m            logger.error(f"Failed to start encoder process: {e}", exc_info=True)[m
+[32m+[m[32m            self._process = None[m
+[32m+[m[32m            self._stdin = None[m
+[32m+[m[32m            self._stdout = None[m
+[32m+[m[32m            self._stderr = None[m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logger.error(f"Failed to start encoder process: {e}", exc_info=True)[m
+[32m+[m[32m            self._process = None[m
+[32m+[m[32m            self._stdin = None[m
+[32m+[m[32m            self._stdout = None[m
+[32m+[m[32m            self._stderr = None[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _build_ffmpeg_cmd(self) -> List[str]:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Build FFmpeg command with debug mode support per contract [S25].[m
+[32m+[m[32m        Ensures -frame_size 1152 is present per contract [S19.11].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Returns:[m
+[32m+[m[32m            FFmpeg command list with appropriate loglevel based on TOWER_ENCODER_DEBUG[m
+[32m+[m[32m            and guaranteed to include -frame_size 1152.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        # Make a copy to avoid modifying the original[m
+[32m+[m[32m        cmd = list(self._ffmpeg_cmd)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S19.11]: Ensure -frame_size 1152 is present[m
+[32m+[m[32m        # This forces MP3 packetization at correct Tower frame boundaries[m
+[32m+[m[32m        if "-frame_size" not in cmd:[m
+[32m+[m[32m            # Insert -frame_size 1152 after -b:a (bitrate) or before -f mp3[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                # Try to find -b:a and insert after it[m
+[32m+[m[32m                bitrate_idx = cmd.index("-b:a")[m
+[32m+[m[32m                if bitrate_idx + 2 < len(cmd):[m
+[32m+[m[32m                    cmd.insert(bitrate_idx + 2, "-frame_size")[m
+[32m+[m[32m                    cmd.insert(bitrate_idx + 3, "1152")[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    # Fallback: insert before -f mp3[m
+[32m+[m[32m                    mp3_idx = cmd.index("-f")[m
+[32m+[m[32m                    if cmd[mp3_idx + 1] == "mp3":[m
+[32m+[m[32m                        cmd.insert(mp3_idx, "1152")[m
+[32m+[m[32m                        cmd.insert(mp3_idx, "-frame_size")[m
+[32m+[m[32m            except ValueError:[m
+[32m+[m[32m                # Neither -b:a nor -f mp3 found, insert before last argument (pipe:1)[m
+[32m+[m[32m                cmd.insert(-1, "-frame_size")[m
+[32m+[m[32m                cmd.insert(-1, "1152")[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S25.1]: Use -loglevel debug when TOWER_ENCODER_DEBUG=1[m
+[32m+[m[32m        # Per contract [S25.2]: Use normal runtime loglevel (e.g. warning) when unset or 0[m
+[32m+[m[32m        if self._debug_mode:[m
+[32m+[m[32m            # Replace existing -loglevel argument with debug[m
+[32m+[m[32m            # Find -loglevel in command and replace its value[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                loglevel_idx = cmd.index("-loglevel")[m
+[32m+[m[32m                if loglevel_idx + 1 < len(cmd):[m
+[32m+[m[32m                    cmd[loglevel_idx + 1] = "debug"[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    # If -loglevel exists but no value, add debug[m
+[32m+[m[32m                    cmd.insert(loglevel_idx + 1, "debug")[m
+[32m+[m[32m            except ValueError:[m
+[32m+[m[32m                # -loglevel not found, insert it after -nostdin or at appropriate position[m
+[32m+[m[32m                # Try to insert after common flags[m
+[32m+[m[32m                insert_pos = 1[m
+[32m+[m[32m                if "-nostdin" in cmd:[m
+[32m+[m[32m                    insert_pos = cmd.index("-nostdin") + 1[m
+[32m+[m[32m                elif "-hide_banner" in cmd:[m
+[32m+[m[32m                    insert_pos = cmd.index("-hide_banner") + 1[m
+[32m+[m[32m                cmd.insert(insert_pos, "-loglevel")[m
+[32m+[m[32m                cmd.insert(insert_pos + 1, "debug")[m
+[32m+[m[32m        # If not debug mode, command is unchanged (preserves existing -loglevel warning)[m
+[32m+[m[41m        [m
+[32m+[m[32m        return cmd[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _stderr_drain(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Drain FFmpeg stderr per contract [S14].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Requirements:[m
+[32m+[m[32m        - [S14.1] Start immediately after process creation (already done in start())[m
+[32m+[m[32m        - [S14.2] Stderr set to non-blocking mode (done in _start_encoder_process())[m
+[32m+[m[32m        - [S14.3] Use readline() in continuous loop: for line in iter(proc.stderr.readline, b'')[m
+[32m+[m[32m        - [S14.4] Log each line with [FFMPEG] prefix[m
+[32m+[m[32m        - [S14.5] Never block main thread (runs as daemon thread)[m
+[32m+[m[32m        - [S14.6] Continue reading until stderr closes[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if self._process is None:[m
+[32m+[m[32m            return[m
+[32m+[m[32m        proc = self._process  # Keep reference[m
+[32m+[m[32m        if proc.stderr is None:[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        try:[m
+[32m+[m[32m            # Per contract [S14.3]: Use readline() in continuous loop[m
+[32m+[m[32m            # Since stderr is non-blocking, we need to handle BlockingIOError[m
+[32m+[m[32m            while not self._shutdown_event.is_set():[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    line = proc.stderr.readline()[m
+[32m+[m[32m                    # Per contract [S21.2]: Defensively handle non-string stderr data (e.g., unittest mocks)[m
+[32m+[m[32m                    # Check if line is actually bytes before processing[m
+[32m+[m[32m                    if not isinstance(line, bytes):[m
+[32m+[m[32m                        # In tests, readline() might return a MagicMock - skip this line[m
+[32m+[m[32m                        # This prevents test noise from MagicMock string representations[m
+[32m+[m[32m                        if not line:  # EOF or None[m
+[32m+[m[32m                            break[m
+[32m+[m[32m                        continue  # Skip MagicMock or other non-bytes objects[m
+[32m+[m[41m                    [m
+[32m+[m[32m                    if not line:[m
+[32m+[m[32m                        # EOF - stderr closed (process ended)[m
+[32m+[m[32m                        break[m
+[32m+[m[41m                    [m
+[32m+[m[32m                    try:[m
+[32m+[m[32m                        decoded_line = line.decode(errors='ignore').rstrip()[m
+[32m+[m[32m                    except (AttributeError, TypeError):[m
+[32m+[m[32m                        # In tests, decode() might return a mock object - skip this line[m
+[32m+[m[32m                        # This prevents test noise from MagicMock string representations[m
+[32m+[m[32m                        continue[m
+[32m+[m[41m                    [m
+[32m+[m[32m                    # Only log if decoded_line is actually a string (not a mock object in tests)[m
+[32m+[m[32m                    if isinstance(decoded_line, str) and decoded_line:[m
+[32m+[m[32m                        # Per contract [S14.4]: Log with [FFMPEG] prefix at ERROR level[m
+[32m+[m[32m                        logger.error(f"[FFMPEG] {decoded_line}")[m
+[32m+[m[32m                        # Per contract [S25.1]: Also log at DEBUG level when debug mode enabled[m
+[32m+[m[32m                        if self._debug_mode:[m
+[32m+[m[32m                            logger.debug(f"[FFMPEG] {decoded_line}")[m
+[32m+[m[32m                except BlockingIOError:[m
+[32m+[m[32m                    # No data available (non-blocking mode) - sleep briefly and retry[m
+[32m+[m[32m                    time.sleep(0.01)  # 10ms sleep to prevent CPU spinning[m
+[32m+[m[32m                    continue[m
+[32m+[m[32m                except (OSError, ValueError) as e:[m
+[32m+[m[32m                    # Stderr closed or error reading[m
+[32m+[m[32m                    logger.debug(f"Stderr read error (likely closed): {e}")[m
+[32m+[m[32m                    break[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S14.6]: Loop exits when stderr closes or shutdown[m
+[32m+[m[32m            logger.debug("FFmpeg stderr drain thread exiting")[m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logger.warning(f"Stderr drain thread error: {e}")[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _stdout_drain(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Drain FFmpeg stdout, packetize MP3 frames, and push to buffer.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Tracks frame timing per contract [S17], [S18] and detects stalls per [S11].[m
+[32m+[m[32m        """[m
+[32m+[m[32m        logger.info("Encoder stdout drain thread running")[m
+[32m+[m[41m        [m
+[32m+[m[32m        last_log_time = time.monotonic()[m
+[32m+[m[41m        [m
+[32m+[m[32m        try:[m
+[32m+[m[32m            while not self._shutdown_event.is_set():[m
+[32m+[m[32m                # Check for process exit per contract [S9][m
+[32m+[m[32m                if self._process is not None and self._process.poll() is not None:[m
+[32m+[m[32m                    logger.warning("Encoder process exited - triggering restart")[m
+[32m+[m[32m                    self._handle_failure("process_exit", exit_code=self._process.returncode)[m
+[32m+[m[32m                    break[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Read from stdout (non-blocking)[m
+[32m+[m[32m                try:[m
+[32m+[m[32m                    data = self._stdout.read(4096) if self._stdout else None[m
+[32m+[m[32m                except BlockingIOError:[m
+[32m+[m[32m                    # No data available - check for stall[m
+[32m+[m[32m                    self._check_stall()[m
+[32m+[m[32m                    time.sleep(0.001)  # 1ms sleep to prevent CPU spinning[m
+[32m+[m[32m                    continue[m
+[32m+[m[32m                except (OSError, ValueError) as e:[m
+[32m+[m[32m                    logger.warning(f"Read error in drain thread: {e}")[m
+[32m+[m[32m                    self._handle_failure("read_error", error=str(e))[m
+[32m+[m[32m                    break[m
+[32m+[m[41m                [m
+[32m+[m[32m                if not data:[m
+[32m+[m[32m                    # EOF - encoder died per contract [S9], [S21.1][m
+[32m+[m[32m                    # Get process return code before handling failure[m
+[32m+[m[32m                    exit_code = None[m
+[32m+[m[32m                    if self._process is not None:[m
+[32m+[m[32m                        # Per contract [S21.1]: Get return code when process exits[m
+[32m+[m[32m                        # Per contract [S21.2]: Defensively handle cases where poll() returns non-int/None[m
+[32m+[m[32m                        # poll() returns None if process is still running, or exit code if exited[m
+[32m+[m[32m                        poll_result = self._process.poll()[m
+[32m+[m[32m                        if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m                            # Process has exited with valid exit code - returncode should be available[m
+[32m+[m[32m                            exit_code = self._process.returncode[m
+[32m+[m[32m                        elif poll_result is None:[m
+[32m+[m[32m                            # Process might still be running but stdout closed (unusual)[m
+[32m+[m[32m                            # Or process just exited and returncode not set yet[m
+[32m+[m[32m                            # Try getting returncode directly (may be None if process was killed)[m
+[32m+[m[32m                            exit_code = getattr(self._process, 'returncode', None)[m
+[32m+[m[32m                            # If still None, process might have been killed or terminated abnormally[m
+[32m+[m[32m                            if exit_code is None:[m
+[32m+[m[32m                                # Give it a tiny moment for returncode to be set (non-blocking check)[m
+[32m+[m[32m                                # This handles race condition where process just exited[m
+[32m+[m[32m                                time.sleep(0.001)  # 1ms - minimal delay[m
+[32m+[m[32m                                poll_result = self._process.poll()[m
+[32m+[m[32m                                if poll_result is not None and isinstance(poll_result, int):[m
+[32m+[m[32m                                    exit_code = self._process.returncode[m
+[32m+[m[32m                        # If poll_result is not None but not an int (e.g., MagicMock), skip exit_code[m
+[32m+[m[32m                        # This handles test scenarios where poll() returns MagicMock per [S21.2][m
+[32m+[m[41m                    [m
+[32m+[m[32m                    # Defensively handle MagicMock objects in tests per [S21.2][m
+[32m+[m[32m                    # Only log exit_code if it's a valid integer or None[m
+[32m+[m[32m                    # MagicMock objects will fail this check and be logged as "unknown"[m
+[32m+[m[32m                    if exit_code is None:[m
+[32m+[m[32m                        exit_code_str = "None"[m
+[32m+[m[32m                    elif isinstance(exit_code, int):[m
+[32m+[m[32m                        exit_code_str = str(exit_code)[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        # exit_code is not None and not an int - likely a MagicMock in tests[m
+[32m+[m[32m                        # Per contract [S21.2]: Logs MUST degrade gracefully without MagicMock representations[m
+[32m+[m[32m                        exit_code_str = "unknown"[m
+[32m+[m[32m                    logger.warning([m
+[32m+[m[32m                        f"Encoder stdout EOF - encoder process ended "[m
+[32m+[m[32m                        f"(exit code: {exit_code_str})"[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                    self._handle_failure("eof", exit_code=exit_code)[m
+[32m+[m[32m                    break[m
+[32m+[m[41m                [m
+[32m+[m[32m                logger.debug(f"[ENC-OUT] {len(data)} bytes from ffmpeg")[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Feed to packetizer and get complete frames[m
+[32m+[m[32m                if self._packetizer:[m
+[32m+[m[32m                    for frame in self._packetizer.feed(data):[m
+[32m+[m[32m                        logger.debug(f"mp3-frame: {len(frame)} bytes")[m
+[32m+[m[41m                        [m
+[32m+[m[32m                        # Push to buffer per contract [S4] (preserve buffer contents)[m
+[32m+[m[32m                        self._mp3_buffer.push_frame(frame)[m
+[32m+[m[41m                        [m
+[32m+[m[32m                        # Track first frame per contract [S7][m
+[32m+[m[32m                        # Per contract [S7B]: Use wall-clock time for timing calculations[m
+[32m+[m[32m                        # Per contract [S7.1B]: First MP3 frame from any PCM source (silence, tone, or live)[m
+[32m+[m[32m                        # satisfies [S6A]/[S7] and transitions supervisor to RUNNING.[m
+[32m+[m[32m                        # Supervisor does not distinguish between PCM sources; it only tracks MP3 frame arrival timing.[m
+[32m+[m[32m                        now = time.time()  # Use wall-clock time per [S7B][m
+[32m+[m[32m                        if not self._first_frame_received:[m
+[32m+[m[32m                            self._first_frame_received = True[m
+[32m+[m[32m                            self._first_frame_time = now[m
+[32m+[m[32m                            elapsed_ms = (now - self._startup_time) * 1000.0 if self._startup_time else 0[m
+[32m+[m[32m                            logger.info(f"First MP3 frame received after {elapsed_ms:.1f}ms")[m
+[32m+[m[41m                            [m
+[32m+[m[32m                            # Step 11 per contract [S19]: Transition BOOTING → RUNNING per [S6A][m
+[32m+[m[32m                            # Per contract [S7.1B]: First frame from any PCM source triggers RUNNING transition[m
+[32m+[m[32m                            # Per contract [S20.1]: This transition MUST log "Encoder LIVE (first frame received)"[m
+[32m+[m[32m                            self._transition_to_running()[m
+[32m+[m[41m                        [m
+[32m+[m[32m                        # Track frame timing per contract [S17][m
+[32m+[m[32m                        # Note: For frame interval tracking, we use monotonic time to avoid[m
+[32m+[m[32m                        # issues with system clock adjustments, but first-frame timer uses wall-clock per [S7B][m
+[32m+[m[32m                        now_monotonic = time.monotonic()[m
+[32m+[m[32m                        if self._last_frame_time is not None:[m
+[32m+[m[32m                            elapsed_ms = (now_monotonic - self._last_frame_time) * 1000.0[m
+[32m+[m[32m                            # Check for frame interval violation per contract [S12], [S18][m
+[32m+[m[32m                            if elapsed_ms > FRAME_INTERVAL_MS * 1.5:[m
+[32m+[m[32m                                logger.warning([m
+[32m+[m[32m                                    f"🔥 FFmpeg frame interval violation: {elapsed_ms:.1f}ms "[m
+[32m+[m[32m                                    f"(expected ~{FRAME_INTERVAL_MS:.1f}ms)"[m
+[32m+[m[32m                                )[m
+[32m+[m[32m                                # May trigger restart if persistent (handled by stall detection)[m
+[32m+[m[41m                        [m
+[32m+[m[32m                        self._last_frame_time = now_monotonic[m
+[32m+[m[41m                        [m
+[32m+[m[32m                        # Log buffer stats periodically[m
+[32m+[m[32m                        stats = self._mp3_buffer.stats()[m
+[32m+[m[32m                        logger.debug(f"mp3->buffer count={stats.count}/{stats.capacity}")[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Log buffer size every 1 second[m
+[32m+[m[32m                now = time.monotonic()[m
+[32m+[m[32m                if now - last_log_time >= 1.0:[m
+[32m+[m[32m                    stats = self._mp3_buffer.stats()[m
+[32m+[m[32m                    logger.info(f"MP3 output buffer: {stats.count} frames")  # Per contract [B20][m
+[32m+[m[32m                    last_log_time = now[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Check for stall per contract [S11][m
+[32m+[m[32m                self._check_stall()[m
+[32m+[m[41m                [m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logger.error(f"Unexpected error in drain thread: {e}", exc_info=True)[m
+[32m+[m[32m            self._handle_failure("drain_error", error=str(e))[m
+[32m+[m[32m        finally:[m
+[32m+[m[32m            logger.debug("Encoder output drain thread stopped")[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _check_stall(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Check for encoder stall per contract [S11].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Stall is detected when no MP3 frames are received for STALL_THRESHOLD_MS[m
+[32m+[m[32m        after the first frame.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if not self._first_frame_received:[m
+[32m+[m[32m            return  # Can't detect stall until first frame received[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._last_frame_time is None:[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        now = time.monotonic()[m
+[32m+[m[32m        elapsed_ms = (now - self._last_frame_time) * 1000.0[m
+[32m+[m[41m        [m
+[32m+[m[32m        if elapsed_ms >= self._stall_threshold_ms:[m
+[32m+[m[32m            logger.warning(f"🔥 FFmpeg stall detected: {elapsed_ms:.0f}ms without frames")[m
+[32m+[m[32m            self._handle_failure("stall", elapsed_ms=elapsed_ms)[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _monitor_startup_timeout(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Monitor startup timeout per contract [S7], [S7A], [S10].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S7]: If no frame arrives by 500ms → log LEVEL=WARN "slow startup".[m
+[32m+[m[32m        This is not a restart condition.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S7A]: Hard timeout (default 1500ms) triggers restart per [S13].[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if self._startup_time is None:[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 10 per contract [S19]: Monitor for 500ms soft target per [S7][m
+[32m+[m[32m        time.sleep(SOFT_STARTUP_TARGET_SEC)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Check if first frame arrived within soft target (500ms)[m
+[32m+[m[32m        if not self._first_frame_received and not self._slow_startup_warn_logged:[m
+[32m+[m[32m            # Per contract [S7], [S20]: Log WARN at 500ms (not a restart condition)[m
+[32m+[m[32m            logger.warning("⚠ FFmpeg slow startup: first frame not received within 500ms")[m
+[32m+[m[32m            self._slow_startup_warn_logged = True[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Step 12 per contract [S19]: Wait for hard timeout per [S7A][m
+[32m+[m[32m        remaining_time = STARTUP_TIMEOUT_SEC - SOFT_STARTUP_TARGET_SEC[m
+[32m+[m[32m        if remaining_time > 0:[m
+[32m+[m[32m            time.sleep(remaining_time)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Check if first frame arrived within hard timeout[m
+[32m+[m[32m        if not self._first_frame_received:[m
+[32m+[m[32m            # Per contract [S7A], [S20]: Log error and restart per [S13][m
+[32m+[m[32m            logger.error(f"🔥 FFmpeg did not produce first MP3 frame within {STARTUP_TIMEOUT_MS}ms")[m
+[32m+[m[32m            self._handle_failure("startup_timeout")[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _handle_failure([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        failure_type: str,[m
+[32m+[m[32m        exit_code: Optional[int] = None,[m
+[32m+[m[32m        elapsed_ms: Optional[float] = None,[m
+[32m+[m[32m        error: Optional[str] = None,[m
+[32m+[m[32m    ) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Handle encoder failure per contract [S13].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Per contract [S13.7]: This function holds _state_lock and sets state directly[m
+[32m+[m[32m        (does not call _set_state() which would also acquire the lock, causing deadlock).[m
+[32m+[m[32m        State change callbacks are invoked outside the lock.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            failure_type: Type of failure (process_exit, startup_timeout, stall, frame_interval_violation, etc.)[m
+[32m+[m[32m            exit_code: Process exit code (for process_exit)[m
+[32m+[m[32m            elapsed_ms: Elapsed time in ms (for stall/timeout)[m
+[32m+[m[32m            error: Error message (for read_error, etc.)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            if self._state in (SupervisorState.STOPPED, SupervisorState.FAILED):[m
+[32m+[m[32m                return[m
+[32m+[m[32m            # Per contract [S19.14]: If a liveness or process failure is detected while[m
+[32m+[m[32m            # state == STARTING, failure handling MUST be queued/deferred. start() MUST[m
+[32m+[m[32m            # transition to BOOTING first, after which deferred failure processing MAY proceed normally.[m
+[32m+[m[32m            # This guarantees deterministic startup semantics and prevents premature RESTARTING/FAILED[m
+[32m+[m[32m            # state before MP3 output pipeline is online.[m
+[32m+[m[32m            if self._state == SupervisorState.STARTING:[m
+[32m+[m[32m                # Defer failure handling - start() will complete and set state to BOOTING first[m
+[32m+[m[32m                # The failure will be handled on the next check or by the monitoring threads[m
+[32m+[m[32m                # after state transitions to BOOTING per contract [S19.14][m
+[32m+[m[32m                logger.debug(f"Deferring failure handling during STARTING state: {failure_type} (per [S19.14])")[m
+[32m+[m[32m                return[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S13.1], [S21.1]: Log specific failure reason with exit code when available[m
+[32m+[m[32m            # Defensively handle MagicMock objects in tests - only log exit_code if it's a valid integer[m
+[32m+[m[32m            exit_code_str = None[m
+[32m+[m[32m            if exit_code is not None and isinstance(exit_code, int):[m
+[32m+[m[32m                exit_code_str = str(exit_code)[m
+[32m+[m[41m            [m
+[32m+[m[32m            if failure_type == "process_exit":[m
+[32m+[m[32m                if exit_code_str is not None:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg exited immediately at startup (exit code: {exit_code_str})")[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg exited immediately at startup (exit code: unknown - process may have been killed)")[m
+[32m+[m[32m            elif failure_type == "eof":[m
+[32m+[m[32m                # Per contract [S21.1]: Explicitly log exit code for EOF failures[m
+[32m+[m[32m                if exit_code_str is not None:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg stdout EOF (exit code: {exit_code_str})")[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg stdout EOF (exit code: unknown - process may have been killed or terminated abnormally)")[m
+[32m+[m[32m            elif failure_type == "stdin_broken":[m
+[32m+[m[32m                # Per contract [S21.1]: Explicitly log exit code for stdin broken failures[m
+[32m+[m[32m                if exit_code_str is not None:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg stdin broken (exit code: {exit_code_str})")[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    logger.error(f"🔥 FFmpeg stdin broken (exit code: unknown - process may have been killed)")[m
+[32m+[m[32m            elif failure_type == "startup_timeout":[m
+[32m+[m[32m                # Per contract [S7A], [S20]: Log hard timeout exceeded[m
+[32m+[m[32m                logger.error(f"🔥 FFmpeg did not produce first MP3 frame within {STARTUP_TIMEOUT_MS}ms")[m
+[32m+[m[32m            elif failure_type == "stall":[m
+[32m+[m[32m                logger.error(f"🔥 FFmpeg stall detected: {elapsed_ms:.0f}ms without frames")[m
+[32m+[m[32m            elif failure_type == "frame_interval_violation":[m
+[32m+[m[32m                logger.error(f"🔥 FFmpeg frame interval violation: {elapsed_ms:.1f}ms (expected ~{FRAME_INTERVAL_MS:.1f}ms)")[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # Include exit code in generic failure log if available[m
+[32m+[m[32m                # Defensively handle MagicMock objects - only include exit_code if it's a valid integer[m
+[32m+[m[32m                exit_info = f" (exit code: {exit_code_str})" if exit_code_str is not None else ""[m
+[32m+[m[32m                logger.error(f"🔥 FFmpeg failure: {failure_type}{exit_info}" + (f" ({error})" if error else ""))[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S21.1]: Ensure stderr is captured for process exit/EOF failures[m
+[32m+[m[32m            # If stderr thread never started or has already exited, do a one-shot read[m
+[32m+[m[32m            if failure_type in ("eof", "process_exit", "stdin_broken"):[m
+[32m+[m[32m                if self._stderr_thread is None or not self._stderr_thread.is_alive():[m
+[32m+[m[32m                    self._read_and_log_stderr()[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S13.2]: Transition to RESTARTING[m
+[32m+[m[32m            # Per contract [S13.7]: Set state directly since we already hold the lock.[m
+[32m+[m[32m            # MUST NOT call _set_state() which would also acquire _state_lock (deadlock).[m
+[32m+[m[32m            old_state = self._state[m
+[32m+[m[32m            self._state = SupervisorState.RESTARTING[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Per contract [S13.5]: Check max restarts[m
+[32m+[m[32m            self._restart_attempts += 1[m
+[32m+[m[32m            entered_failed = False[m
+[32m+[m[32m            if self._restart_attempts > self._max_restarts:[m
+[32m+[m[32m                # Per contract [S13.6]: Enter FAILED state[m
+[32m+[m[32m                logger.error([m
+[32m+[m[32m                    f"Encoder failed after {self._max_restarts} restart attempts. "[m
+[32m+[m[32m                    "Entering FAILED state."[m
+[32m+[m[32m                )[m
+[32m+[m[32m                old_state = self._state  # RESTARTING -> FAILED[m
+[32m+[m[32m                self._state = SupervisorState.FAILED[m
+[32m+[m[32m                entered_failed = True[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.7]: State change callbacks SHALL be executed strictly outside the lock[m
+[32m+[m[32m        # to prevent nested deadlocks. Lock is released above, callbacks invoked here.[m
+[32m+[m[32m        if entered_failed:[m
+[32m+[m[32m            logger.debug(f"Supervisor state: {old_state} -> {SupervisorState.FAILED}")[m
+[32m+[m[32m            if self._on_state_change:[m
+[32m+[m[32m                self._on_state_change(SupervisorState.FAILED)[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.2]: Invoke callback when transitioning to RESTARTING[m
+[32m+[m[32m        # Only invoke if state actually changed (to avoid duplicate callbacks)[m
+[32m+[m[32m        if old_state != SupervisorState.RESTARTING:[m
+[32m+[m[32m            logger.debug(f"Supervisor state: {old_state} -> {SupervisorState.RESTARTING}")[m
+[32m+[m[32m            if self._on_state_change:[m
+[32m+[m[32m                self._on_state_change(SupervisorState.RESTARTING)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.3]: Preserve MP3 buffer contents (do not clear)[m
+[32m+[m[32m        # Buffer is already preserved - we don't clear it here[m
+[32m+[m[32m        # Per contract [S13.3B]: During restart, MP3 output MUST remain continuous —[m
+[32m+[m[32m        # Supervisor restarts MUST NOT stall or block the broadcast loop.[m
+[32m+[m[32m        # Per contract [S13.3C]: Frame delivery MUST continue from existing buffer during restart[m
+[32m+[m[32m        # until new frames arrive. Fallback/silence may be injected upstream if buffer depletes,[m
+[32m+[m[32m        # but output MUST NOT stop.[m
+[32m+[m[32m        # The buffer remains accessible and non-blocking during restart, allowing the broadcast[m
+[32m+[m[32m        # loop to continue consuming frames from the buffer.[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.4]: Follow exponential backoff schedule[m
+[32m+[m[32m        self._schedule_restart()[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _schedule_restart(self) -> None:[m
+[32m+[m[32m        """Schedule asynchronous restart with backoff per contract [S13.4]."""[m
+[32m+[m[32m        if self._restart_thread is not None and self._restart_thread.is_alive():[m
+[32m+[m[32m            logger.debug("Restart already in progress")[m
+[32m+[m[32m            return[m
+[32m+[m[41m        [m
+[32m+[m[32m        self._restart_thread = threading.Thread([m
+[32m+[m[32m            target=self._restart_worker,[m
+[32m+[m[32m            daemon=False,[m
+[32m+[m[32m            name="EncoderRestart"[m
+[32m+[m[32m        )[m
+[32m+[m[32m        self._restart_thread.start()[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _restart_worker(self) -> None:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Worker function for asynchronous restart per contract [S13.4].[m
+[32m+[m[41m        [m
+[32m+[m[32m        Handles exponential backoff and restart logic.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            if self._state != SupervisorState.RESTARTING:[m
+[32m+[m[32m                return[m
+[32m+[m[32m            attempt_num = self._restart_attempts[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Get backoff delay per contract [S13.4][m
+[32m+[m[32m        backoff_idx = min(attempt_num - 1, len(self._backoff_schedule_ms) - 1)[m
+[32m+[m[32m        delay_ms = self._backoff_schedule_ms[backoff_idx][m
+[32m+[m[32m        delay_sec = delay_ms / 1000.0[m
+[32m+[m[41m        [m
+[32m+[m[32m        logger.info([m
+[32m+[m[32m            f"Restarting encoder (attempt {attempt_num}/{self._max_restarts}) "[m
+[32m+[m[32m            f"after {delay_sec:.1f}s delay"[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Wait for backoff delay[m
+[32m+[m[32m        time.sleep(delay_sec)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Stop old process[m
+[32m+[m[32m        self._stop_encoder_process()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Reset liveness tracking[m
+[32m+[m[32m        self._first_frame_received = False[m
+[32m+[m[32m        self._first_frame_time = None[m
+[32m+[m[32m        self._last_frame_time = None[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Start new encoder process[m
+[32m+[m[32m        self._start_encoder_process()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Per contract [S13.8], [S29]: IMMEDIATELY set state to BOOTING after process spawn attempt[m
+[32m+[m[32m        # This must happen synchronously before checking for failures or starting threads,[m
+[32m+[m[32m        # so that tests checking state immediately after _restart_worker() returns will see BOOTING (not RESTARTING).[m
+[32m+[m[32m        # Even if the process fails immediately, state MUST be BOOTING first per [S13.8], [S29][m
+[32m+[m[32m        # State will transition to RUNNING only after first MP3 frame received per [S6A][m
+[32m+[m[32m        with self._state_lock:[m
+[32m+[m[32m            old_state = self._state[m
+[32m+[m[32m            self._state = SupervisorState.BOOTING[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Notify state change outside lock per [S13.7][m
+[32m+[m[32m        if old_state != SupervisorState.BOOTING:[m
+[32m+[m[32m            logger.debug(f"Supervisor state: {old_state} -> {SupervisorState.BOOTING}")[m
+[32m+[m[32m            if self._on_state_change:[m
+[32m+[m[32m                self._on_state_change(SupervisorState.BOOTING)[m
+[32m+[m[41m        [m
+[32m+[m[32m        if self._process is None or self._stdout is None:[m
+[32m+[m[32m            # Restart failed - trigger another attempt[m
+[32m+[m[32m            # Per contract [S13.8], [S29]: State is already BOOTING, but process failed[m
+[32m+[m[32m            # _handle_failure() will transition to RESTARTING for next attempt[m
+[32m+[m[32m            # However, per contract [S13.8], [S29]: State MUST be BOOTING immediately after spawn attempt[m
+[32m+

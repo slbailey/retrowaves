@@ -631,6 +631,193 @@ The encoder output path is implemented as a tick-driven loop (see Section 5.2.3 
 - Delegates per-connection writes to `HTTPConnectionManager`
 - Handles new connections and delegates to connection manager
 
+### 7.6 Component Integration Contracts (Implementation Binding)
+
+This section defines the **public interface of each internal component** and the **exact function calls connecting them**, so that the implementation follows directly from architecture with no guessing.
+
+#### Explicit Class Interface Signatures
+
+**EncoderManager**
+
+```python
+class EncoderManager:
+    def __init__(
+        self,
+        pcm_buffer: FrameRingBuffer,
+        mp3_buffer: Optional[FrameRingBuffer] = None,
+        stall_threshold_ms: Optional[int] = None,
+        backoff_schedule_ms: Optional[List[int]] = None,
+        max_restarts: Optional[int] = None,
+        ffmpeg_cmd: Optional[List[str]] = None,
+    ) -> None: ...
+    
+    def write_pcm(self, frame: bytes) -> None: ...
+    """Write PCM frame to encoder. Non-blocking, forwards to supervisor."""
+    
+    def get_frame(self) -> Optional[bytes]: ...
+    """Get next MP3 frame or silence. Returns None only at startup before first frame."""
+    
+    def start(self) -> None: ...
+    """Start encoder process and supervisor. Initializes FFmpegSupervisor internally."""
+    
+    def stop(self, timeout: float = 5.0) -> None: ...
+    """Stop encoder process and supervisor. Cleans up all resources."""
+    
+    @property
+    def mp3_buffer(self) -> FrameRingBuffer: ...
+    """Get MP3 output buffer (read-only access for monitoring)."""
+    
+    def get_state(self) -> EncoderState: ...
+    """Get current encoder state (RUNNING, RESTARTING, FAILED, STOPPED)."""
+```
+
+**AudioPump**
+
+```python
+class AudioPump:
+    def __init__(
+        self,
+        pcm_buffer: FrameRingBuffer,
+        fallback_generator: FallbackGenerator,
+        encoder_manager: EncoderManager,
+    ) -> None: ...
+    """Initialize AudioPump with PCM buffer, fallback source, and encoder manager.
+    
+    AudioPump writes PCM frames via encoder_manager.write_pcm() only.
+    It never interacts with FFmpegSupervisor directly.
+    """
+    
+    def start(self) -> None: ...
+    """Start AudioPump thread. Begins real-time PCM pumping at 21.333ms intervals."""
+    
+    def stop(self) -> None: ...
+    """Stop AudioPump thread gracefully. Waits for thread completion."""
+```
+
+**FFmpegSupervisor**
+
+```python
+class FFmpegSupervisor:
+    def __init__(
+        self,
+        mp3_buffer: FrameRingBuffer,
+        ffmpeg_cmd: List[str],
+        stall_threshold_ms: int = 2000,
+        backoff_schedule_ms: Optional[List[int]] = None,
+        max_restarts: int = 5,
+        on_state_change: Optional[Callable[[SupervisorState], None]] = None,
+    ) -> None: ...
+    """Initialize FFmpeg supervisor with MP3 output buffer and configuration."""
+    
+    def start(self) -> None: ...
+    """Start FFmpeg process and drain threads. Begins liveness monitoring."""
+    
+    def stop(self, timeout: float = 5.0) -> None: ...
+    """Stop FFmpeg process and all threads. Cleans up resources."""
+    
+    def write_pcm(self, frame: bytes) -> None: ...
+    """Write PCM frame to FFmpeg stdin. Non-blocking, handles broken pipe errors."""
+    
+    def get_stdin(self) -> Optional[BinaryIO]: ...
+    """Get FFmpeg stdin pipe for direct writing (INTERNAL ONLY - used by EncoderManager.write_pcm())."""
+    
+    def get_state(self) -> SupervisorState: ...
+    """Get current supervisor state (STARTING, RUNNING, RESTARTING, FAILED, STOPPED)."""
+```
+
+**HTTPConnectionManager**
+
+```python
+class HTTPConnectionManager:
+    def __init__(self) -> None: ...
+    """Initialize connection manager with empty client list."""
+    
+    def add_client(self, client_socket: socket.socket, client_id: str) -> None: ...
+    """Add new client to broadcast list. Thread-safe."""
+    
+    def remove_client(self, client_id: str) -> None: ...
+    """Remove client from broadcast list. Thread-safe."""
+    
+    def broadcast(self, data: bytes) -> None: ...
+    """Broadcast data to all connected clients. Non-blocking, drops slow clients."""
+```
+
+**TowerService**
+
+```python
+class TowerService:
+    def __init__(self) -> None: ...
+    """Initialize Tower service. Creates all components and buffers."""
+    
+    def start(self) -> None: ...
+    """Start Tower service. Initializes and starts all threads and processes."""
+    
+    def stop(self) -> None: ...
+    """Stop Tower service. Gracefully shuts down all components."""
+    
+    def main_loop(self) -> None: ...
+    """Main broadcast loop. Tick-driven MP3 frame broadcasting to HTTP clients."""
+```
+
+#### AudioPump → EncoderManager Contract
+
+- AudioPump never interacts with FFmpegSupervisor directly.
+- It only calls:
+  - `encoder_manager.write_pcm(frame: bytes)`
+- AudioPump responsibility:
+  - Pull next PCM frame (live or fallback)
+  - Push PCM to encoder via EncoderManager
+  - Timing loop 21.333ms stable metronome
+
+**Note:** The current implementation has AudioPump writing directly to supervisor. This contract specifies the intended architecture where AudioPump should call `encoder_manager.write_pcm()` instead. This separation ensures proper encapsulation.
+
+#### EncoderManager → FFmpegSupervisor Contract
+
+- EncoderManager is the ONLY owner of FFmpegSupervisor.
+- Public surface:
+  - `write_pcm(frame: bytes)` → forwards PCM to supervisor input ring
+  - `get_frame() -> bytes` → returns next encoded MP3 frame or silence
+- Internally maintains:
+  - MP3 ring buffer output (owned by EncoderManager)
+  - PCM buffer is NOT owned by EncoderManager (owned by TowerService, passed to AudioPump)
+- Calls supervisor.start(), supervisor.restart(), supervisor.stop()
+
+#### FFmpegSupervisor Internal Contract
+
+- Owns ffmpeg subprocess and drain threads
+- Provides:
+  - `write_pcm(frame: bytes)` → writes directly to FFmpeg stdin
+  - Pushes MP3 frames into mp3_buffer (not callback-based)
+- Handles liveness, restart, stderr logging
+
+#### HTTPBroadcast Loop
+
+- Calls `encoder_manager.get_frame()` every tick interval.
+- Never checks state, never blocks, no restart awareness.
+
+#### Final Required Wiring Summary
+
+At startup TowerService must:
+
+1. Create PCM ring buffer
+2. Create MP3 ring buffer
+3. Construct EncoderManager(pcm_buffer, mp3_buffer, supervisor_config)
+4. Construct AudioPump(fallback_source, encoder_manager)
+5. Construct FFmpegSupervisor inside EncoderManager
+6. Start:
+   - supervisor
+   - audio pump thread
+   - encoder drain thread
+   - HTTP output tick thread
+
+#### Acceptance Criteria
+
+- No component references another by attribute that isn't defined in contract.
+- AudioPump → EncoderManager interface is explicit.
+- Supervisor lifecycle does not leak outside EncoderManager.
+- Implementation must be derivable directly from the document.
+- All public methods must match the interface signatures defined above.
+
 ---
 
 ## 8. Tower Lifecycle
@@ -644,13 +831,31 @@ On service start:
    - Try MP3/WAV file if `TOWER_SILENCE_MP3_PATH` is configured
    - Fall back to tone generator if file unavailable or invalid
    - Fall back to silence if tone generator fails
-3. Initialize `AudioInputRouter`, `FallbackGenerator`, and `HTTPConnectionManager`
-4. Start FFmpeg encoder process
-5. Start:
-   - AudioPump thread
-   - EncoderReader thread
-   - HTTP server thread
+3. Initialize buffers:
+   - Create PCM ring buffer
+   - Create MP3 ring buffer
+4. Initialize components:
+   - Initialize `AudioInputRouter`
+   - Initialize `FallbackGenerator`
+   - Initialize `HTTPConnectionManager`
+   - Construct `EncoderManager` (which internally creates `FFmpegSupervisor`)
+   - Construct `AudioPump` with encoder_manager (not supervisor)
+5. Start components in order (critical sequence):
+   - Start Supervisor (via `encoder_manager.start()` - initializes FFmpeg process)
+   - Start EncoderOutputDrain thread (via supervisor - drains FFmpeg stdout)
+   - Start AudioPump thread (begins writing PCM to encoder)
+   - Start HTTP server thread (accepts client connections)
+   - Start HTTP tick/broadcast thread (begins streaming MP3 frames)
 6. Begin continuous streaming
+
+**Critical Startup Order Rationale:**
+
+This sequence ensures:
+- Buffers exist before any component tries to use them
+- FFmpeg process and stdin pipe exist before AudioPump begins writing
+- EncoderOutputDrain thread is ready to receive MP3 frames before encoding begins
+- HTTP server is ready to accept connections before broadcast loop starts
+- Eliminates edge conditions where AudioPump writes before FFmpeg stdin exists
 
 Station may be offline at this point; Tower still streams fallback audio.
 
@@ -807,5 +1012,60 @@ This document defines the canonical behavior, responsibilities, and constraints 
 ---
 
 **Document:** Tower Unified Architecture (canonical)  
-**Last Updated:** 2025-12-03  
+**Last Updated:** 2025-12-04  
 **Authority:** This document supersedes prior Tower-related architecture documents.
+
+---
+
+## IMPLEMENTATION TODO CHECKLIST
+
+This checklist provides concrete implementation tasks derived from the architecture contracts defined in Section 7.6.
+
+### AudioPump Implementation
+
+- [ ] Ensure AudioPump only calls `encoder_manager.write_pcm(frame: bytes)`
+- [ ] Remove any direct references to FFmpegSupervisor from AudioPump
+- [ ] Verify AudioPump timing loop uses 21.333ms stable metronome
+- [ ] Confirm AudioPump pulls PCM frames from ring buffer or fallback generator
+
+### EncoderManager Implementation
+
+- [ ] Add `write_pcm(frame: bytes)` method that forwards to supervisor
+- [ ] Ensure `get_frame() -> bytes` returns next MP3 frame or silence
+- [ ] Verify EncoderManager is the ONLY owner of FFmpegSupervisor
+- [ ] Confirm EncoderManager maintains PCM and MP3 ring buffers internally
+- [ ] Ensure supervisor lifecycle methods (start, restart, stop) are called only by EncoderManager
+
+### FFmpegSupervisor Implementation
+
+- [ ] Verify supervisor owns ffmpeg subprocess and drain threads
+- [ ] Ensure supervisor provides `write_pcm(frame)` method (or equivalent)
+- [ ] Confirm supervisor pushes MP3 frames into mp3_buffer (not callback-based)
+- [ ] Verify supervisor handles liveness detection, restart logic, and stderr logging
+
+### HTTPBroadcast Loop Implementation
+
+- [ ] Ensure broadcast loop calls `encoder_manager.get_frame()` every tick interval
+- [ ] Remove any state checks or restart awareness from broadcast loop
+- [ ] Verify broadcast loop never blocks on frame retrieval
+- [ ] Confirm broadcast loop operates independently of encoder state
+
+### TowerService Wiring
+
+- [ ] Verify TowerService creates PCM ring buffer at startup
+- [ ] Verify TowerService creates MP3 ring buffer at startup
+- [ ] Ensure EncoderManager is constructed with pcm_buffer, mp3_buffer, and supervisor_config
+- [ ] Ensure AudioPump is constructed with fallback_source and encoder_manager (not supervisor)
+- [ ] Verify FFmpegSupervisor is constructed inside EncoderManager (not in TowerService)
+- [ ] Confirm startup sequence:
+  - [ ] supervisor.start()
+  - [ ] audio pump thread.start()
+  - [ ] encoder drain thread.start()
+  - [ ] HTTP output tick thread.start()
+
+### Contract Compliance Verification
+
+- [ ] Audit all component references to ensure no attribute access outside defined contracts
+- [ ] Verify AudioPump → EncoderManager interface is explicit and documented
+- [ ] Confirm supervisor lifecycle is completely encapsulated within EncoderManager
+- [ ] Ensure implementation can be derived directly from architecture document without guessing
