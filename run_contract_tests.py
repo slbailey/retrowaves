@@ -85,6 +85,9 @@ def run_pytest(suppress_logs=False):
             r'WARNING.*tower\.encoder',  # WARNING logs from encoder modules
             r'🔥\s+',  # Fire emoji error logs
             r'\[FFMPEG\]',  # FFmpeg prefix logs
+            r'\[DEBUG\].*tower\.',  # All DEBUG logs from tower modules
+            r'\[INFO\].*tower\.',  # INFO logs from tower modules (unless critical)
+            r'\[GEN\]',  # Generator debug logs
         ]
         log_spam_re = re.compile('|'.join(log_spam_patterns))
         
@@ -338,6 +341,37 @@ def categorize_failure(test_name, error, status='FAIL'):
     # Default
     return "CONTRACT MISMATCH", "Code doesn't match contract requirements"
 
+def filter_log_spam(text):
+    """Filter out application DEBUG/INFO log spam from test output."""
+    import re
+    lines = text.split('\n')
+    filtered_lines = []
+    
+    # Patterns to filter (application log spam)
+    log_spam_patterns = [
+        r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[DEBUG\].*tower\.',  # DEBUG logs with timestamps
+        r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\].*tower\.',   # INFO logs with timestamps (non-critical)
+        r'\[GEN\]',  # Generator debug logs
+        r'\[DEBUG\].*tower\.',  # DEBUG logs without timestamps
+    ]
+    log_spam_re = re.compile('|'.join(log_spam_patterns))
+    
+    for line in lines:
+        # Keep pytest output, test results, and non-spam lines
+        is_pytest_output = (
+            '::' in line or  # Test results
+            '=' * 10 in line or  # pytest separators
+            'PASSED' in line or 'FAILED' in line or 'ERROR' in line or
+            'collected' in line.lower() or
+            'passed' in line.lower() or 'failed' in line.lower() or
+            line.strip().startswith('tower/tests/contracts/')
+        )
+        
+        if is_pytest_output or not log_spam_re.search(line):
+            filtered_lines.append(line)
+    
+    return '\n'.join(filtered_lines)
+
 def generate_report(tests, passed, failed, errors, total, full_output, show_all=False):
     """Generate audit report per rules format."""
     report = []
@@ -345,7 +379,13 @@ def generate_report(tests, passed, failed, errors, total, full_output, show_all=
     report.append("")
     report.append(f"Tests executed: {total}  | Passed: {passed} | Failed: {failed} | Errors: {errors}")
     report.append("")
-    report.append("")
+    
+    # Add success message if all tests pass
+    if failed == 0 and errors == 0 and total > 0:
+        report.append("All tests passing! ✓")
+        report.append("")
+    else:
+        report.append("")
     
     for test in tests:
         test_name = test['name']
@@ -385,9 +425,13 @@ def generate_report(tests, passed, failed, errors, total, full_output, show_all=
             report.append("")
             report.append("")
     
-    # Add full output at end for debugging
-    report.append("--- Full Test Output ---")
-    report.append(full_output)
+    # Only add full output if there are failures (for debugging)
+    # When all tests pass, the verbose output is unnecessary noise
+    if failed > 0 or errors > 0:
+        report.append("--- Full Test Output ---")
+        # Filter out log spam even in failure output for readability
+        cleaned_output = filter_log_spam(full_output)
+        report.append(cleaned_output)
     
     return "\n".join(report)
 

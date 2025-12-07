@@ -8,6 +8,13 @@ A 24/7, process-isolated, HTTP-based audio transmission service that exposes a s
 
 This is the canonical architecture document for `retrowaves-tower.service` and supersedes all previous Tower-related designs.
 
+> **Contract Alignment:**  
+> This architecture document aligns with the NEW contract specifications:
+> - `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md` (C-series: timing, formats, buffers)
+> - `NEW_ENCODER_MANAGER_CONTRACT.md` (M-series: routing, grace period, fallback)
+> - `NEW_FALLBACK_PROVIDER_CONTRACT.md` (FP-series: fallback source selection)
+> - `NEW_TOWER_RUNTIME_CONTRACT.md` (T-series: HTTP endpoints, integration)
+
 ---
 
 ## 1. Executive Summary
@@ -158,25 +165,28 @@ Tower exposes an internal interface (`AudioInputRouter`) that Station can push P
 - PCM `s16le`
 - 48 kHz sample rate
 - 2 channels (stereo)
-- `frame_size = 1024` samples (~21.3 ms per frame at 48 kHz)
+- `frame_size = 1152` samples (24 ms per frame at 48 kHz)
+- `frame_bytes = 4608` bytes (1152 samples × 2 channels × 2 bytes per sample)
 
 **Live PCM Delivery Model:**
 
-Station (producer) → unpaced writes → Unix Socket → Tower Ring Buffer → paced consumption → Encoder
+Station (producer) → unpaced writes → Unix Socket → Tower Ring Buffer → EncoderManager → AudioPump → Encoder
 
 | Component | Timing Responsibility |
 |-----------|----------------------|
 | Station | no timing — decode & write frames immediately as available |
-| Tower | sole metronome — pulls one 1024-sample frame every 21.333ms |
-| Fallback | provides frames only when Tower pulls and none are available |
+| AudioPump | sole metronome — drives 24ms tick interval (1152 samples per tick) |
+| EncoderManager | routing authority — selects program/grace/fallback PCM per tick |
+| Fallback | provides frames only when EncoderManager requests and no program PCM available |
 
 **Important Principles:**
 
-- **Tower is the only clock in the system.** Station writes frames into the socket with no timing, pushing decoded PCM bursts.
-- **Station pushes fast; Tower pulls steady.** Tower is the rate limiter, consuming frames at exactly 48kHz → 1024-sample frames → 21.333ms.
-- **Buffer must be bounded (200–500ms max recommended).** A ring buffer absorbs burstiness; underflow triggers fallback tone.
-- **Buffer never grows unbounded — Tower consumption rate stabilizes the system.** Overflow drops newest or oldest depending on strategy.
-- **Underflow triggers silence → tone after grace window.** If Station falls behind or stops writing, Tower must detect this and use fallback.
+- **AudioPump is the single authoritative time source (C7.1).** All Tower subsystems operate on the global 24ms tick interval (C1.3).
+- **Station pushes fast; AudioPump pulls steady.** AudioPump is the rate limiter, consuming frames at exactly 48kHz → 1152-sample frames → 24ms intervals.
+- **EncoderManager is the single routing authority (M11, M12).** Only EncoderManager decides between program PCM, grace-period silence, or fallback. No other component implements routing logic.
+- **Buffer must be bounded (200–500ms max recommended).** A ring buffer absorbs burstiness; underflow triggers grace silence then fallback.
+- **Buffer never grows unbounded — AudioPump consumption rate stabilizes the system.** Overflow drops newest or oldest depending on strategy (C-RB2).
+- **Grace period uses monotonic clock (M-GRACE1).** Grace period is 5 seconds default (M8), configurable via `TOWER_PCM_GRACE_SEC`.
 
 **Format Validation:**
 
@@ -196,41 +206,60 @@ Fallback is internal to Tower and requires no Station participation.
 
 **Fallback Source Priority Order:**
 
-Tower selects the fallback source using the following priority order (highest to lowest):
+Per NEW_CORE_TIMING_AND_FORMATS_CONTRACT (C4.1) and NEW_FALLBACK_PROVIDER_CONTRACT (FP3), the fallback provider selects sources using the following strict priority order (highest to lowest):
 
-1. **MP3/WAV File** (if `TOWER_SILENCE_MP3_PATH` is configured and exists):
-   - If the file is a WAV file (`.wav` extension), Tower uses it as a file source
-   - If the file is an MP3 or other format, Tower falls through to tone generator (FileSource only handles WAV files)
-   - Note: To use MP3 files as fallback, they must be converted to WAV first, or MP3 support must be added to FileSource
+1. **File Source** (if `TOWER_SILENCE_MP3_PATH` is configured and exists):
+   - File fallback MUST provide PCM frames in format C2 (48kHz, stereo, 16-bit, 1152 samples per frame) (C4.2.1)
+   - File content MUST be decoded to PCM format at startup or first use (C4.2.2)
+   - File fallback MUST support seamless looping if file is shorter than required duration (C4.2.3)
+   - File fallback MUST be selected only if valid file path is configured, file exists and is readable, and format is supported (C4.2.4)
 
-2. **Tone Generator** (default):
-   - Generates continuous PCM tone (e.g., 440 Hz sine wave)
-   - Used when no file is configured, or when file source initialization fails
-   - Configured via `TOWER_DEFAULT_SOURCE=tone` (default)
+2. **440Hz Tone Generator** (preferred fallback):
+   - **440Hz tone is the preferred fallback source** when file-based fallback is unavailable (C4.3, FP3.2)
+   - Tone MUST be represented as valid PCM of the same format as C2 (C4.3.1)
+   - Tone MUST be continuous across frames when emitted tick-by-tick (no phase discontinuities) (C4.3.2)
+   - Tone MUST use a phase accumulator to ensure waveform continuity between frames (C4.3.3)
+   - Tone generator MUST return frames immediately without blocking (zero latency concept) (C4.3.5, FP2.2)
+   - Tone is strongly preferred over silence whenever possible (FP3.2, FP5.2)
 
-3. **Silence** (fallback if tone generation fails):
-   - Produces continuous PCM zeros (silence)
-   - Used only if tone generator initialization fails
-   - Ensures Tower always has a valid source, even if tone generation encounters errors
+3. **Silence** (last resort only):
+   - Silence MUST be used **only if tone generation is not possible for any reason** (C4.4, FP3.3)
+   - Silence MUST be a zero-filled PCM frame of size 4608 bytes (as defined in C3) (C4.4.1)
+   - Silence MUST always be available as the final fallback option (C4.4.2)
+   - Silence frames MUST be precomputed and reused for maximum speed (C3.3, C4.4.4)
 
-### 4.3 Input Selection Logic
+The priority order is: **File → 440Hz Tone → Silence**. Tone is strongly preferred over silence whenever possible.
 
-At each audio tick (exactly 21.333 ms intervals, driven by Tower's metronome):
+### 4.3 Input Selection Logic (EncoderManager Routing Authority)
 
-1. Tower pulls one frame from the Station input buffer (non-blocking, short timeout ~5ms)
-2. If available → use live frame
-3. If not available (queue empty or timeout) → check grace period:
-   - **5 second grace period before fallback**: When Station switches between MP3 tracks, there may be brief gaps in PCM data. Tower must wait 5 seconds (configurable via `TOWER_PCM_GRACE_SEC`) before switching to fallback tone. During the grace period, Tower uses silence frames to maintain continuous MP3 stream. This prevents audible tone interruptions during track transitions.
-   - If within grace period (default 5 seconds): use silence frame
-   - If grace period expired: generate or fetch fallback frame (tone/file)
-4. Send the chosen PCM to the encoder
+Per NEW_ENCODER_MANAGER_CONTRACT (M11, M12), **EncoderManager is the single, authoritative decision-maker** for which audio source is used each tick. No other component implements routing logic.
+
+**At each audio tick (exactly 24ms intervals, driven by AudioPump's metronome):**
+
+1. **AudioPump** calls `EncoderManager.next_frame()` with no arguments (M1)
+2. **EncoderManager** reads PCM from internal buffer (populated via `write_pcm()` from upstream) or determines absence
+3. **EncoderManager** applies source selection rules (M6, M7):
+   - **If PCM present and valid (M6):** EncoderManager updates `last_pcm_seen_at` to `now()` and returns program PCM frame (**PROGRAM**)
+   - **If PCM absent (M7):** EncoderManager calculates `since = now() - last_pcm_seen_at`:
+     - **If `since <= GRACE_SEC` (M7.1):** Returns canonical precomputed silence frame (**GRACE_SILENCE**)
+     - **If `since > GRACE_SEC` (M7.2):** Calls `fallback_provider.next_frame()` and returns fallback frame (**FALLBACK**)
+4. **AudioPump** receives the selected PCM frame and writes it to encoder via `EncoderManager.write_pcm()`
+
+**Grace Period Requirements (M-GRACE):**
+
+- **Grace timers MUST use monotonic clock (M-GRACE1)**
+- **Silence frame MUST be precomputed and reused (M-GRACE2)**
+- **At exactly `t == GRACE_SEC`, silence still applies; tone applies only at `t > GRACE_SEC` (M-GRACE3)**
+- **Grace resets immediately when program PCM returns (M-GRACE4)**
+- **GRACE_SEC MUST be configurable (default 5 seconds) (M8)**
 
 **Key Points:**
 
-- Tower's consumption rate (21.333ms per frame) is the sole timing reference
-- Station writes are unpaced bursts; Tower's steady pull rate stabilizes the buffer
-- Grace period prevents tone blips during short gaps between tracks
-- This logic ensures there is never a gap in the PCM stream feeding the encoder
+- **AudioPump is the single authoritative time source (C7.1)** — drives 24ms tick interval
+- **EncoderManager is the single routing authority (M11, M12)** — only component that decides program/grace/fallback
+- **Station writes are unpaced bursts; AudioPump's steady pull rate stabilizes the buffer**
+- **Grace period prevents tone blips during short gaps between tracks**
+- **This logic ensures there is never a gap in the PCM stream feeding the encoder (S7.0A, S7.0D)**
 
 This architecture aligns with broadcast automation, SDR, VoIP jitter buffers, ALSA/JACK, Icecast source clients, radio encoders, and MPEG TS playout systems.
 
@@ -277,20 +306,27 @@ Tower implements a production-quality encoding subsystem designed to eliminate s
 
 **Core Invariant:** MP3 output must be smooth and continuous regardless of input, timing, or encoder health.
 
+**Global Timing Contract (C1):**
+- **Universal timing tick: 24ms (C1.1)** — all Tower subsystems operate on this global tick
+- **24ms = 1152 samples at 48kHz (C1.2)**
+- **All subsystems MUST operate on this global tick (C1.3):** AudioPump, EncoderManager, FFmpegSupervisor input pacing, TowerRuntime HTTP streaming tick
+- **No other subsystem may introduce its own timing loop (C1.3)**
+
 #### 5.2.1 Dual-Buffer Architecture
 
 The encoding subsystem uses a **dual-buffer architecture** with independent input and output queues, separated by the FFmpeg encoder process:
 
 - **PCM Input Buffer**: Thread-safe ring buffer for PCM frames (~50-100 frames, ~1-2 seconds)
-  - Pumped by AudioPump at real-time pace (source clock)
-  - Non-blocking writes (drops newest if full)
-  - Non-blocking reads (returns None if empty)
+  - Populated via `EncoderManager.write_pcm()` from upstream (Station or test injection)
+  - Consumed by AudioPump at 24ms tick intervals (C1.1, C7.1)
+  - Non-blocking writes (drops newest if full per C-RB2)
+  - Non-blocking reads (returns None if empty per C-RB3)
 
 - **MP3 Output Buffer**: Frame-based ring buffer for MP3 frames (~400 frames, ~5 seconds depth)
   - Consumed by tick-driven broadcast loop (consumer clock)
   - Stores complete MP3 frames only (no partials)
-  - Non-blocking writes (drops oldest if full)
-  - Non-blocking reads (returns None if empty)
+  - Non-blocking writes (drops oldest if full per C-RB2)
+  - Non-blocking reads (returns None if empty per C-RB3)
 
 **Why Split Buffers?**
 - Input timing (PCM pump) operates independently from output timing (HTTP broadcast)
@@ -316,20 +352,21 @@ The encoding subsystem uses a **dual-buffer architecture** with independent inpu
 
 **Problem:** "Read as fast as possible" causes CPU spinning, inconsistent output rate, buffer oscillation, and poor jitter tolerance.
 
-**Solution:** Tick-driven loop with fixed interval (15ms default, ~66 ticks/second):
+**Solution:** Tick-driven loop with fixed interval aligned to global 24ms tick (C1.1):
 - Consistent output rate (not bursty)
 - Better jitter tolerance (smooths network/system delays)
 - Lower CPU usage (no busy loops)
 - Predictable behavior
+- All subsystems operate on same 24ms global tick (C1.3)
 
 **Output Loop:**
 ```python
-# Tick-driven broadcast loop
-tick_interval_ms = 15  # ~66 frames/second
+# Tick-driven broadcast loop (24ms intervals per C1.1)
+tick_interval_ms = 24  # Global metronome interval (C1.1)
 while not shutdown:
     frame = encoder_manager.get_frame()  # Returns frame or silence_frame
     broadcast(frame)
-    sleep(tick_interval_ms)  # Fixed interval, not "as fast as possible"
+    sleep(tick_interval_ms)  # Fixed interval, aligned to global tick
 ```
 
 #### 5.2.4 Encoder Lifecycle & Restart Flow
@@ -401,31 +438,32 @@ TOWER_ENCODER_BACKOFF_MS=1000,2000,4000,8000,10000
 # Maximum encoder restart attempts
 TOWER_ENCODER_MAX_RESTARTS=5
 
-# MP3 output buffer capacity (frames) - 5 seconds @ ~66 fps = 330 frames
+# MP3 output buffer capacity (frames) - 5 seconds @ ~42 fps (24ms intervals) = ~208 frames
 # Recommended: 400 frames (with headroom) for jitter tolerance
 TOWER_MP3_BUFFER_CAPACITY_FRAMES=400
 
 # PCM input buffer size (frames) - ~1-2 seconds
 TOWER_PCM_BUFFER_SIZE=100
 
-# Tick-driven output interval (milliseconds)
-TOWER_OUTPUT_TICK_INTERVAL_MS=15  # ~66 ticks/second
+# Tick-driven output interval (milliseconds) - MUST match global 24ms metronome (C1.1, C1.3)
+TOWER_OUTPUT_TICK_INTERVAL_MS=24  # Global metronome interval per C1.1
 ```
 
 **Default Values:**
 - Stall Threshold: 2000ms
 - Backoff Schedule: [1000, 2000, 4000, 8000, 10000]ms
 - Max Restarts: 5
-- MP3 Buffer Capacity: 400 frames (~5 seconds @ ~66 fps)
-- PCM Buffer Size: 100 frames (~2 seconds)
-- Output Tick Interval: 15ms (~66 ticks/second)
+- MP3 Buffer Capacity: 400 frames (~5 seconds @ ~42 fps, 24ms intervals)
+- PCM Buffer Size: 100 frames (~2.4 seconds at 24ms intervals)
+- Output Tick Interval: 24ms (global metronome interval per C1.1, C1.3)
+- Grace Period: 5.0 seconds (default per M8)
 
 **Performance Characteristics:**
 - Latency: ~5 seconds (MP3 buffer depth)
 - CPU Usage: Minimal (select-based I/O, tick-driven pacing, no busy loops)
 - Memory Usage: ~150KB-1.7MB (MP3 buffer, depends on frame size) + ~100KB (PCM buffer)
 - Restart Time: ~1-10 seconds (depending on backoff schedule)
-- Output Rate: ~66 frames/second (15ms tick interval)
+- Output Rate: ~42 frames/second (24ms tick interval per C1.1)
 
 For detailed troubleshooting, design rationale, and verification procedures, see the full encoding architecture documentation in `tower/docs/BROADCAST_ENCODER_ARCHITECTURE.md`.
 
@@ -807,93 +845,110 @@ Connection: keep-alive
 
 ## 7. Internal Components
 
-### 7.1 AudioInputRouter
+### 7.1 PCM Input Buffer (FrameRingBuffer)
 
-- Receives PCM frames from Station via Unix domain socket (`/var/run/retrowaves/pcm.sock`)
-- Buffers frames in a thread-safe bounded queue (ring buffer)
-- **Queue size:** 10 frames (~213 ms of audio at 48kHz)
+Per NEW contracts, AudioInputRouter has been removed. PCM input is handled via a FrameRingBuffer that EncoderManager reads from.
+
+**PCM Input Flow:**
+
+- Station writes PCM frames to Unix domain socket (`/var/run/retrowaves/pcm.sock`)
+- Frames are written to a FrameRingBuffer via `EncoderManager.write_pcm(frame)`
+- **Buffer capacity:** Configurable (typically 50-100 frames, ~1-2 seconds at 24ms intervals)
   - Bounded size prevents unbounded growth
-  - Tower's steady consumption rate (21.333ms per frame) stabilizes the buffer
+  - AudioPump's steady consumption rate (24ms per frame) stabilizes the buffer
   - Absorbs burstiness from Station's unpaced writes
-- Provides a `get_next_frame(timeout)` method to the Tower audio pump
-- Tower pulls frames at exactly 21.333ms intervals (sole metronome)
-- If no frames arrive within timeout, Tower assumes Station is offline or paused and uses fallback
+
+**FrameRingBuffer Requirements (C-RB):**
+
+- **Thread-safe operations (C-RB1):** Buffer operations MUST be thread-safe
+- **push() behavior (C-RB2):** Reject empty/None frames, drop newest on overflow for PCM
+- **pop() behavior (C-RB3):** MUST never block, return None if underflow
+- **O(1) time (C-RB4):** All operations MUST operate in O(1) time
+- **Required properties (C-RB5):** Buffer MUST expose capacity, count, overflow_count
 
 **Buffer Overflow Handling:**
 
-- If the queue is full when Station tries to write:
-  - **Strategy:** Drop incoming frame (newest frame is discarded)
-  - Station writes are unpaced bursts; Tower's steady pull rate prevents sustained overflow
+- If the buffer is full when Station tries to write:
+  - **Strategy:** Drop incoming frame (newest frame is discarded per C-RB2)
+  - Station writes are unpaced bursts; AudioPump's steady pull rate prevents sustained overflow
   - Station stays non-blocking; Tower maintains continuous audio flow
-  - Buffer never grows unbounded — Tower consumption rate stabilizes the system
+  - Buffer never grows unbounded — AudioPump consumption rate stabilizes the system
 
 **Buffer Underflow Handling:**
 
-- If the queue is empty when Tower tries to read:
-  - Tower uses fallback frame (already specified in 4.3)
-  - Underflow triggers silence → tone after grace window (default 5 seconds)
+- If the buffer is empty when EncoderManager reads:
+  - EncoderManager applies source selection rules (M6, M7)
+  - If within grace period: returns grace silence (M7.1)
+  - If grace period expired: calls fallback provider (M7.2)
+  - This ensures continuous PCM output per S7.0A, S7.0D
 
-**Partial Frame Handling:**
+**Frame Integrity (C8):**
 
-- If Station crashes mid-write, Tower may read an incomplete PCM frame
-- Tower discards any partial frames and falls back to fallback audio for that tick
-- This ensures continuous audio output even during Station failures
+- All PCM buffers MUST be sized in exact frame multiples (4608 bytes per frame) (C8.1)
+- Partial writes to PCM buffers MUST be forbidden; only complete 4608-byte frames may be written (C8.2)
+- Frame size must remain stable (4608 bytes) even under concurrent operations (C8.3)
 
-### 7.2 FallbackGenerator
+### 7.2 FallbackProvider (FallbackGenerator)
 
-- Generates PCM frames in the canonical audio format
-- **Current implementation:** tone generator (e.g., 440 Hz sine wave)
-- **Future implementation:** looped PCM from a pre-decoded standby asset
-  - **Loading strategy:** Load standby assets at Tower startup
-  - **Pre-processing:** Pre-decode MP3 → PCM at startup and cache in memory
-  - **Looping:** Loop cached PCM frames during fallback mode
-  - **Fallback:** If asset is missing or fails to load, use tone generator
+Per NEW_FALLBACK_PROVIDER_CONTRACT, the FallbackProvider is the exclusive source of non-program audio used when upstream PCM is unavailable beyond the grace period.
 
-**Source Selection Priority:**
+**Responsibilities (FP2):**
+- Produce exactly one **4608-byte PCM frame** on every call to `next_frame()` (FP2.1)
+- Guarantee that `next_frame()` returns **immediately without blocking** (zero latency concept) (FP2.2)
+- Provide audio in the PCM format defined by the Core Timing Contract: 48kHz, stereo, 1152 samples, 4608 bytes (FP2.3)
+- Guarantee that it always returns a valid frame — **no exceptions** (FP2.4)
 
-The fallback source is selected at Tower startup using the following priority order:
+**Source Selection Priority (FP3, C4.1):**
 
-1. **File Source** (if `TOWER_SILENCE_MP3_PATH` is set and points to a valid WAV file):
-   - Tower attempts to use the file as a file source
-   - If the file is not a WAV file or initialization fails, falls through to tone generator
+The fallback provider selects sources using the following strict priority order:
 
-2. **Tone Generator** (default):
-   - Generates continuous PCM tone (440 Hz sine wave by default)
-   - Used when no file is configured or file source initialization fails
-   - Configured via `TOWER_DEFAULT_SOURCE=tone`
+1. **File Source** (if `TOWER_SILENCE_MP3_PATH` is configured and exists):
+   - File fallback MUST provide PCM frames in format C2 (48kHz, stereo, 16-bit, 1152 samples per frame) (C4.2.1)
+   - File content MUST be decoded to PCM format at startup or first use (C4.2.2)
+   - File fallback MUST support seamless looping if file is shorter than required duration (C4.2.3)
 
-3. **Silence Source** (last resort):
-   - Produces continuous PCM zeros
-   - Used only if tone generator initialization fails
-   - Ensures Tower always has a valid source, even in error conditions
+2. **440Hz Tone Generator** (preferred fallback):
+   - **440Hz tone is the preferred fallback source** when file-based fallback is unavailable (C4.3, FP3.2)
+   - Tone MUST be continuous across frames when emitted tick-by-tick (no phase discontinuities) (C4.3.2)
+   - Tone MUST use a phase accumulator to ensure waveform continuity between frames (C4.3.3)
+   - Tone generator MUST return frames immediately without blocking (zero latency concept) (C4.3.5, FP2.2)
 
-This priority order ensures Tower always has a valid fallback source, with graceful degradation from file → tone → silence.
+3. **Silence** (last resort only):
+   - Silence MUST be used **only if tone generation is not possible for any reason** (C4.4, FP3.3)
+   - Silence MUST be a zero-filled PCM frame of size 4608 bytes (as defined in C3) (C4.4.1)
+   - Silence frames MUST be precomputed and reused for maximum speed (C3.3, C4.4.4)
+
+The priority order is: **File → 440Hz Tone → Silence**. Tone is strongly preferred over silence whenever possible.
 
 ### 7.3 AudioPump
 
-Runs in its own thread. **Tower's sole metronome — the only clock in the system.**
+Runs in its own thread. **AudioPump is the single authoritative time source (C7.1).** All Tower subsystems operate on the global 24ms tick interval (C1.1, C1.3).
 
-**Loop (exactly 21.333ms per iteration, using absolute clock timing):**
+**Loop (exactly 24ms per iteration, using absolute clock timing per C1.1):**
 
-1. Pull live PCM from `AudioInputRouter` with short timeout (~5ms, non-blocking)
-2. If none available:
-   - Check grace period: if within grace window, use silence frame
-   - If grace period expired, get fallback frame from `FallbackGenerator`
-3. Write PCM bytes into FFmpeg stdin
-4. Handle FFmpeg stdin errors (broken pipe, etc.) and trigger encoder restart if needed
-5. **Sleep for remaining time in 21.333ms period** (absolute clock timing prevents drift)
+1. Call `EncoderManager.next_frame()` with no arguments (M1)
+   - EncoderManager is the single routing authority (M11, M12)
+   - EncoderManager reads PCM from internal buffer (populated via `write_pcm()` from upstream)
+   - EncoderManager applies source selection rules: program PCM, grace silence, or fallback (M6, M7)
+2. Receive selected PCM frame from EncoderManager (guaranteed to be valid per S7.0A, S7.0D)
+3. Write PCM frame to encoder via `EncoderManager.write_pcm(frame)` (non-blocking)
+4. Handle encoder errors (broken pipe, etc.) — EncoderManager handles restart logic
+5. **Sleep for remaining time in 24ms period** (absolute clock timing prevents drift)
 
-**Timing Model:**
+**Timing Model (C1, C7):**
 
+- **Global metronome interval: 24ms (C1.1)** — all Tower subsystems operate on this tick
+- **24ms = 1152 samples at 48kHz (C1.2)**
 - Uses absolute clock timing (`next_frame_time += FRAME_DURATION`) to prevent cumulative drift
 - If loop falls behind schedule, resyncs clock instead of accumulating delay
-- Tower is the rate limiter: consumes frames at exactly 48kHz → 1024-sample frames → 21.333ms
-- Station pushes fast (unpaced bursts); Tower pulls steady (metronome)
+- **AudioPump is the rate limiter:** consumes frames at exactly 48kHz → 1152-sample frames → 24ms intervals
+- Station pushes fast (unpaced bursts); AudioPump pulls steady (metronome)
+- **No other component may maintain its own internal timing cycle (C7.2)**
 
 **Thread Safety:**
 
-- Must coordinate with `AudioInputRouter` (thread-safe queue)
-- Must handle FFmpeg process lifecycle (process may be restarted by another thread)
+- Must coordinate with EncoderManager (thread-safe buffer operations)
+- Must handle encoder process lifecycle (process may be restarted by EncoderManager)
 
 ### 7.4 Encoder Output & Broadcast Loop
 
@@ -934,20 +989,40 @@ This section defines the **public interface of each internal component** and the
 
 **EncoderManager**
 
+Per NEW_ENCODER_MANAGER_CONTRACT, EncoderManager is the single, authoritative decision-maker for which audio source is used each tick (M11, M12).
+
 ```python
 class EncoderManager:
     def __init__(
         self,
         pcm_buffer: FrameRingBuffer,
         mp3_buffer: Optional[FrameRingBuffer] = None,
+        fallback_provider: Optional[FallbackProvider] = None,
+        grace_sec: float = 5.0,  # Default 5 seconds per M8
         stall_threshold_ms: Optional[int] = None,
         backoff_schedule_ms: Optional[List[int]] = None,
         max_restarts: Optional[int] = None,
         ffmpeg_cmd: Optional[List[str]] = None,
     ) -> None: ...
+    """Initialize EncoderManager with PCM buffer, MP3 buffer, and fallback provider.
+    
+    EncoderManager is the ONLY owner of FFmpegSupervisor (M1).
+    Supervisor is never exposed to external components (M2).
+    """
     
     def write_pcm(self, frame: bytes) -> None: ...
-    """Write PCM frame to encoder. Non-blocking, forwards to supervisor."""
+    """Write PCM frame to internal buffer. Non-blocking, validates frame size (4608 bytes)."""
+    
+    def next_frame(self) -> bytes: ...
+    """Get next PCM frame for encoding. NEVER returns None (S7.0A, S7.0D).
+    
+    Per M1-M3, M6-M7: Returns exactly one PCM frame per tick:
+    - Program PCM if available (M6)
+    - Grace silence if within grace period (M7.1)
+    - Fallback frame if grace expired (M7.2)
+    
+    AudioPump calls this with no arguments - EncoderManager reads from internal buffer.
+    """
     
     def get_frame(self) -> Optional[bytes]: ...
     """Get next MP3 frame or silence. Returns None only at startup before first frame."""
@@ -964,26 +1039,32 @@ class EncoderManager:
     
     def get_state(self) -> EncoderState: ...
     """Get current encoder state (RUNNING, RESTARTING, FAILED, STOPPED)."""
+    
+    def get_operational_mode(self) -> str: ...
+    """Get current operational mode (M30). Computed independently, not just mapping Supervisor state."""
 ```
 
 **AudioPump**
+
+Per NEW_CORE_TIMING_AND_FORMATS_CONTRACT, AudioPump is the single authoritative time source (C7.1).
 
 ```python
 class AudioPump:
     def __init__(
         self,
-        pcm_buffer: FrameRingBuffer,
-        fallback_generator: FallbackGenerator,
         encoder_manager: EncoderManager,
     ) -> None: ...
-    """Initialize AudioPump with PCM buffer, fallback source, and encoder manager.
+    """Initialize AudioPump with encoder manager.
     
-    AudioPump writes PCM frames via encoder_manager.write_pcm() only.
-    It never interacts with FFmpegSupervisor directly.
+    AudioPump is the single authoritative time source (C7.1).
+    All Tower subsystems operate on the global 24ms tick interval (C1.1, C1.3).
+    
+    AudioPump calls encoder_manager.next_frame() with no arguments.
+    EncoderManager is the single routing authority (M11, M12).
     """
     
     def start(self) -> None: ...
-    """Start AudioPump thread. Begins real-time PCM pumping at 21.333ms intervals."""
+    """Start AudioPump thread. Begins real-time PCM pumping at 24ms intervals (C1.1)."""
     
     def stop(self) -> None: ...
     """Stop AudioPump thread gracefully. Waits for thread completion."""
@@ -1056,15 +1137,20 @@ class TowerService:
 
 #### AudioPump → EncoderManager Contract
 
-- AudioPump never interacts with FFmpegSupervisor directly.
-- It only calls:
-  - `encoder_manager.write_pcm(frame: bytes)`
-- AudioPump responsibility:
-  - Pull next PCM frame (live or fallback)
-  - Push PCM to encoder via EncoderManager
-  - Timing loop 21.333ms stable metronome
+Per NEW contracts:
+- **AudioPump is the single authoritative time source (C7.1)** — drives 24ms tick interval (C1.1)
+- **EncoderManager is the single routing authority (M11, M12)** — decides program/grace/fallback
+- AudioPump calls `encoder_manager.next_frame()` with **no arguments** (M1)
+- EncoderManager reads PCM from internal buffer (populated via `write_pcm()` from upstream)
+- EncoderManager applies source selection rules and returns selected PCM frame (M6, M7)
+- AudioPump receives selected PCM frame and writes to encoder via `encoder_manager.write_pcm(frame)`
+- Timing loop: 24ms stable metronome (C1.1)
 
-**Note:** The current implementation has AudioPump writing directly to supervisor. This contract specifies the intended architecture where AudioPump should call `encoder_manager.write_pcm()` instead. This separation ensures proper encapsulation.
+**PCM Flow:**
+1. Station writes PCM → Unix socket → `EncoderManager.write_pcm(frame)` → internal PCM buffer
+2. AudioPump tick (24ms) → `EncoderManager.next_frame()` → EncoderManager reads from internal buffer
+3. EncoderManager applies routing logic (M6, M7) → returns selected PCM frame
+4. AudioPump receives frame → `EncoderManager.write_pcm(frame)` → forwards to supervisor
 
 #### EncoderManager → FFmpegSupervisor Contract
 
@@ -1127,20 +1213,19 @@ On service start:
    - Fall back to tone generator if file unavailable or invalid
    - Fall back to silence if tone generator fails
 3. Initialize buffers:
-   - Create PCM ring buffer
-   - Create MP3 ring buffer
-4. Initialize components:
-   - Initialize `AudioInputRouter`
-   - Initialize `FallbackGenerator`
+   - Create PCM ring buffer (FrameRingBuffer per C-RB)
+   - Create MP3 ring buffer (FrameRingBuffer per C-RB)
+4. Initialize components (per T-ORDER1):
+   - Construct FallbackProvider (must be constructed before EncoderManager per FP7.1)
+   - Construct `EncoderManager` with PCM buffer, MP3 buffer, and fallback provider (which internally creates `FFmpegSupervisor`)
+   - Construct `AudioPump` with encoder_manager (AudioPump is single timing authority per C7.1)
    - Initialize `HTTPConnectionManager`
-   - Construct `EncoderManager` (which internally creates `FFmpegSupervisor`)
-   - Construct `AudioPump` with encoder_manager (not supervisor)
-5. Start components in order (critical sequence):
+5. Start components in order (critical sequence per T-ORDER1):
    - Start Supervisor (via `encoder_manager.start()` - initializes FFmpeg process)
    - Start EncoderOutputDrain thread (via supervisor - drains FFmpeg stdout)
-   - Start AudioPump thread (begins writing PCM to encoder)
+   - Start AudioPump thread (begins 24ms tick loop per C1.1, C7.1)
    - Start HTTP server thread (accepts client connections)
-   - Start HTTP tick/broadcast thread (begins streaming MP3 frames)
+   - Start HTTP tick/broadcast thread (begins streaming MP3 frames at 24ms intervals per C1.3)
 6. Begin continuous streaming
 
 **Critical Startup Order Rationale:**
@@ -1167,29 +1252,34 @@ Station may be offline at this point; Tower still streams fallback audio.
 
 When Station starts feeding PCM:
 
-- `AudioInputRouter` begins returning live frames
+- Station writes PCM frames to Unix socket → `EncoderManager.write_pcm(frame)` → internal PCM buffer
+- EncoderManager detects PCM availability and transitions from grace/fallback to program (M6)
 - Tower naturally transitions from fallback frames to live frames without disconnecting clients
-- No explicit mode switch is required; mode is implied by presence/absence of live frames
+- No explicit mode switch is required; EncoderManager handles routing automatically (M11, M12)
 
 **Transition Behavior:**
 
 - Transition should be seamless (no audio glitches)
-- Station writes frames in unpaced bursts; Tower's steady pull rate (21.333ms) absorbs burstiness
+- Station writes frames in unpaced bursts; AudioPump's steady pull rate (24ms per C1.1) absorbs burstiness
 - Buffer (ring buffer, bounded) absorbs temporary bursts without unbounded growth
-- If Station provides frames slower than expected, Tower uses grace period (silence) then fallback frames
-- Tower's consumption rate stabilizes the system regardless of Station's write pattern
+- If Station provides frames slower than expected, EncoderManager uses grace period (silence) then fallback frames (M7)
+- AudioPump's consumption rate stabilizes the system regardless of Station's write pattern
+- Grace resets immediately when program PCM returns (M-GRACE4)
 
 ### 8.3 on_live_audio_lost
 
 When Station stops feeding PCM (e.g., crash, restart, intentional stop):
 
-- `AudioInputRouter` times out retrieving frames
-- `AudioPump` falls back to `FallbackGenerator` frames
+- PCM buffer becomes empty (no more `write_pcm()` calls from upstream)
+- EncoderManager detects PCM absence within one tick (M7)
+- EncoderManager applies grace period logic (M7.1): returns grace silence if `since <= GRACE_SEC`
+- After grace period expires (M7.2): EncoderManager calls `fallback_provider.next_frame()` and returns fallback frame
 - Tower continues streaming fallback audio seamlessly
 
 **Detection Time:**
 
-- Audio loss is detected within 50 ms (as specified in Section 4.3)
+- Audio loss is detected within one tick (24ms per C1.1) by EncoderManager (M7)
+- Grace period uses monotonic clock (M-GRACE1) for accurate timing
 - This provides fast, graceful switching while absorbing timing jitter
 
 ### 8.4 on_tower_stop
@@ -1237,9 +1327,9 @@ TOWER_PCM_BUFFER_SIZE=100  # PCM input buffer size (frames, ~2 seconds)
 TOWER_OUTPUT_TICK_INTERVAL_MS=15  # tick-driven output interval (~66 ticks/second)
 TOWER_CLIENT_TIMEOUT_MS=250  # timeout before dropping slow clients
 TOWER_SHUTDOWN_TIMEOUT=5    # seconds for graceful shutdown
-TOWER_PCM_GRACE_PERIOD_MS=1500  # grace period before switching from silence to tone (default 1500ms)
-TOWER_PCM_FALLBACK_TONE=1  # enable tone fallback after grace period (0=silence only, 1=tone enabled)
-TOWER_PCM_LOSS_WINDOW_MS=500  # window for detecting PCM loss when in PROGRAM state (default 250-500ms)
+TOWER_PCM_GRACE_SEC=5.0  # grace period before switching from silence to fallback (default 5 seconds per M8)
+# Note: Grace period uses monotonic clock (M-GRACE1). At exactly t == GRACE_SEC, silence still applies;
+# fallback applies only at t > GRACE_SEC (M-GRACE3).
 TOWER_RECOVERY_RETRY_MINUTES=10  # retry encoder recovery after max restarts (default 10 minutes)
 TOWER_CROSSFADE_ENABLED=0  # enable crossfade for fallback→program transitions (default 0=disabled)
 TOWER_PCM_SILENCE_THRESHOLD_DB=-60  # RMS threshold for detecting silent but present PCM (default -60dB)
@@ -1262,15 +1352,17 @@ Station configuration must include:
 - **Unix domain socket path:** `/var/run/retrowaves/pcm.sock`
   - Station connects to this socket to send PCM frames
   - Station retries connection every 1 second if Tower is not available at startup
-- **Canonical audio format alignment:** Must match Tower expectations
-  - PCM s16le, 48 kHz, 2 channels, 1024 samples per frame
+- **Canonical audio format alignment:** Must match Tower expectations (C2)
+  - PCM s16le, 48 kHz, 2 channels, 1152 samples per frame (24ms per C1.1, C1.2)
+  - Frame size: exactly 4608 bytes (1152 samples × 2 channels × 2 bytes per sample) (C2.2)
 - **Connection behavior:**
   - Station attempts connection at startup
   - If connection fails, Station retries every 1 second
   - Once connected, Station writes frames with **no timing** (unpaced, immediate writes as decoded)
-  - Station writes are non-blocking; if buffer is full, frames may be dropped
-  - **Tower is the rate limiter:** Tower pulls frames at exactly 21.333ms intervals (sole metronome)
-  - Tower's steady consumption rate stabilizes the buffer and prevents unbounded growth
+  - Station writes are non-blocking; if buffer is full, frames may be dropped (per C-RB2)
+  - **AudioPump is the rate limiter (C7.1):** AudioPump drives 24ms tick intervals (C1.1, C1.3)
+  - AudioPump's steady consumption rate stabilizes the buffer and prevents unbounded growth
+  - **EncoderManager is the routing authority (M11, M12):** Only EncoderManager decides program/grace/fallback
 
 ---
 

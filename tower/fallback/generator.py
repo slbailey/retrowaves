@@ -107,6 +107,18 @@ class FallbackGenerator:
         logger.debug(f"[GEN] Tone frame {len(frame)}")
         return frame
     
+    def next_frame(self) -> bytes:
+        """
+        Get next PCM frame per contract FP4.
+        
+        Per contract FP4: FallbackProvider MUST expose next_frame() -> bytes.
+        This method delegates to get_frame() for backwards compatibility.
+        
+        Returns:
+            bytes: PCM frame (4608 bytes) per contract FP2.1, FP4.1
+        """
+        return self.get_frame()
+    
     def _generate_tone_frame(self) -> bytes:
         """
         Generate one frame of 440Hz sine tone.

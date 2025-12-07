@@ -22,12 +22,24 @@ class AudioPump:
     
     Per contract [A1], [A4]: AudioPump is Tower's sole metronome - the only clock in the system.
     Never interacts with FFmpegSupervisor directly.
+    
+    Per contract [A10]: Constructor takes pcm_buffer, encoder_manager, downstream_buffer.
+    Per contract [A5]: Calls encoder_manager.next_frame() with NO arguments.
+    Per contract [A5.4]: Pushes returned frame to downstream_buffer (NOT via write_pcm() per A8).
     """
 
-    def __init__(self, pcm_buffer, fallback_generator, encoder_manager):
+    def __init__(self, pcm_buffer, encoder_manager, downstream_buffer):
+        """
+        Initialize AudioPump per contract [A10].
+        
+        Args:
+            pcm_buffer: Upstream PCM input buffer (from Station/upstream feeder)
+            encoder_manager: EncoderManager instance (routing authority)
+            downstream_buffer: Downstream PCM buffer feeding FFmpegSupervisor
+        """
         self.pcm_buffer = pcm_buffer
-        self.fallback = fallback_generator
         self.encoder_manager = encoder_manager
+        self.downstream_buffer = downstream_buffer
         self.running = False
         self.thread = None
 
@@ -46,7 +58,16 @@ class AudioPump:
         logger.info("AudioPump stopped")
 
     def _run(self):
-        next_tick = time.time()
+        """
+        Main tick loop per contract [A4], [A5], [A6].
+        
+        Per contract [A4]: Runs at 24ms intervals (global tick).
+        Per contract [A5]: Calls encoder_manager.next_frame() with NO arguments each tick.
+        Per contract [A5.4]: Pushes returned frame to downstream buffer (NOT via write_pcm() per A8).
+        Per contract [A12], [A13]: Handles errors gracefully, never stops ticking.
+        """
+        # Per contract [A4]: Use absolute clock timing to prevent drift
+        next_tick = time.monotonic()
         tick_index = 0
 
         while self.running:
@@ -54,21 +75,57 @@ class AudioPump:
             if tick_index == 0:
                 logger.info("AUDIO_PUMP: first PCM frame generated")
             
-            # Per contract [A3], [A7]: AudioPump calls encoder_manager.next_frame() each tick
+            # Per contract [A5]: AudioPump calls encoder_manager.next_frame() with NO arguments
+            # EncoderManager reads from its internal buffer (populated via write_pcm() from upstream)
             # EncoderManager handles ALL routing decisions internally (operational mode, thresholds, etc.)
             # AudioPump does not choose PCM vs fallback — routing is inside EncoderManager
             try:
-                self.encoder_manager.next_frame(self.pcm_buffer)
+                # Per contract [A5]: Call next_frame() with NO arguments
+                # EncoderManager returns exactly one PCM frame (program, silence, or fallback)
+                frame = self.encoder_manager.next_frame()
+                
+                # Per contract [A5.4]: Push returned frame to downstream buffer
+                # Per contract [A8]: AudioPump MUST NOT call write_pcm() directly
+                # Push to downstream_buffer which feeds FFmpegSupervisor
+                if frame is not None:
+                    self.downstream_buffer.push_frame(frame)
+                else:
+                    # Per contract [S7.0D]: next_frame() should never return None
+                    # But per contract [A12]: Handle gracefully if it does
+                    logger.warning("AudioPump: encoder_manager.next_frame() returned None, using silence")
+                    # Use silence frame as fallback
+                    silence_frame = b'\x00' * SILENCE_FRAME_SIZE
+                    self.downstream_buffer.push_frame(silence_frame)
+                    
             except Exception as e:
-                logger.error(f"AudioPump next_frame error: {e}")
-                time.sleep(0.1)
+                # Per contract [A12]: Log error and continue ticking
+                logger.error(f"AudioPump next_frame error: {e}", exc_info=True)
+                # Per contract [A12]: Replace with silence for this tick
+                try:
+                    silence_frame = b'\x00' * SILENCE_FRAME_SIZE
+                    self.downstream_buffer.push_frame(silence_frame)
+                except Exception as write_error:
+                    logger.error(f"AudioPump push_frame error after next_frame error: {write_error}")
+                # Per contract [A13]: Continue ticking on subsequent intervals
+                # Sleep for remaining time in tick period
+                tick_index += 1
+                next_tick += FRAME_DURATION_SEC
+                sleep_time = next_tick - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    # Behind schedule - resync per contract [A10]
+                    logger.warning("AudioPump behind schedule after error, resyncing")
+                    next_tick = time.monotonic()
                 continue
 
             tick_index += 1
+            # Per contract [A4]: Use absolute clock timing to prevent cumulative drift
             next_tick += FRAME_DURATION_SEC
-            sleep_time = next_tick - time.time()
+            sleep_time = next_tick - time.monotonic()
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
-                logger.warning("AudioPump behind schedule")
-                next_tick = time.time()  # resync
+                # Per contract [A10]: Resync if behind schedule instead of accumulating delay
+                logger.warning("AudioPump behind schedule, resyncing")
+                next_tick = time.monotonic()  # resync

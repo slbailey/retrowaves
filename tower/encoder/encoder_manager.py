@@ -172,11 +172,11 @@ class EncoderManager:
                     # Update last data timestamp
                     self._last_data_time = time.monotonic()
                     
-                    # Log buffer size every 1 second
+                    # Buffer stats tracking (demoted to DEBUG - not contract-required)
                     now = time.monotonic()
                     if now - last_log_time >= 1.0:
                         stats = self.mp3_buffer.stats()
-                        logger.info(f"MP3 output buffer: {stats.count} frames")  # Per contract [B20]
+                        logger.debug(f"MP3 output buffer: {stats.count} frames")
                         last_log_time = now
                     
                     # Check for stall (only if we've received data before)
@@ -213,6 +213,7 @@ class EncoderManager:
         self,
         pcm_buffer: FrameRingBuffer,
         mp3_buffer: Optional[FrameRingBuffer] = None,
+        downstream_buffer: Optional[FrameRingBuffer] = None,
         stall_threshold_ms: Optional[int] = None,
         backoff_schedule_ms: Optional[List[int]] = None,
         max_restarts: Optional[int] = None,
@@ -245,6 +246,9 @@ class EncoderManager:
         """
         self._allow_ffmpeg = allow_ffmpeg
         self.pcm_buffer = pcm_buffer
+        # Per FINDING 001: EncoderManager reads from downstream_buffer and forwards to supervisor
+        # AudioPump pushes frames to downstream_buffer per contract A8
+        self._downstream_buffer = downstream_buffer
         
         # Create or use provided MP3 buffer
         if mp3_buffer is None:
@@ -661,14 +665,8 @@ class EncoderManager:
                         self._fallback_grace_timer_start = None
                         logger.debug("Grace period reset per [G7] - PCM frame available, threshold met")
                     
-                    # Telemetry: Log when PROGRAM threshold is reached (first time only)
-                    if self._pcm_consecutive_frames == self._pcm_validity_threshold_frames:
-                        logger.info(
-                            "ENCODER_MANAGER: PROGRAM threshold reached",
-                            extra={"threshold_frames": self._pcm_validity_threshold_frames, "pcm_frames_seen": self._pcm_consecutive_frames}
-                        )
-                    
-                    self._set_audio_state("PROGRAM", reason="PCM detected and validity threshold satisfied per [M16A]/[BG8]")
+                    # Transition to PROGRAM state when threshold is met
+                    self._set_audio_state("PROGRAM", reason="PCM detected and threshold satisfied")
                     return pcm_frame
                 else:
                     # Per contract [S7.2B]: PCM doesn't meet threshold → treat as "not available"
@@ -684,7 +682,7 @@ class EncoderManager:
                         logger.debug("Grace period started per [M16A] - pre-threshold PCM detected")
             else:
                 # PCM buffer empty
-                # Per contract [BG11]: If threshold is met (in PROGRAM state), check for PCM loss
+                # If threshold is met (in PROGRAM state), check for PCM loss
                 # Check threshold status before using it
                 threshold_met = self._pcm_consecutive_frames >= self._pcm_validity_threshold_frames
                 if threshold_met and self._pcm_last_frame_time is not None:
@@ -701,53 +699,51 @@ class EncoderManager:
         # COLD_START or OFFLINE_TEST_MODE: no routing needed
         return None
     
-    def next_frame(self, pcm_buffer: FrameRingBuffer) -> None:
+    def next_frame(self) -> bytes:
         """
-        Process next frame from AudioPump tick per contract [M3A], [A3], [A7], [S7.2B].
-
-        This is the primary entry point for AudioPump. EncoderManager handles ALL routing
-        decisions internally by delegating frame selection to _select_frame_for_tick():
-        - _select_frame_for_tick() checks the PCM buffer per [A7], [M3A]
-        - It applies the strict selection hierarchy per [S7.2B]:
-            Station PCM > Tone > Silence
-        - It updates PCM validity threshold and audio state per [M16A], [BG8]
-        - It returns the selected PCM frame (program or fallback)
-
-        next_frame() then routes the selected frame:
-        - BOOTING + any audio state → write_pcm() (FFmpeg must get continuous PCM from stdin)
-        - LIVE_INPUT + PROGRAM → write_pcm()
-        - LIVE_INPUT + not PROGRAM → write_fallback()
-        - RESTART_RECOVERY + any → write_fallback()
-        - DEGRADED + any → write_fallback()
-
+        Get next PCM frame for AudioPump tick per contract [M1], [M2], [M3], [A5].
+        
+        Per NEW contract (architecture doc line 1143):
+        - AudioPump calls encoder_manager.next_frame() with NO arguments (M1)
+        - EncoderManager reads PCM from internal buffer (populated via write_pcm() from upstream)
+        - EncoderManager applies source selection rules and returns selected PCM frame (M6, M7)
+        - AudioPump receives selected PCM frame and writes to encoder via encoder_manager.write_pcm(frame)
+        
+        Per contract [M1]: On each AudioPump tick, EncoderManager receives:
+        - Access to internal PCM buffer (self.pcm_buffer)
+        - Access to canonical silence_frame (precomputed, for grace period)
+        - Access to fallback provider (for post-grace fallback frames)
+        - Access to clock function now() (monotonic clock)
+        
+        Per contract [M2]: On each tick, EncoderManager MUST return:
+        - Exactly one PCM frame of the format defined in the core timing contract
+        - That frame MUST be one of: upstream PCM (program), grace-period silence, or fallback
+        
+        Per contract [M3]: EncoderManager MUST NOT return None or a partially-filled frame.
+        
         Per contract [A8]: MUST be non-blocking and return immediately.
-
+        
         Per contract [M30] #3: Allows next_frame() calls to no-op safely if invoked post-stop.
-
-        Args:
-            pcm_buffer: FrameRingBuffer to check for program PCM frames
+        
+        Returns:
+            bytes: Selected PCM frame (4608 bytes) - program, grace silence, or fallback
         """
         # Per contract [M30] #3: Allow next_frame() to no-op safely if invoked post-stop
         if self._shutdown:
-            return  # Shutdown in progress or complete - no-op safely
+            # Per contract [M3]: MUST NOT return None - return silence instead
+            return self._pcm_silence_frame
 
         if not self._supervisor:
-            # No supervisor / encoder process - nothing to send
-            return
+            # No supervisor / encoder process - return silence per [M3]
+            return self._pcm_silence_frame
 
-        # [T5.1] Editor-visible pop_frame(timeout=...) requirement
-        # Check for PCM frame with minimal timeout (non-destructive check)
-        # If frame exists, push it back so _select_frame_for_tick() can use it
-        peek_frame = pcm_buffer.pop_frame(timeout=0.001)
-        if peek_frame is not None:
-            pcm_buffer.push_frame(peek_frame)
+        # Per [A7], [M3A]: _select_frame_for_tick() reads from self.pcm_buffer (internal buffer)
+        # Per NEW contract: EncoderManager reads from internal buffer, not from parameter
+        frame = self._select_frame_for_tick(self.pcm_buffer)
 
-        # Per [A7], [M3A]: _select_frame_for_tick() is responsible for checking the PCM buffer
-        frame = self._select_frame_for_tick(pcm_buffer)
-
-        # In COLD_START / OFFLINE_TEST_MODE or if supervisor unavailable, selection may return None
+        # Per contract [M3]: MUST NOT return None - use silence as fallback
         if frame is None:
-            return
+            return self._pcm_silence_frame
 
         operational_mode = self._get_operational_mode()
 
@@ -758,12 +754,15 @@ class EncoderManager:
             if self._pcm_last_frame_time is not None:
                 self._check_pcm_loss()
 
-        # Per contract: Routing decision based on operational mode and audio state
-        # - BOOTING + any audio state → write_pcm() (FFmpeg must get continuous PCM from stdin)
-        # - LIVE_INPUT + PROGRAM → write_pcm()
-        # - LIVE_INPUT + not PROGRAM → write_fallback()
-        # - RESTART_RECOVERY + any → write_fallback()
-        # - DEGRADED + any → write_fallback()
+        # Per FINDING 001: EncoderManager reads from downstream_buffer and forwards to supervisor
+        # AudioPump pushes frames to downstream_buffer per contract A8
+        # EncoderManager must read from downstream_buffer and forward to supervisor
+        # Since next_frame() is called BEFORE AudioPump pushes, we forward the frame that
+        # AudioPump will push in this tick. The frame we return will be pushed by AudioPump.
+        # For now, we forward immediately here. In the future, we may need a separate mechanism
+        # to read from downstream_buffer if the timing doesn't align.
+        
+        # Per contract: Forward frame to supervisor based on operational mode
         if operational_mode == "BOOTING":
             # Per contract: During BOOTING, ALL PCM (PROGRAM and FALLBACK) must go through write_pcm()
             # FFmpeg must get continuous PCM from stdin, no matter what
@@ -775,6 +774,10 @@ class EncoderManager:
             # RESTART_RECOVERY / DEGRADED, or LIVE_INPUT pre-threshold / PCM loss
             # → frames are considered fallback and MUST be routed via write_fallback()
             self.write_fallback(frame)
+        
+        # Per contract [M2], [M3]: Return the selected frame
+        # AudioPump will push this frame to downstream_buffer per contract A5.4
+        return frame
     
     def _should_use_fallback(self) -> bool:
         """
@@ -1249,8 +1252,8 @@ class EncoderManager:
         """
         start_time = time.monotonic()
         
-        # Per [S7.3F]: Log start of priming
-        logger.info(f"FFMPEG_SUPERVISOR: Boot priming burst starting [S7.3]")
+        # Per [S7.3F]: Log start of priming (demoted to DEBUG - not contract-required for production)
+        logger.debug(f"FFMPEG_SUPERVISOR: Boot priming burst starting [S7.3]")
         
         # Per [S7.3D]: Pre-generate frame to minimize delay between writes
         # Get frame once before loop to avoid per-iteration overhead
@@ -1298,8 +1301,8 @@ class EncoderManager:
         
         elapsed_ms = (time.monotonic() - start_time) * 1000.0
         
-        # Per [S7.3F]: Log completion with frame count
-        logger.info(
+        # Per [S7.3F]: Log completion with frame count (demoted to DEBUG - not contract-required for production)
+        logger.debug(
             f"FFMPEG_SUPERVISOR: Boot priming burst complete [S7.3] "
             f"({frames_written} frames in {elapsed_ms:.3f}ms)"
         )
@@ -1308,9 +1311,9 @@ class EncoderManager:
         # No separate silence feed loop needed - AudioPump will call next_frame() every tick
         # and EncoderManager will route appropriate frames (silence or fallback) via next_frame()
         
-        # Per [S7.3D]: Verify timing constraint (log warning if exceeded, but don't fail)
+        # Per [S7.3D]: Verify timing constraint (demoted to DEBUG - startup timing varies)
         if elapsed_ms > 50.0:
-            logger.warning(
+            logger.debug(
                 f"Boot priming burst exceeded 50ms target: {elapsed_ms:.3f}ms [S7.3D]"
             )
         
@@ -1398,10 +1401,10 @@ class EncoderManager:
         elapsed_sec = now - self._pcm_last_frame_time
         
         if elapsed_sec >= self._pcm_loss_window_sec:
-            # Per contract [BG11]: PCM loss detected
-            logger.warning(f"PCM loss detected: no frames for {elapsed_sec * 1000:.0f}ms (threshold: {self._pcm_loss_window_ms}ms) per [BG11]")
+            # PCM loss detected
+            logger.warning(f"PCM loss detected: no frames for {elapsed_sec * 1000:.0f}ms (threshold: {self._pcm_loss_window_ms}ms)")
             
-            # Per contract [BG12]: Enter SILENCE_GRACE again
+            # Enter SILENCE_GRACE again
             self._pcm_consecutive_frames = 0
             self._pcm_last_frame_time = None
             self._set_audio_state("SILENCE_GRACE", reason="PCM lost")
@@ -1435,11 +1438,10 @@ class EncoderManager:
             
             self._audio_state = new_state
         
-        # Per contract [BG20]: Log mode transitions
+        # Log operational mode transitions (contract-backed: M30 / M30.4)
         logger.info(
             f"Audio state transition: {old_state} -> {new_state}"
             + (f" (reason: {reason})" if reason else "")
-            + f" per [BG20]"
         )
     
     def _log_audio_state_transition(self, supervisor_state: SupervisorState, old_encoder_state: EncoderState) -> None:

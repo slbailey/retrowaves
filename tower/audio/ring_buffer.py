@@ -63,13 +63,17 @@ class FrameRingBuffer:
         capacity: Maximum number of frames the buffer can hold
     """
     
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, expected_frame_size: Optional[int] = None) -> None:
         """
         Initialize MP3 frame ring buffer.
         
         Args:
             capacity: Maximum number of frames (must be > 0)
                      Typical value: 400 frames (~5 seconds @ ~66 fps)
+            expected_frame_size: Optional expected frame size in bytes.
+                               If provided, push_frame() will reject frames that don't match this size.
+                               Used for PCM buffers (4608 bytes) per contract C8.2.
+                               If None, frame size validation is disabled (for MP3 buffers with variable frame sizes).
             
         Raises:
             ValueError: If capacity <= 0
@@ -78,6 +82,7 @@ class FrameRingBuffer:
             raise ValueError(f"FrameRingBuffer capacity must be > 0, got {capacity}")
         
         self._capacity = capacity
+        self._expected_frame_size = expected_frame_size  # Per contract C8.2: validate frame size for PCM buffers
         # Use deque with maxlen for automatic oldest-frame dropping
         # When full, append() automatically removes oldest (popleft())
         # This is O(1) and thread-safe with our RLock
@@ -96,6 +101,9 @@ class FrameRingBuffer:
         If the buffer is full, the oldest frame is automatically discarded
         (deque with maxlen handles this). This operation never blocks.
         
+        Per contract C8.2: If expected_frame_size is set, only frames of that exact size
+        are accepted. Partial frames are rejected with ValueError.
+        
         This method tracks statistics: increments total_pushed, and if a frame
         was dropped, increments total_dropped.
         
@@ -103,10 +111,18 @@ class FrameRingBuffer:
             frame: Complete MP3 frame bytes to push (must not be None or empty)
             
         Raises:
-            ValueError: If frame is None or empty
+            ValueError: If frame is None or empty, or if frame size doesn't match expected_frame_size
         """
         if not frame:
             raise ValueError("Cannot push None or empty frame")
+        
+        # Per contract C8.2: Reject partial frames if expected_frame_size is set
+        if self._expected_frame_size is not None:
+            if len(frame) != self._expected_frame_size:
+                raise ValueError(
+                    f"Frame size must be exactly {self._expected_frame_size} bytes "
+                    f"(per contract C8.2), got {len(frame)} bytes"
+                )
         
         with self._lock:
             # Check if buffer is full before appending
@@ -221,6 +237,18 @@ class FrameRingBuffer:
                 count=len(self._buffer),  # Per contract [B20]
                 overflow_count=self._total_dropped,  # Per contract [B20]
             )
+    
+    def get_stats(self) -> FrameRingBufferStats:
+        """
+        Get buffer statistics (alias for stats() for test compatibility).
+        
+        Returns a snapshot of current buffer state and statistics.
+        Thread-safe.
+        
+        Returns:
+            FrameRingBufferStats with capacity, count, overflow_count (per contract [B20])
+        """
+        return self.stats()
     
     # Backwards compatibility methods (delegate to new API)
     def push(self, frame: bytes) -> None:

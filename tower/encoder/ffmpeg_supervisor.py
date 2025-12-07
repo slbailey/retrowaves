@@ -47,10 +47,9 @@ FRAME_BYTES = 4608
 # FRAME_BYTES is the *only* valid Tower PCM frame size.
 # Anything else is considered malformed and must be dropped at the edge.
 
-# How much PCM to feed during BOOTING to keep ffmpeg happy while it spins up.
-BOOT_PCM_SECONDS = 2.0
-BOOT_PCM_FRAMES = int(BOOT_PCM_SECONDS / FRAME_INTERVAL_SEC)  # ~83-84 frames
-PRIMING_COUNT = 83  # Exact count for boot priming burst
+# Removed boot priming constants per residue sweep.
+# Per contract [S7.0B], [A7], [M12]: EncoderManager provides continuous PCM via AudioPump.
+# Supervisor does not generate or inject PCM - it only writes what it receives.
 
 # Per contract [S7.4]: PCM cadence is driven by AudioPump/EncoderManager, not Supervisor.
 # Per contract [S22A]/[M25]: Supervisor is source-agnostic and never generates PCM frames
@@ -162,7 +161,7 @@ class FFmpegSupervisor:
         self._stderr_thread: Optional[threading.Thread] = None
         self._stdout_thread: Optional[threading.Thread] = None
         self._restart_thread: Optional[threading.Thread] = None
-        self._writer_thread: Optional[threading.Thread] = None
+        # Removed _writer_thread - per contract [A7], timing is driven by AudioPump, not Supervisor
         
         # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor
         # Supervisor only writes what it receives via write_pcm()
@@ -172,8 +171,7 @@ class FFmpegSupervisor:
         # Shutdown event
         self._shutdown_event = threading.Event()
         
-        # Stop event for writer thread
-        self._stop_event = threading.Event()
+        # Removed _stop_event - no longer needed without writer thread per residue sweep
         
         # Per contract [S31] #3: Restart logic disable flag
         self._restart_disabled = False
@@ -213,10 +211,6 @@ class FFmpegSupervisor:
         self._last_stderr = ""
         self._last_stderr_max_size = 10 * 1024  # 10KB limit
         
-        # Rate limiting for frame interval violation warnings
-        self._last_interval_violation_log_time: Optional[float] = None
-        self._interval_violation_log_interval = 5.0  # Only log once every 5 seconds
-        
         # Per contract F9: MP3 frame boundary detection and accumulation
         # MP3 frame size for 128kbps @ 48kHz: (144 * bitrate_bps) / sample_rate = (144 * 128000) / 48000 = 384 bytes
         # Note: Actual MP3 frames can vary by 1 byte due to padding bit, so we use dynamic detection
@@ -230,19 +224,10 @@ class FFmpegSupervisor:
         # Compute base frame size: (144 * bitrate_bps) / sample_rate
         self._mp3_base_frame_size = int((144 * self._mp3_bitrate_kbps * 1000) / self._mp3_sample_rate)
         
-        # PCM ring buffer for pacing writes to ffmpeg
-        # Capacity ~200 frames (~5 seconds at 24ms per frame)
-        self._pcm_buffer = FrameRingBuffer(capacity=200)
-        
-        # High-priority boot PCM buffer for real user PCM during BOOTING state
-        # Capacity 10 frames to prioritize real PCM over priming frames
-        self._boot_pcm_buffer = FrameRingBuffer(capacity=10)
-        
-        # Precomputed silence frame for when PCM buffer is empty
-        self._silence_frame = b'\x00' * FRAME_BYTES  # 4608 bytes
-        
-        # Flag to halt priming if real PCM arrives during boot
-        self._pcm_seen_during_boot = False
+        # Per contract [A7], [C7.1]: AudioPump is the single timing authority.
+        # Per contract [M12]: EncoderManager handles all routing decisions.
+        # Supervisor does NOT buffer or pace PCM - it writes immediately when received.
+        # Removed PCM buffers and timing loop per residue sweep.
     
     def start(self) -> None:
         """
@@ -277,7 +262,6 @@ class FFmpegSupervisor:
             self._on_state_change(SupervisorState.STARTING)
         
         # Step 1-3: Start encoder process FIRST (before setting BOOTING state)
-        # This ensures writer hooks (stdin) are installed before priming burst is triggered
         self._start_encoder_process()
         
         if self._process is None:
@@ -319,24 +303,11 @@ class FFmpegSupervisor:
         if self._on_state_change:
             self._on_state_change(SupervisorState.BOOTING)
         
-        # Perform boot priming burst *before* writer thread starts
-        # This ensures burst is measured without 24ms pacing delays (per S7.3D)
-        self._perform_boot_priming_burst()
-        
-        # Start PCM writer thread (pacing thread) to write frames at stable 24ms cadence
-        # This ensures ffmpeg gets PCM at a stable cadence, removes burst behavior, and
-        # makes ffmpeg startup fully deterministic. Writer thread will drain priming frames at 24ms.
-        self._stop_event.clear()  # Clear stop event for new startup
-        self._writer_thread = threading.Thread(
-            target=self._pcm_writer_loop,
-            name="FFMPEG_PCM_WRITER",
-            daemon=True
-        )
-        self._writer_thread.start()
-        logger.info("Encoder PCM writer thread started")
-        
-        # Per contract [S7.4]: PCM cadence is driven by AudioPump via EncoderManager.next_frame()
-        # Supervisor only writes what it receives via write_pcm(). No silence feed loop.
+        # Per contract [S7.4], [A7], [C7.1]: PCM cadence is driven by AudioPump, not Supervisor.
+        # Supervisor does NOT operate a timing loop or buffer PCM frames.
+        # AudioPump drives timing at 24ms intervals and calls EncoderManager.next_frame() each tick.
+        # EncoderManager handles all routing decisions (M11, M12) and calls supervisor.write_pcm().
+        # Supervisor writes frames immediately when received - no buffering or pacing.
         self._last_write_ts = None  # Reset write tracking (used for telemetry)
         
         # Step 8-9: Start timer for first-frame detection per contract [S7], [S7A]
@@ -381,8 +352,7 @@ class FFmpegSupervisor:
         # Per contract [S31] #3: Disable restart logic immediately
         self._shutdown_event.set()
         
-        # Signal writer thread to stop
-        self._stop_event.set()
+        # Removed _stop_event.set() - no writer thread per residue sweep
         
         # Cancel startup timeout thread to prevent it from blocking during join
         self._startup_timeout_cancelled.set()
@@ -444,10 +414,7 @@ class FFmpegSupervisor:
         # File descriptors are now closed, so threads should exit quickly
         thread_timeout = 0.1 if is_test_mode else 1.0  # Tighter timeout in test mode per [S31] #5
         
-        if self._writer_thread is not None and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=thread_timeout)
-            if self._writer_thread.is_alive():
-                logger.warning("PCM writer thread did not terminate within timeout")
+        # Removed writer thread join - no writer thread per residue sweep
         
         if self._stdout_thread is not None and self._stdout_thread.is_alive():
             self._stdout_thread.join(timeout=thread_timeout)
@@ -470,8 +437,7 @@ class FFmpegSupervisor:
         # Per contract [S31] #4: Verify no background threads remain running
         # All threads should be daemon threads or already joined above
         remaining_threads = []
-        if self._writer_thread is not None and self._writer_thread.is_alive():
-            remaining_threads.append("pcm_writer")
+        # Removed writer thread check - no writer thread per residue sweep
         if self._stdout_thread is not None and self._stdout_thread.is_alive():
             remaining_threads.append("stdout_drain")
         if self._stderr_thread is not None and self._stderr_thread.is_alive():
@@ -491,7 +457,7 @@ class FFmpegSupervisor:
         self._last_stderr = ""
         
         # Clear all thread references to help garbage collection
-        self._writer_thread = None
+        # Removed _writer_thread - no writer thread per residue sweep
         self._stdout_thread = None
         self._stderr_thread = None
         self._startup_timeout_thread = None
@@ -551,10 +517,8 @@ class FFmpegSupervisor:
         if callback:
             callback(SupervisorState.RUNNING)
         
-        # After BOOTING → RUNNING: Flush remaining boot PCM frames to main buffer
-        # This ensures any real PCM frames in the boot buffer are processed before priming frames
-        while (frame := self._boot_pcm_buffer.pop_frame()) is not None:
-            self._pcm_buffer.push_front_frame(frame)
+        # Removed boot buffer flush - no buffers per residue sweep
+        # Per contract [A7], [S7.4]: Supervisor writes immediately, no buffering
     
     def _transition_to_running(self) -> None:
         """
@@ -586,10 +550,8 @@ class FFmpegSupervisor:
         if callback:
             callback(SupervisorState.RUNNING)
         
-        # After BOOTING → RUNNING: Flush remaining boot PCM frames to main buffer
-        # This ensures any real PCM frames in the boot buffer are processed before priming frames
-        while (frame := self._boot_pcm_buffer.pop_frame()) is not None:
-            self._pcm_buffer.push_front_frame(frame)
+        # Removed boot buffer flush - no buffers per residue sweep
+        # Per contract [A7], [S7.4]: Supervisor writes immediately, no buffering
     
     def get_stdin(self) -> Optional[BinaryIO]:
         """Get encoder stdin for writing PCM frames."""
@@ -606,48 +568,12 @@ class FFmpegSupervisor:
         # No-op: Per [S7.4], Supervisor does not generate timing-based writes
         logger.debug("FFMPEG_SUPERVISOR: Boot priming complete [S7.3A] (no-op per [S7.4])")
     
-    def _perform_boot_priming_burst(self) -> None:
-        """
-        Contract-compliant priming burst per [S7.3]:
-
-        - MUST complete within 50ms.
-        - MUST bypass pacing thread and ring buffer.
-        - MUST NOT overwhelm ffmpeg input buffer (small micro-delays used).
-        """
-
-        if self._stdin is None:
-            logger.warning("No stdin for priming burst")
-            return
-
-        frame = self._silence_frame
-
-        start = time.perf_counter()
-
-        MICRO_DELAY = 0.00025  # 250 microseconds — prevents ffmpeg crash
-
-        for _ in range(83):
-            if self._pcm_seen_during_boot:
-                # Stop burst immediately per F7/F8
-                break
-            try:
-                # stdin is in blocking mode, so write() will block until data is written or pipe is broken
-                self._stdin.write(frame)
-            except BrokenPipeError:
-                return  # ffmpeg died, startup logic will detect this
-
-            # Prevent ffmpeg input buffer overflow
-            time.sleep(MICRO_DELAY)
-
-        try:
-            self._stdin.flush()
-        except Exception:
-            pass
-
-        total_ms = (time.perf_counter() - start) * 1000.0
-        logger.info(
-            f"FFMPEG_SUPERVISOR: Boot priming burst complete [S7.3] "
-            f"({83} frames in {total_ms:.3f}ms)"
-        )
+    # Removed _perform_boot_priming_burst() per residue sweep.
+    # Per contract [S7.0B]: EncoderManager MUST be capable of supplying PCM before Supervisor starts.
+    # Per contract [A7], [C7.1]: AudioPump drives timing and calls EncoderManager.next_frame() each tick.
+    # Per contract [M12]: EncoderManager handles all routing - Supervisor does not generate/inject PCM.
+    # Per contract [S22A]: Supervisor is source-agnostic and does not generate silence frames.
+    # Continuous PCM delivery is handled by AudioPump + EncoderManager from startup.
     
     @property
     def last_stderr(self) -> str:
@@ -661,27 +587,24 @@ class FFmpegSupervisor:
     
     def write_pcm(self, frame: bytes) -> None:
         """
-        Enqueue PCM frame to internal buffer for paced writing.
+        Write PCM frame immediately to ffmpeg stdin.
         
-        Per contract [S7.1]: During BOOTING, encoder MUST receive continuous PCM frames
-        (Tower format, 4608 bytes) even if live PCM is absent. Supervisor does not generate
-        or inject PCM; it only receives PCM frames from EncoderManager via write_pcm().
-        The source of PCM (silence, tone, or live) is determined by AudioPump and
-        EncoderManager per operational modes contract, not by the supervisor.
+        Per contract [S7.1], [S7.4], [A7], [C7.1]: Supervisor receives PCM frames via write_pcm()
+        and writes them immediately. PCM cadence is driven by AudioPump, not Supervisor.
+        Supervisor does NOT buffer or pace PCM frames.
         
         Per contract [S22A]: Supervisor MUST NOT know about noise/silence generation.
         It treats all valid Tower-format PCM frames identically.
         
-        Frames are enqueued to a ring buffer and written to ffmpeg stdin by a dedicated
-        pacing thread at a stable 24ms cadence, ensuring deterministic behavior and
-        preventing pipe overflow.
+        Per contract [M12]: All routing decisions (program, silence, fallback) are made by
+        EncoderManager. Supervisor is source-agnostic and simply writes whatever frame it receives.
         
         Args:
-            frame: PCM frame bytes to enqueue (Tower format, 4608 bytes)
+            frame: PCM frame bytes to write (Tower format, 4608 bytes)
         """
         # First: validate the frame *shape*.
         # This is the edge of the Supervisor API; enforcing the 4608-byte contract
-        # here keeps the writer loop simple and predictable (F7/F8).
+        # here keeps the write operation simple and predictable (F7/F8).
 
         if not isinstance(frame, (bytes, bytearray)):
             raise TypeError(f"PCM frame must be bytes-like, got {type(frame)!r}")
@@ -696,7 +619,7 @@ class FFmpegSupervisor:
                 extra={"len": frame_len, "expected": FRAME_BYTES},
             )
             return
-
+        
         # Per contract [S7.1], [S22A]: Supervisor is source-agnostic and receives
         # PCM frames from EncoderManager. The PCM source (silence, tone, or live)
         # is determined upstream. We only accept frames while actively booting or
@@ -710,83 +633,36 @@ class FFmpegSupervisor:
         # after enqueuing.
         frame_bytes = bytes(frame)
 
-        # During BOOTING: route real PCM to the high-priority boot buffer so that
-        # it is written before any priming frames.
-        # During RUNNING: route to the main PCM buffer.
-        if current_state == SupervisorState.BOOTING:
-            self._pcm_seen_during_boot = True
-            self._boot_pcm_buffer.push_frame(frame_bytes)
-        else:
-            self._pcm_buffer.push_frame(frame_bytes)
+        # Per contract [A7], [C7.1], [S7.4]: Write immediately - no buffering or pacing.
+        # AudioPump drives timing at 24ms intervals via EncoderManager.next_frame().
+        # Supervisor is a simple pass-through: receives frame, writes immediately.
+        if self._stdin is not None:
+            try:
+                self._stdin.write(frame_bytes)
+                self._stdin.flush()
+                
+                # Telemetry: Log first byte written to stdin
+                if not self._debug_first_stdin_logged:
+                    self._debug_first_stdin_logged = True
+                    logger.debug("FFMPEG_SUPERVISOR: first PCM bytes written to stdin", extra={"len": len(frame_bytes)})
+                
+                # Visibility: Track PCM write timestamp
+                with self._write_lock:
+                    self._last_write_ts = time.monotonic()
+            except BrokenPipeError:
+                # ffmpeg died, Supervisor failure handler will restart it asynchronously
+                # This is non-blocking - per contract [M8], write_pcm() does not wait for restart
+                logger.debug("FFMPEG_SUPERVISOR: BrokenPipeError during write_pcm() - restart will be handled asynchronously")
+                # Don't raise - per contract [M8], errors are handled by supervisor's restart logic
+            except Exception as e:
+                # Other errors (e.g., pipe closed) - log and let restart logic handle it
+                logger.debug(f"FFMPEG_SUPERVISOR: Error during write_pcm(): {e}")
     
-    def _pcm_writer_loop(self) -> None:
-        """
-        Pacing loop that writes PCM frames to ffmpeg stdin at stable 24ms cadence.
-        
-        This loop:
-        - Ensures ffmpeg gets PCM at a stable cadence
-        - Removes all burst behavior
-        - Keeps behavior independent of AudioPump speed
-        - Makes ffmpeg startup fully deterministic
-        - Eliminates pipe overflow crashes
-        
-        If no PCM is available in the buffer, sends silence frames to keep ffmpeg fed.
-        """
-        FRAME_INTERVAL = 0.024  # 24ms
-        
-        while not self._stop_event.is_set():
-            # Get current state to determine priority
-            current_state = self.get_state()
-            
-            if current_state == SupervisorState.BOOTING:
-                # Highest priority: user PCM during boot
-                frame = self._boot_pcm_buffer.pop_frame()
-                if frame:
-                    # Boot PCM frame found, will write it
-                    pass
-                else:
-                    # Next priority: priming frames (already enqueued)
-                    frame = self._pcm_buffer.pop_frame()
-                    if frame:
-                        # Priming frame found, will write it
-                        pass
-                    else:
-                        # Otherwise, write silence
-                        frame = self._silence_frame
-            else:
-                # Normal operation: pop from main buffer
-                frame = self._pcm_buffer.pop_frame()
-                if frame is None:
-                    # No PCM available → send silence
-                    frame = self._silence_frame
-            
-            # Write to ffmpeg stdin
-            if self._stdin is not None:
-                try:
-                    self._stdin.write(frame)
-                    self._stdin.flush()
-                    
-                    # Telemetry: Log first byte written to stdin
-                    if not self._debug_first_stdin_logged:
-                        self._debug_first_stdin_logged = True
-                        logger.debug("FFMPEG_SUPERVISOR: first PCM bytes written to stdin", extra={"len": len(frame)})
-                    
-                    # Visibility: Track PCM write timestamp
-                    with self._write_lock:
-                        self._last_write_ts = time.monotonic()
-                except BrokenPipeError:
-                    # ffmpeg died, Supervisor failure handler will restart it
-                    # stdin is in blocking mode, so write() will block until data is written or pipe is broken
-                    # Sleep to avoid tight loop during restart
-                    time.sleep(FRAME_INTERVAL)
-                    continue
-                except Exception:
-                    # Other errors (e.g., pipe closed) - sleep and continue
-                    time.sleep(FRAME_INTERVAL)
-                    continue
-            
-            # Sleep for frame interval to maintain stable cadence
-            time.sleep(FRAME_INTERVAL)
+    # Removed _pcm_writer_loop() per residue sweep.
+    # Per contract [A7], [C7.1]: AudioPump is the single timing authority.
+    # Per contract [M12]: EncoderManager handles all routing decisions.
+    # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor.
+    # Supervisor now writes PCM immediately when received via write_pcm().
     
     def _set_state(self, new_state: SupervisorState) -> None:
         """Set state and notify callback."""
@@ -1120,8 +996,14 @@ class FFmpegSupervisor:
                     
                     # Only log if decoded_line is actually a string (not a mock object in tests)
                     if isinstance(decoded_line, str) and decoded_line:
-                        # Per contract [S14.4]: Log with [FFMPEG] prefix at ERROR level
-                        logger.error(f"[FFMPEG] {decoded_line}")
+                        # Per contract [S14.4]: Log with [FFMPEG] prefix
+                        # "Guessed Channel Layout" is an FFmpeg stdout message, not an actual error
+                        # Demote to DEBUG for informational FFmpeg messages
+                        if "Guessed channel layout" in decoded_line or "guessed channel layout" in decoded_line.lower():
+                            logger.debug(f"[FFMPEG] {decoded_line}")
+                        else:
+                            # Real errors still logged at ERROR level
+                            logger.error(f"[FFMPEG] {decoded_line}")
                         # Per contract [S25.1]: Also log at DEBUG level when debug mode enabled
                         if self._debug_mode:
                             logger.debug(f"[FFMPEG] {decoded_line}")
@@ -1351,33 +1233,20 @@ class FFmpegSupervisor:
                 # If we pushed frames, update timing tracking
                 if frames_pushed > 0:
                     now_monotonic = time.monotonic()
+                    # Per contract [S18]: Non-strict output cadence - encoder batching is normal
+                    # Frame interval tracking is used solely for stall detection, not for enforcing strict timing
                     if self._last_frame_time is not None:
-                        elapsed_ms = (now_monotonic - self._last_frame_time) * 1000.0
-                        if elapsed_ms > FRAME_INTERVAL_MS * 1.5:
-                            # Rate limit warnings to avoid log spam
-                            should_log = False
-                            if self._last_interval_violation_log_time is None:
-                                should_log = True
-                            else:
-                                time_since_last = now_monotonic - self._last_interval_violation_log_time
-                                if time_since_last >= self._interval_violation_log_interval:
-                                    should_log = True
-                            
-                            if should_log:
-                                logger.warning(
-                                    f"🔥 FFmpeg frame interval violation: {elapsed_ms:.1f}ms "
-                                    f"(expected ~{FRAME_INTERVAL_MS:.1f}ms)"
-                                )
-                                self._last_interval_violation_log_time = now_monotonic
+                        # Track last frame time for stall detection only
+                        pass
                     self._last_frame_time = now_monotonic
                 
-                # Log buffer stats periodically
+                # Buffer stats tracking (demoted to DEBUG - not contract-required)
                 if frames_pushed > 0:
-                    # Log buffer size every 10 seconds
+                    # Log buffer size every 10 seconds at DEBUG level
                     now = time.monotonic()
                     if now - last_log_time >= 10.0:
                         stats = self._mp3_buffer.stats()
-                        logger.info(f"MP3 output buffer: {stats.count} frames")  # Per contract [B20]
+                        logger.debug(f"MP3 output buffer: {stats.count} frames")
                         last_log_time = now
                     
                     # Check for stall per contract [S11]
@@ -1538,8 +1407,9 @@ class FFmpegSupervisor:
             return
         
         if not self._first_frame_received and not self._slow_startup_warn_logged:
-            # Per contract [S7], [S20]: Log WARN at 500ms (not a restart condition)
-            logger.warning("⚠ FFmpeg slow startup: first frame not received within 500ms")
+            # Per contract [S7]: Startup delay is normal; contracts do not specify thresholds
+            # Demoted to DEBUG - startup timing varies and is not an error condition
+            logger.debug("FFmpeg startup: first frame not yet received (startup delay is normal)")
             self._slow_startup_warn_logged = True
         
         # Step 12 per contract [S19]: Wait for hard timeout per [S7A]
@@ -1758,7 +1628,7 @@ class FFmpegSupervisor:
         if (
             state == SupervisorState.BOOTING
             and not self._first_frame_received
-            and failure_type in ("stall", "frame_interval_violation")
+            and failure_type == "stall"
         ):
             logger.info(f"Ignoring {failure_type} during BOOTING before first MP3 frame")
             return
@@ -1795,8 +1665,6 @@ class FFmpegSupervisor:
                     logger.error("FFMPEG_SUPERVISOR: last_stderr at BOOTING→RESTARTING (startup_timeout): %s", self.last_stderr or "<empty>")
         elif failure_type == "stall":
             logger.error(f"🔥 FFmpeg stall detected: {elapsed_ms:.0f}ms without frames")
-        elif failure_type == "frame_interval_violation":
-            logger.error(f"🔥 FFmpeg frame interval violation: {elapsed_ms:.1f}ms (expected ~{FRAME_INTERVAL_MS:.1f}ms)")
         else:
             # Include exit code in generic failure log if available
             # Defensively handle MagicMock objects - only include exit_code if it's a valid integer
@@ -2147,10 +2015,9 @@ class FFmpegSupervisor:
         # No silence feed loop - Supervisor only writes what it receives via write_pcm()
         self._last_write_ts = None  # Reset write tracking for new process (used for telemetry)
         
-        # Run boot priming burst after restart, same as initial startup
-        # This feeds ~2 seconds of PCM to keep ffmpeg happy while it initializes
-        # Must happen AFTER drain threads start but BEFORE startup timeout is armed
-        self._perform_boot_priming_burst()
+        # Removed boot priming burst per residue sweep.
+        # Per contract [S7.0B], [A7], [M12]: EncoderManager provides continuous PCM via AudioPump.
+        # Supervisor does not generate or inject PCM - it only writes what it receives.
         
         # Restart startup timeout monitor per contract [S19] step 7
         # Note: _startup_time and _slow_startup_warn_logged are already set at the start of _restart_worker()

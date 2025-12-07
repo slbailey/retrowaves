@@ -27,8 +27,10 @@ class TowerService:
                            If False or TOWER_ENCODER_ENABLED=0, operates in OFFLINE_TEST_MODE [O6] per [I19]
         """
         # Create buffers
-        self.pcm_buffer = FrameRingBuffer(capacity=100)
+        # Per contract C8.2: PCM buffers must enforce 4608-byte frame size
+        self.pcm_buffer = FrameRingBuffer(capacity=100, expected_frame_size=4608)
         # Create MP3 buffer explicitly (configurable via TOWER_MP3_BUFFER_CAPACITY_FRAMES)
+        # MP3 frames have variable sizes, so no frame size validation
         mp3_buffer_capacity = int(os.getenv("TOWER_MP3_BUFFER_CAPACITY_FRAMES", "400"))
         self.mp3_buffer = FrameRingBuffer(capacity=mp3_buffer_capacity)
         # Pass MP3 buffer to EncoderManager with encoder_enabled flag per [I19]
@@ -44,11 +46,22 @@ class TowerService:
         self.router = AudioInputRouter()
         self.fallback = FallbackGenerator()
         
+        # Create downstream PCM buffer (feeds FFmpegSupervisor)
+        # Per FINDING 001: AudioPump pushes frames to downstream buffer per contract A8
+        # EncoderManager reads from this buffer and forwards to supervisor
+        # Per contract C8.2: PCM buffers must enforce 4608-byte frame size
+        self.downstream_pcm_buffer = FrameRingBuffer(capacity=10, expected_frame_size=4608)  # Small buffer for immediate forwarding
+        
+        # Pass downstream_buffer to EncoderManager per FINDING 001
+        # EncoderManager needs access to downstream_buffer to read frames and forward to supervisor
+        self.encoder._downstream_buffer = self.downstream_pcm_buffer
+        
         # Create audio pump (feeds PCM to encoder)
+        # Per contract A10: AudioPump constructor takes pcm_buffer, encoder_manager, downstream_buffer
         self.audio_pump = AudioPump(
             pcm_buffer=self.pcm_buffer,
-            fallback_generator=self.fallback,
-            encoder_manager=self.encoder
+            encoder_manager=self.encoder,
+            downstream_buffer=self.downstream_pcm_buffer
         )
         
         # Create HTTP server (manages its own connection manager internally)
@@ -117,13 +130,13 @@ class TowerService:
                 logger.warning("get_frame() returned None - using silence frame")
                 frame = self.encoder._silence_frame
             
-            # TEMPORARY: Verify output buffer is filling
+            # Buffer stats tracking (demoted to DEBUG - not contract-required)
             mp3_buffer = self.encoder.mp3_buffer
             if len(mp3_buffer) > 0 and count % 500 == 0:
                 stats = mp3_buffer.stats()
                 # Estimate bytes: typical MP3 frame is ~417 bytes at 128kbps
-                estimated_bytes = stats.count * 417  # Use count, not size per [B20]
-                logger.info(f"MP3 buffer size: {stats.count} frames, ~{estimated_bytes} bytes")
+                estimated_bytes = stats.count * 417
+                logger.debug(f"MP3 buffer size: {stats.count} frames, ~{estimated_bytes} bytes")
             
             self.http_server.broadcast(frame)
             count += 1
