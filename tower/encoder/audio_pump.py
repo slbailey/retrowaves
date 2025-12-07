@@ -5,16 +5,23 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-FRAME_DURATION_SEC = 1152 / 48000  # ~0.024s
+# PCM frame cadence: 1024 samples at 48kHz = 21.333ms
+# Per contract C1: PCM cadence is the global timing authority
+FRAME_SIZE_SAMPLES = 1024
+SAMPLE_RATE = 48000
+FRAME_DURATION_SEC = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # 0.0213333333s (21.333ms)
 
-# Standard PCM frame size: 1152 samples × 2 channels × 2 bytes = 4608 bytes
-SILENCE_FRAME_SIZE = 1152 * 2 * 2  # 4608 bytes
+# Standard PCM frame size: 1024 samples × 2 channels × 2 bytes = 4096 bytes
+SILENCE_FRAME_SIZE = FRAME_SIZE_SAMPLES * 2 * 2  # 4096 bytes
 
 
 class AudioPump:
     """
     Simple working PCM→FFmpeg pump.
-    Continuously calls encoder_manager.next_frame() at 24ms intervals.
+    Continuously calls encoder_manager.next_frame() at PCM cadence (1024 samples = 21.333ms).
+    
+    Per contract C1.3: AudioPump operates at PCM cadence (21.333ms).
+    Per contract C7.1: AudioPump is the system timing authority at PCM cadence.
     
     Per contract [A3], [A7]: AudioPump DOES NOT route audio. It calls encoder_manager.next_frame()
     each tick. All routing decisions (PCM vs fallback, thresholds, operational modes) are made
@@ -26,6 +33,9 @@ class AudioPump:
     Per contract [A10]: Constructor takes pcm_buffer, encoder_manager, downstream_buffer.
     Per contract [A5]: Calls encoder_manager.next_frame() with NO arguments.
     Per contract [A5.4]: Pushes returned frame to downstream_buffer (NOT via write_pcm() per A8).
+    
+    AudioPump ticks at PCM cadence (1024 samples = 21.333ms).
+    Per contract C1.3 and C7.1: AudioPump is the global timing authority at PCM cadence.
     """
 
     def __init__(self, pcm_buffer, encoder_manager, downstream_buffer):
@@ -61,7 +71,7 @@ class AudioPump:
         """
         Main tick loop per contract [A4], [A5], [A6].
         
-        Per contract [A4]: Runs at 24ms intervals (global tick).
+        Per contract [A4]: Runs at PCM cadence (1024 samples = 21.333ms).
         Per contract [A5]: Calls encoder_manager.next_frame() with NO arguments each tick.
         Per contract [A5.4]: Pushes returned frame to downstream buffer (NOT via write_pcm() per A8).
         Per contract [A12], [A13]: Handles errors gracefully, never stops ticking.
@@ -74,6 +84,10 @@ class AudioPump:
             # Telemetry: Log first PCM frame generated
             if tick_index == 0:
                 logger.info("AUDIO_PUMP: first PCM frame generated")
+            
+            # DEBUG: Diagnostic logging - buffer count on every tick
+            buffer_stats = self.pcm_buffer.stats()
+            logger.debug(f"Tick start. Buffer count={buffer_stats.count}")
             
             # Per contract [A5]: AudioPump calls encoder_manager.next_frame() with NO arguments
             # EncoderManager reads from its internal buffer (populated via write_pcm() from upstream)

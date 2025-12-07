@@ -15,10 +15,11 @@ TowerRuntime does not decide audio content; it passes through what it receives f
 ## S. HTTP Stream Endpoint
 
 ### T1
-TowerRuntime **MUST** expose an HTTP endpoint (existing name preserved, e.g. `/tower/stream` or `/stream.mp3`) that:
+TowerRuntime **MUST** expose an HTTP endpoint /stream that:
 
 - Returns HTTP 200 on successful connection
 - Streams MP3 frames continuously until the client disconnects or server shuts down
+- No other endpoints shall output MP3
 
 ### T2
 The stream endpoint **MUST**:

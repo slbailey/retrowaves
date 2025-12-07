@@ -42,7 +42,7 @@ class TestAudioPumpMetronome:
         """Test [A1]: AudioPump is Tower's sole metronome."""
         # Verify timing constant
         from tower.encoder.audio_pump import FRAME_DURATION_SEC
-        expected_duration = 1152 / 48000  # ~0.024s
+        expected_duration = 1024 / 48000  # ~0.021333s (PCM cadence)
         assert abs(FRAME_DURATION_SEC - expected_duration) < 0.001
     
     def test_canonical_pcm_format_assumption(self, audio_pump):
@@ -50,26 +50,22 @@ class TestAudioPumpMetronome:
         Test: AudioPump assumes and uses the canonical PCM frame format; cannot redefine it.
         
         Contract: A2, A3, plus Core Timing C2
-        AudioPump must assume: 48kHz, Stereo, 1152 samples, 4608-byte frames
+        AudioPump must assume: 48kHz, Stereo, 1024 samples, 4096-byte frames (PCM cadence)
         Must NOT invent alternate frame sizes or intervals
         """
-        from tower.encoder.audio_pump import FRAME_DURATION_SEC
-        from tower.encoder.ffmpeg_supervisor import FRAME_BYTES, FRAME_SIZE_SAMPLES, SAMPLE_RATE
-        from tower.fallback.generator import FRAME_SIZE_BYTES as FB_FRAME_SIZE_BYTES, CHANNELS
+        from tower.encoder.audio_pump import FRAME_DURATION_SEC, FRAME_SIZE_SAMPLES, SAMPLE_RATE, SILENCE_FRAME_SIZE
         
-        # Verify AudioPump uses canonical format constants
-        assert FRAME_DURATION_SEC == 1152 / 48000, "Frame duration must be 1152/48000 (24ms)"
-        assert FRAME_SIZE_SAMPLES == 1152, "Frame size must be 1152 samples"
+        # Verify AudioPump uses PCM cadence format constants
+        assert abs(FRAME_DURATION_SEC - (1024 / 48000)) < 0.0001, "Frame duration must be 1024/48000 (21.333ms PCM cadence)"
+        assert FRAME_SIZE_SAMPLES == 1024, "Frame size must be 1024 samples"
         assert SAMPLE_RATE == 48000, "Sample rate must be 48kHz"
-        assert CHANNELS == 2, "Must be stereo (2 channels)"
-        assert FRAME_BYTES == 4608, "Frame must be 4608 bytes (1152 * 2 * 2)"
-        assert FB_FRAME_SIZE_BYTES == 4608, "Fallback frame size must be 4608 bytes"
+        assert SILENCE_FRAME_SIZE == 4096, "Silence frame must be 4096 bytes (1024 * 2 * 2)"
         
         # Verify AudioPump cannot redefine these - it uses the same constants
         # AudioPump does not have its own frame size definitions
         assert not hasattr(audio_pump, 'frame_size_bytes') or \
-               getattr(audio_pump, 'frame_size_bytes', None) == 4608, \
-               "AudioPump must use canonical 4608-byte frame size"
+               getattr(audio_pump, 'frame_size_bytes', None) == 4096, \
+               "AudioPump must use canonical 4096-byte frame size"
     
     def test_a2_never_interacts_with_supervisor(self, audio_pump):
         """Test [A2]: AudioPump never interacts with FFmpegSupervisor directly."""
@@ -149,14 +145,14 @@ class TestAudioPumpMetronome:
         assert not hasattr(audio_pump, 'supervisor'), \
             "AudioPump MUST NOT interact with supervisor directly per contract [A2]"
     
-    def test_a4_timing_loop_24ms(self, audio_pump):
-        """Test [A4]: Timing loop operates at exactly 24ms intervals (1152 samples at 48kHz)."""
+    def test_a4_timing_loop_pcm_cadence(self, audio_pump):
+        """Test [A4]: Timing loop operates at PCM cadence (1024 samples = 21.333ms at 48kHz)."""
         from tower.encoder.audio_pump import FRAME_DURATION_SEC
-        expected_ms = (1152 / 48000) * 1000  # 24.0ms
+        expected_ms = (1024 / 48000) * 1000  # 21.333ms
         actual_ms = FRAME_DURATION_SEC * 1000
         assert abs(actual_ms - expected_ms) < 0.1, \
-            "Frame duration should be 24ms (not 21.333ms) per contract [A4]"
-        # TODO: 24ms global tick, AudioPump is the sole timing authority
+            "Frame duration should be 21.333ms (PCM cadence) per contract [A4]"
+        # AudioPump ticks at PCM cadence (1024 samples = 21.333ms) per contract C1.3 and C7.1
 
 
 class TestAudioPumpInterface:
@@ -211,7 +207,7 @@ class TestAudioPumpFrameSelection:
         )
         
         pump.start()
-        time.sleep(0.1)  # Let it tick multiple times (~4 ticks at 24ms)
+        time.sleep(0.1)  # Let it tick multiple times (~5 ticks at 21.333ms)
         pump.stop()
         
         # Verify next_frame was called multiple times (once per tick)
@@ -252,7 +248,7 @@ class TestAudioPumpFrameSelection:
         )
         
         pump.start()
-        time.sleep(0.15)  # Let it tick multiple times (~6 ticks at 24ms)
+        time.sleep(0.15)  # Let it tick multiple times (~7 ticks at 21.333ms)
         pump.stop()
         
         # Verify: Number of reads should not exceed number of ticks
@@ -281,7 +277,7 @@ class TestAudioPumpFrameSelection:
         
         # Mock next_frame to return a frame (simulating EM output)
         def mock_next_frame():
-            return b'\x00' * 4608  # Return a frame
+            return b'\x00' * 4096  # Return a frame
         
         encoder_manager.next_frame = Mock(side_effect=mock_next_frame)
         
@@ -292,7 +288,7 @@ class TestAudioPumpFrameSelection:
         )
         
         pump.start()
-        time.sleep(0.15)  # Let it tick multiple times (~6 ticks at 24ms)
+        time.sleep(0.15)  # Let it tick multiple times (~7 ticks at 21.333ms)
         pump.stop()
         
         # Count ticks (next_frame calls)
@@ -398,9 +394,9 @@ class TestAudioPumpTiming:
                 downstream_buffer=encoder_manager.mp3_buffer,
             )
             
-            # TODO: 24ms global tick, AudioPump is the sole timing authority
+            # AudioPump ticks at PCM cadence (21.333ms), AudioPump is the sole timing authority
             # Remove detailed drift/resync accuracy expectations.
-            # Only require: 24ms global tick, AudioPump is the sole timing authority.
+            # Only require: PCM cadence tick (21.333ms), AudioPump is the sole timing authority.
             
             pump.start()
             time.sleep(0.1)  # Let it run briefly
@@ -429,7 +425,7 @@ class TestAudioPumpTiming:
             downstream_buffer=encoder_manager.mp3_buffer,
         )
         
-        # TODO: 24ms global tick, AudioPump is the sole timing authority
+        # AudioPump ticks at PCM cadence (21.333ms), AudioPump is the sole timing authority
         # Remove detailed drift/resync accuracy expectations.
         assert True  # Concept validated - implementation resyncs on delay
     
@@ -447,7 +443,7 @@ class TestAudioPumpTiming:
                 downstream_buffer=encoder_manager.mp3_buffer,
             )
             
-            # TODO: 24ms global tick, AudioPump is the sole timing authority
+            # AudioPump ticks at PCM cadence (21.333ms), AudioPump is the sole timing authority
             # Remove detailed drift/resync accuracy expectations.
             pump.start()
             time.sleep(0.15)  # Let it run for several ticks
@@ -533,10 +529,10 @@ class TestAudioPumpErrorHandling:
         assert len(call_count) > 0, "AudioPump should continue ticking after errors"
         
         # Verify: AudioPump may emit silence frames on error (optional behavior per A13)
-        # If implementation emits silence, verify it's canonical silence (all zeros, 4608 bytes)
+        # If implementation emits silence, verify it's canonical silence (all zeros, 4096 bytes)
         if written_frames:
             for frame in written_frames:
-                assert len(frame) == 4608, "Silence frame must be 4608 bytes"
+                assert len(frame) == 4096, "Silence frame must be 4096 bytes"
                 # Silence frames are all zeros
                 if all(b == 0 for b in frame):
                     # This is a valid silence frame
@@ -580,7 +576,7 @@ class TestAudioPumpErrorHandling:
         Test [A12]: AudioPump handles slow next_frame() correctly.
         
         When next_frame() is slow or stalls, AudioPump must continue ticking
-        at 24ms intervals (does not catch up by emitting extra frames).
+        at PCM cadence intervals (21.333ms) (does not catch up by emitting extra frames).
         """
         pcm_buffer, fallback, encoder_manager = components
         
@@ -588,7 +584,7 @@ class TestAudioPumpErrorHandling:
         call_count = []
         def slow_next_frame():
             call_count.append(time.time())
-            time.sleep(0.05)  # Slower than 24ms tick
+            time.sleep(0.05)  # Slower than 21.333ms tick
         
         encoder_manager.next_frame = Mock(side_effect=slow_next_frame)
         
@@ -605,7 +601,7 @@ class TestAudioPumpErrorHandling:
         # Verify next_frame was called
         assert len(call_count) > 0, "next_frame() should be called even if slow"
         
-        # Verify AudioPump continues ticking at 24ms intervals (does not catch up)
+        # Verify AudioPump continues ticking at PCM cadence intervals (21.333ms) (does not catch up)
         # AudioPump should maintain its tick schedule regardless of next_frame() speed
         # This is verified by checking that the pump continues running
 
@@ -655,8 +651,8 @@ class TestAudioPumpProhibitedBehaviors:
         pcm_buffer, fallback, encoder_manager = components
         
         # Create PCM frames with different content
-        frame1 = b'\x00' * 4608  # Silence
-        frame2 = b'\x01' * 4608  # Non-silence
+        frame1 = b'\x00' * 4096  # Silence
+        frame2 = b'\x01' * 4096  # Non-silence
         
         # AudioPump should not distinguish between frame types
         # It just passes buffer reference to next_frame()
@@ -681,7 +677,7 @@ class TestAudioPumpProhibitedBehaviors:
         """
         Test: AudioPump MUST NOT catch up by emitting extra frames.
         
-        AudioPump maintains strict 24ms tick intervals. If it falls behind schedule,
+        AudioPump maintains strict PCM cadence tick intervals (21.333ms). If it falls behind schedule,
         it resyncs clock but does not emit extra frames to "catch up".
         """
         pcm_buffer, fallback, encoder_manager = components
@@ -706,18 +702,18 @@ class TestAudioPumpProhibitedBehaviors:
         # Calculate intervals between ticks
         if len(tick_times) >= 2:
             intervals = [tick_times[i] - tick_times[i-1] for i in range(1, len(tick_times))]
-            # Intervals should be approximately 24ms (allow some variance for system jitter)
+            # Intervals should be approximately 21.333ms (allow ±2ms variance for system jitter)
             # Should NOT have very short intervals indicating "catch up" behavior
             for interval in intervals:
                 assert interval >= 0.020, \
-                    "AudioPump MUST NOT catch up with extra frames - intervals should be ~24ms, not shorter"
+                    "AudioPump MUST NOT catch up with extra frames - intervals should be ~21.333ms, not shorter"
     
     def test_does_not_throttle_upstream(self, components):
         """Test: AudioPump MUST NOT throttle upstream PCM delivery."""
         pcm_buffer, fallback, encoder_manager = components
         
-        # AudioPump consumes at fixed 24ms intervals - it does not throttle
-        # Upstream can write faster than 24ms, AudioPump just consumes once per tick
+        # AudioPump consumes at fixed PCM cadence intervals (21.333ms) - it does not throttle
+        # Upstream can write faster than 21.333ms, AudioPump just consumes once per tick
         
         encoder_manager.next_frame = Mock()
         

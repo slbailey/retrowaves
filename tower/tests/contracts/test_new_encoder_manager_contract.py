@@ -189,7 +189,7 @@ class TestPCMAvailabilityInvariants:
             # Verify it doesn't crash or raise exceptions
         
         # Test with PCM in buffer (should use program internally)
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         
         # next_frame() should process program frame without errors
@@ -383,7 +383,7 @@ class TestStateAndGraceLogic:
         # Verify: Internal timestamp tracking exists (implementation detail, verified by behavior)
         
         # Test: Writing PCM should update timestamp (behavioral test)
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         
         # Process frame - should update last_pcm_seen_at internally
@@ -421,7 +421,7 @@ class TestStateAndGraceLogic:
         # Per contract M6: If pcm_from_upstream present and valid, return it (PROGRAM)
         
         # Test: Write PCM frame to buffer
-        program_frame = b'\x02' * 4608  # Unique pattern to identify
+        program_frame = b'\x02' * 4096  # Unique pattern to identify
         encoder_manager.write_pcm(program_frame)
         
         # Verify: next_frame() processes program frame when PCM available
@@ -525,7 +525,7 @@ class TestPCMStarvationHandling:
         - After grace: Output fallback frames
         """
         # Step 1: Start with PCM available
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         
         # Verify: next_frame() processes program frame when PCM available
@@ -666,7 +666,7 @@ class TestOwnershipOfRoutingAndFallback:
         
         # Test: EncoderManager handles all routing scenarios
         # 1. Program selection (PCM available)
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         encoder_manager.next_frame()  # NO ARGUMENTS
         # Should process program frame (routing decision made internally)
@@ -694,7 +694,7 @@ class TestOwnershipOfRoutingAndFallback:
         # Other components should not have routing logic (verified in their tests)
         
         # Test: EncoderManager's routing is self-contained
-        program_frame = b'\x02' * 4608
+        program_frame = b'\x02' * 4096
         encoder_manager.write_pcm(program_frame)
         encoder_manager.next_frame()  # NO ARGUMENTS
         
@@ -771,7 +771,7 @@ class TestFallbackProviderInteraction:
         if hasattr(encoder_manager, '_pcm_silence_frame'):
             silence = encoder_manager._pcm_silence_frame
             assert silence is not None, "Silence should be precomputed, not generated"
-            assert len(silence) == 4608, "Silence frame must be 4608 bytes"
+            assert len(silence) == 4096, "Silence frame must be 4096 bytes"
         
         # Verify: EncoderManager does NOT generate tone/silence waveforms
         # It must call FallbackProvider.next_frame() for fallback audio
@@ -816,7 +816,7 @@ class TestFallbackProviderInteraction:
         # - Fallback provider output (file, tone, or silence as determined by provider)
         
         # Test: Program selection (upstream PCM)
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         encoder_manager.next_frame()  # NO ARGUMENTS
         # Should select program (upstream PCM)
@@ -918,7 +918,7 @@ class TestErrorHandlingAndRobustness:
             # Should complete without errors - outputs fallback frames continuously
         
         # Test: Remains responsive if PCM resumes
-        program_frame = b'\x01' * 4608
+        program_frame = b'\x01' * 4096
         encoder_manager.write_pcm(program_frame)
         encoder_manager.next_frame()  # NO ARGUMENTS
         # Should process program frame when PCM resumes (remains responsive)
@@ -940,7 +940,7 @@ class TestErrorHandlingAndRobustness:
         # Contract allows treating malformed frames as absent
         
         # Test: Valid frames work normally
-        valid_frame = b'\x01' * 4608
+        valid_frame = b'\x01' * 4096
         encoder_manager.write_pcm(valid_frame)
         encoder_manager.next_frame()  # NO ARGUMENTS
         # Should process valid frame normally

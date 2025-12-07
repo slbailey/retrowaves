@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # Audio format constants
 SAMPLE_RATE = 48000  # Hz
 CHANNELS = 2  # Stereo
-FRAME_SIZE_SAMPLES = 1152  # Samples per frame (MP3 frame size)
+FRAME_SIZE_SAMPLES = 1024  # Samples per frame (PCM cadence)
 BYTES_PER_SAMPLE = 2  # s16le = 2 bytes per sample
-FRAME_SIZE_BYTES = FRAME_SIZE_SAMPLES * CHANNELS * BYTES_PER_SAMPLE  # 4608 bytes
+FRAME_SIZE_BYTES = FRAME_SIZE_SAMPLES * CHANNELS * BYTES_PER_SAMPLE  # 4096 bytes
 
 # Tone generation constants
 TONE_FREQUENCY = 440.0  # Hz (A4 note)
@@ -83,7 +83,7 @@ class FallbackGenerator:
         Generate one PCM frame.
         
         Returns:
-            bytes: PCM frame (4608 bytes for 1152 samples × 2 channels × 2 bytes)
+            bytes: PCM frame (4096 bytes for 1024 samples × 2 channels × 2 bytes)
                   Format: s16le, stereo, 48000Hz
                   
         Fallback Priority:
@@ -115,7 +115,7 @@ class FallbackGenerator:
         This method delegates to get_frame() for backwards compatibility.
         
         Returns:
-            bytes: PCM frame (4608 bytes) per contract FP2.1, FP4.1
+            bytes: PCM frame (4096 bytes) per contract FP2.1, FP4.1
         """
         return self.get_frame()
     

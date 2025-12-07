@@ -6,6 +6,7 @@ import threading
 import time
 import logging
 import uuid
+import json
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -63,10 +64,20 @@ class HTTPServer:
     - Maintains thread-safe client registry (T-CLIENTS3)
     - Validates socket send return values (T-CLIENTS4)
     """
-    def __init__(self, host, port, frame_source):
+    def __init__(self, host, port, frame_source, buffer_stats_provider=None):
+        """
+        Initialize HTTPServer.
+        
+        Args:
+            host: Host address to bind to
+            port: Port to listen on
+            frame_source: Must implement .pop() returning bytes (for /stream endpoint)
+            buffer_stats_provider: Optional object with .stats() method returning buffer stats (for /tower/buffer endpoint)
+        """
         self.host = host
         self.port = port
         self.frame_source = frame_source  # must implement .pop() returning bytes
+        self.buffer_stats_provider = buffer_stats_provider  # for /tower/buffer endpoint
         
         # Per contract T-CLIENTS3: Thread-safe client registry
         # Store clients as dict: {client_id: _ClientState}
@@ -108,14 +119,18 @@ class HTTPServer:
         while self.running:
             try:
                 client, addr = self._server_sock.accept()
-                logger.info(f"Client connected: {addr}")
                 threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
             except OSError:
                 # Socket closed during shutdown
                 break
 
     def _handle_client(self, client):
-        """Handle a single client connection."""
+        """
+        Handle a single client connection.
+        
+        Per contract T1: Only /stream endpoint outputs MP3.
+        Other endpoints return appropriate responses (JSON for /tower/buffer, 404 for others).
+        """
         # Generate unique client ID per contract [H4]
         client_id = str(uuid.uuid4())
         try:
@@ -124,51 +139,166 @@ class HTTPServer:
                 client.close()
                 return
 
-            # --- REQUIRED HTTP RESPONSE HEADER ---
-            headers = (
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: audio/mpeg\r\n"
-                "Connection: keep-alive\r\n"
-                "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-                "\r\n"
-            )
-            client.sendall(headers.encode("ascii"))
-
-            # Check maximum client count before adding
-            with self._clients_lock:
-                if len(self._connected_clients) >= MAX_CLIENTS:
-                    logger.warning(
-                        f"Rejecting new client {client_id}: maximum client count ({MAX_CLIENTS}) reached"
-                    )
-                    client.close()
-                    return
+            # Parse HTTP request to extract path
+            # Format: "GET /path HTTP/1.1\r\n..."
+            request_str = request.decode('utf-8', errors='ignore')
+            lines = request_str.split('\r\n')
+            if not lines:
+                client.close()
+                return
             
-            # Add client to internal registry per contract T-CLIENTS3
-            self._add_client(client, client_id)
-
-            # Keep connection alive - wait for client to disconnect
-            # The main_loop will broadcast frames to all clients via HTTPServer.broadcast()
-            while True:
-                try:
-                    # Set timeout to periodically check if client is still connected
-                    client.settimeout(5.0)
-                    data = client.recv(1)
-                    if not data:
-                        # Client closed connection
-                        break
-                except socket.timeout:
-                    # Timeout is fine - client is still connected, just waiting
-                    # Continue loop to check again
-                    continue
-                except (OSError, ConnectionError):
-                    # Client disconnected
-                    break
-
+            # Parse request line: "GET /path HTTP/1.1"
+            request_line = lines[0]
+            parts = request_line.split()
+            if len(parts) < 2:
+                client.close()
+                return
+            
+            method = parts[0]
+            path = parts[1]
+            
+            # Per contract T1: Only /stream endpoint outputs MP3
+            if path == "/stream":
+                self._handle_stream_endpoint(client, client_id)
+            elif path == "/tower/buffer":
+                self._handle_buffer_endpoint(client)
+            else:
+                # Return 404 for unknown endpoints
+                self._handle_404(client, path)
+                
         except Exception as e:
             logger.warning(f"Client error: {e}")
         finally:
-            # Remove client by ID per contract T-CLIENTS3
-            self._remove_client(client_id)
+            # Remove client by ID per contract T-CLIENTS3 (only if it was added)
+            if client_id in self._connected_clients:
+                self._remove_client(client_id)
+    
+    def _handle_stream_endpoint(self, client, client_id):
+        """
+        Handle /stream endpoint - streams MP3 per contract T1.
+        
+        Per contract T1: Returns HTTP 200 and streams MP3 frames continuously.
+        """
+        # --- REQUIRED HTTP RESPONSE HEADER ---
+        headers = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: audio/mpeg\r\n"
+            "Connection: keep-alive\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "\r\n"
+        )
+        client.sendall(headers.encode("ascii"))
+
+        # Check maximum client count before adding
+        with self._clients_lock:
+            if len(self._connected_clients) >= MAX_CLIENTS:
+                logger.warning(
+                    f"Rejecting new client {client_id}: maximum client count ({MAX_CLIENTS}) reached"
+                )
+                client.close()
+                return
+        
+        # Add client to internal registry per contract T-CLIENTS3
+        self._add_client(client, client_id)
+
+        # Keep connection alive - wait for client to disconnect
+        # The main_loop will broadcast frames to all clients via HTTPServer.broadcast()
+        while True:
+            try:
+                # Set timeout to periodically check if client is still connected
+                client.settimeout(5.0)
+                data = client.recv(1)
+                if not data:
+                    # Client closed connection
+                    break
+            except socket.timeout:
+                # Timeout is fine - client is still connected, just waiting
+                # Continue loop to check again
+                continue
+            except (OSError, ConnectionError):
+                # Client disconnected
+                break
+    
+    def _handle_buffer_endpoint(self, client):
+        """
+        Handle /tower/buffer endpoint - returns JSON buffer stats per contract T-BUF.
+        
+        Per contract T-BUF1: Endpoint path MUST remain /tower/buffer
+        Per contract T-BUF2: Response MUST be JSON with capacity, count, overflow_count, ratio
+        Per contract T-BUF5: Stats MUST originate from buffer stats provider
+        """
+        try:
+            if self.buffer_stats_provider is None:
+                # No buffer stats provider available
+                response = (
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Buffer stats not available"}\n'
+                )
+                client.sendall(response.encode("ascii"))
+                client.close()
+                return
+            
+            # Get buffer stats per contract T-BUF5
+            # Use get_stats() if available (per contract), otherwise fall back to stats()
+            if hasattr(self.buffer_stats_provider, 'get_stats'):
+                stats = self.buffer_stats_provider.get_stats()
+            else:
+                stats = self.buffer_stats_provider.stats()
+            
+            # Build JSON response with fill and capacity
+            response_data = {
+                "fill": stats.count,
+                "capacity": stats.capacity
+            }
+            
+            response_json = json.dumps(response_data)
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "Content-Length: " + str(len(response_json)) + "\r\n"
+                "\r\n"
+                f"{response_json}"
+            )
+            client.sendall(response.encode("ascii"))
+            client.close()
+            
+        except Exception as e:
+            logger.warning(f"Error handling /tower/buffer endpoint: {e}")
+            error_response = (
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                f'{{"error": "Internal server error"}}\n'
+            )
+            try:
+                client.sendall(error_response.encode("ascii"))
+            except Exception:
+                pass
+            client.close()
+    
+    def _handle_404(self, client, path):
+        """
+        Handle unknown endpoints - return 404 Not Found.
+        
+        Per contract T1: No other endpoints shall output MP3.
+        """
+        response = (
+            "HTTP/1.1 404 Not Found\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            f"404 Not Found: {path}\n"
+        )
+        try:
+            client.sendall(response.encode("ascii"))
+        except Exception:
+            pass
+        client.close()
 
     def broadcast(self, frame: bytes):
         """

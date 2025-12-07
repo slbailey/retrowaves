@@ -72,9 +72,143 @@ class TestHTTPStreamEndpoint:
         del service
     
     def test_t1_exposes_get_stream_endpoint(self, service):
-        """Test T1: TowerRuntime MUST expose HTTP endpoint that returns 200 and streams MP3."""
-        # TODO: Implement per contract requirements
-        pass
+        """
+        Test T1: TowerRuntime MUST expose HTTP endpoint that returns 200 and streams MP3.
+        
+        Per contract T1: TowerRuntime MUST expose an HTTP endpoint /stream that:
+        - Returns HTTP 200 on successful connection
+        - Streams MP3 frames continuously until the client disconnects or server shuts down
+        - No other endpoints shall output MP3
+        """
+        import http.client
+        import threading
+        import time
+        
+        # Start encoder to provide MP3 frames (even in offline mode, it provides silence frames)
+        service.encoder.start()
+        
+        # Start HTTP server in a separate thread
+        # Use a random port to avoid conflicts
+        import random
+        test_port = random.randint(8001, 9000)
+        service.http_server.port = test_port
+        
+        # Start the HTTP server
+        server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
+        server_thread.start()
+        
+        # Start a thread to broadcast frames (simulating main_loop)
+        # This is needed because HTTPServer.broadcast() must be called to send data to clients
+        def broadcast_loop():
+            while service.http_server.running:
+                frame = service.encoder.get_frame()
+                if frame:
+                    service.http_server.broadcast(frame)
+                time.sleep(0.024)  # ~24ms frame interval
+        
+        broadcast_thread = threading.Thread(target=broadcast_loop, daemon=True)
+        broadcast_thread.start()
+        
+        # Wait for server to be ready
+        time.sleep(0.2)
+        
+        try:
+            # Test 1: /stream endpoint returns MP3 per contract T1
+            conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
+            conn.request("GET", "/stream")
+            response = conn.getresponse()
+            
+            # Verify: HTTP 200 response per contract T1
+            assert response.status == 200, \
+                f"Expected HTTP 200, got {response.status}"
+            
+            # Verify: Content-Type is audio/mpeg
+            content_type = response.getheader("Content-Type")
+            assert content_type == "audio/mpeg", \
+                f"Expected Content-Type: audio/mpeg, got {content_type}"
+            
+            # Verify: Streams MP3 data continuously per contract T1
+            # Read some data to verify streaming
+            data_received = bytearray()
+            start_time = time.time()
+            timeout = 0.5  # Wait up to 500ms for data
+            
+            while time.time() - start_time < timeout:
+                try:
+                    chunk = response.read(1024)
+                    if chunk:
+                        data_received.extend(chunk)
+                        # If we received data, streaming is working
+                        if len(data_received) > 0:
+                            break
+                    else:
+                        # No data yet, wait a bit
+                        time.sleep(0.05)
+                except Exception:
+                    break
+            
+            # Verify: We received some data (streaming is working)
+            assert len(data_received) > 0, \
+                "Stream endpoint must stream MP3 data continuously"
+            
+            # Verify: Data looks like MP3 (starts with MP3 sync word 0xFF)
+            # MP3 frames typically start with 0xFF 0xFB or 0xFF 0xFA
+            if len(data_received) >= 2:
+                # Check if data starts with MP3 sync pattern
+                # Note: In offline mode, encoder may return silence frames
+                # which should still be valid MP3 data
+                assert data_received[0] == 0xFF, \
+                    f"Expected MP3 sync byte 0xFF, got 0x{data_received[0]:02X}"
+                assert (data_received[1] & 0xE0) == 0xE0, \
+                    f"Expected MP3 sync pattern, got 0x{data_received[1]:02X}"
+            
+            conn.close()
+            
+            # Test 2: Other endpoints MUST NOT output MP3 per contract T1 constraint
+            # Test /tower/buffer endpoint (should return JSON, not MP3)
+            conn2 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
+            conn2.request("GET", "/tower/buffer")
+            response2 = conn2.getresponse()
+            
+            # Verify: Non-stream endpoints should NOT return audio/mpeg Content-Type
+            content_type2 = response2.getheader("Content-Type")
+            assert content_type2 != "audio/mpeg", \
+                f"Non-stream endpoint /tower/buffer must NOT return audio/mpeg, got {content_type2}"
+            
+            # Verify: Response data should NOT be MP3 (should be JSON or error)
+            buffer_data = response2.read(1024)
+            if len(buffer_data) >= 2:
+                # Should NOT start with MP3 sync pattern
+                assert not (buffer_data[0] == 0xFF and (buffer_data[1] & 0xE0) == 0xE0), \
+                    "Non-stream endpoint /tower/buffer must NOT output MP3 data"
+            
+            conn2.close()
+            
+            # Test 3: Random endpoint MUST NOT output MP3 per contract T1 constraint
+            conn3 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
+            conn3.request("GET", "/random/path")
+            response3 = conn3.getresponse()
+            
+            # Verify: Random endpoint should NOT return audio/mpeg Content-Type
+            content_type3 = response3.getheader("Content-Type")
+            assert content_type3 != "audio/mpeg", \
+                f"Random endpoint /random/path must NOT return audio/mpeg, got {content_type3}"
+            
+            # Verify: Response data should NOT be MP3
+            random_data = response3.read(1024)
+            if len(random_data) >= 2:
+                # Should NOT start with MP3 sync pattern
+                assert not (random_data[0] == 0xFF and (random_data[1] & 0xE0) == 0xE0), \
+                    "Random endpoint /random/path must NOT output MP3 data"
+            
+            conn3.close()
+            
+        finally:
+            # Cleanup: Stop HTTP server and encoder
+            service.http_server.stop()
+            service.encoder.stop()
+            server_thread.join(timeout=1.0)
+            broadcast_thread.join(timeout=1.0)
     
     def test_t2_reads_mp3_from_encoder(self, service):
         """

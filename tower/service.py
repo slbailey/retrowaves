@@ -13,6 +13,8 @@ from tower.audio.input_router import AudioInputRouter
 from tower.encoder.audio_pump import AudioPump
 from tower.fallback.generator import FallbackGenerator
 from tower.http.server import HTTPServer
+from tower.ingest.pcm_ingestor import PCMIngestor
+from tower.ingest.transport import UnixSocketIngestTransport
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,8 @@ class TowerService:
                            If False or TOWER_ENCODER_ENABLED=0, operates in OFFLINE_TEST_MODE [O6] per [I19]
         """
         # Create buffers
-        # Per contract C8.2: PCM buffers must enforce 4608-byte frame size
-        self.pcm_buffer = FrameRingBuffer(capacity=100, expected_frame_size=4608)
+        # PCM buffer accepts 4096-byte frames (1024 samples) from PCM Ingestion
+        self.pcm_buffer = FrameRingBuffer(capacity=60, expected_frame_size=4096)
         # Create MP3 buffer explicitly (configurable via TOWER_MP3_BUFFER_CAPACITY_FRAMES)
         # MP3 frames have variable sizes, so no frame size validation
         mp3_buffer_capacity = int(os.getenv("TOWER_MP3_BUFFER_CAPACITY_FRAMES", "400"))
@@ -49,8 +51,8 @@ class TowerService:
         # Create downstream PCM buffer (feeds FFmpegSupervisor)
         # Per FINDING 001: AudioPump pushes frames to downstream buffer per contract A8
         # EncoderManager reads from this buffer and forwards to supervisor
-        # Per contract C8.2: PCM buffers must enforce 4608-byte frame size
-        self.downstream_pcm_buffer = FrameRingBuffer(capacity=10, expected_frame_size=4608)  # Small buffer for immediate forwarding
+        # Downstream PCM buffer accepts 4096-byte frames
+        self.downstream_pcm_buffer = FrameRingBuffer(capacity=10, expected_frame_size=4096)  # Small buffer for immediate forwarding
         
         # Pass downstream_buffer to EncoderManager per FINDING 001
         # EncoderManager needs access to downstream_buffer to read frames and forward to supervisor
@@ -65,13 +67,36 @@ class TowerService:
         )
         
         # Create HTTP server (manages its own connection manager internally)
-        self.http_server = HTTPServer(host="0.0.0.0", port=8000, frame_source=self.encoder)
+        # Pass PCM buffer as buffer_stats_provider for /tower/buffer endpoint per contract T-BUF5
+        # Port is configurable via TOWER_PORT env var, defaults to 8005 to match Station's expectation
+        http_port = int(os.getenv("TOWER_PORT", "8005"))
+        self.http_server = HTTPServer(
+            host="0.0.0.0", 
+            port=http_port, 
+            frame_source=self.encoder,
+            buffer_stats_provider=self.pcm_buffer  # PCM buffer has .stats() method
+        )
+        
+        # Create PCM Ingestion subsystem
+        # Per contract I43: Deliver to same upstream buffer AudioPump reads from
+        # Per contract I12-I16: Transport is implementation-defined (Unix socket)
+        socket_path = os.getenv("TOWER_PCM_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
+        transport = UnixSocketIngestTransport(socket_path)
+        self.pcm_ingestor = PCMIngestor(
+            upstream_buffer=self.pcm_buffer,  # Same buffer AudioPump reads from
+            transport=transport
+        )
         
         self.running = False
 
     def start(self):
         """Start encoder + HTTP server threads."""
         logger.info("=== Tower starting ===")
+        
+        # Start PCM Ingestion (before AudioPump per contract I51)
+        # Per contract I51: PCM Ingestion MUST be ready before AudioPump begins ticking
+        self.pcm_ingestor.start()
+        logger.info("PCM Ingestion started")
         
         # Start encoder (this also starts the drain thread internally)
         # Per contract [I7.1]: EncoderManager MAY start before AudioPump, but system MUST feed
@@ -80,10 +105,11 @@ class TowerService:
         logger.info("Encoder started")
         
         # Start audio pump
-        # Per contract [I7.1]: AudioPump MUST begin ticking within ≤1 grace period (≈24ms) after
+        # Per contract [I7.1]: AudioPump MUST begin ticking within ≤1 grace period (≈21.33ms) after
         # encoder start to ensure continuous PCM delivery per [S7.1] and [M19].
         # The initial silence write in [S19] step 4 covers the tiny window between FFmpeg spawn
         # and AudioPump's first tick.
+        # AudioPump ticks at PCM cadence (1024 samples = 21.333ms), not MP3 frame cadence.
         self.audio_pump.start()
         logger.info("AudioPump started")
         
@@ -214,7 +240,8 @@ class TowerService:
         """
         mode = self.get_mode()
         
-        # Calculate frame rate (fps) - 24ms intervals = ~41.6 fps
+        # Calculate frame rate (fps) - MP3 broadcast uses 24ms intervals = ~41.6 fps
+        # Note: AudioPump ticks at PCM cadence (21.333ms), but MP3 broadcast remains at 24ms
         FRAME_INTERVAL_MS = 24.0
         fps = 1000.0 / FRAME_INTERVAL_MS
         
@@ -239,8 +266,9 @@ class TowerService:
         1. Stop AudioPump (metronome halts)
         2. Stop EncoderManager (which stops Supervisor)
         3. Stop HTTP connection manager (close client sockets)
-        4. Wait for all threads to exit (join)
-        5. Return only after a fully quiescent system state
+        4. Stop PCM Ingestion (per contract I53: graceful shutdown)
+        5. Wait for all threads to exit (join)
+        6. Return only after a fully quiescent system state
         """
         logger.info("Shutting down Tower...")
         
@@ -253,6 +281,9 @@ class TowerService:
         
         # Per contract [I27] #2: Stop EncoderManager (which stops Supervisor)
         self.encoder.stop()
+        
+        # Per contract I53: Stop PCM Ingestion gracefully
+        self.pcm_ingestor.stop()
         
         # Per contract [I27] #3: Stop HTTP server (close client sockets)
         # HTTPServer now owns client management directly

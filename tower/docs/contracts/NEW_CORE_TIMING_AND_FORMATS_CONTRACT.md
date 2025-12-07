@@ -6,51 +6,54 @@ Define the invariant low-level technical parameters used across the entire Tower
 
 ---
 
-## C1 — Global Metronome Interval
+## C1 — Global PCM Timing Cadence
 
 ### C1.1
-The system's universal timing tick is **24ms**.
+The canonical PCM frame size across all Tower components is:
+
+**1024 samples × 2 channels × 2 bytes = 4096 bytes**
 
 ### C1.2
-This interval corresponds to **1152 samples at 48kHz**.
+The PCM cadence interval is derived from sample rate and frame size:
+
+**1024 samples / 48000 = 0.021333333 seconds (≈21.333ms)**
 
 ### C1.3
-All Tower subsystems **MUST** operate on this global tick:
+This PCM cadence is the ONLY timing loop used by:
 
 - **AudioPump**
-- **EncoderManager**
-- **FFmpegSupervisor's** input pacing
-- **TowerRuntime** (HTTP streaming tick)
+- **EncoderManager** next_frame()
+- **PCMIngestor** delivery into upstream PCM buffer
+- **Downstream PCM routing**
+- **Fallback generator** frame stepping
 
-No other subsystem may introduce its own timing loop.
+### C1.4
+MP3 encoding and HTTP streaming operate in their own timing domain and **MUST NOT** influence PCM cadence.
 
 ---
 
 ## C2 — PCM Format Requirements
 
 ### C2.1
-All PCM audio handled by Tower **MUST** be:
+All system PCM **MUST** be:
 
 | Parameter | Value |
 |-----------|-------|
 | Sample rate | 48,000 Hz |
 | Channels | 2 (stereo) |
-| Bit depth | 16-bit (signed PCM) |
-| Frame size per tick | 1152 samples per channel |
+| Bit depth | 16-bit signed integer |
+| Frame size | 1024 samples per channel |
+| Bytes per frame | 4096 bytes |
 
 ### C2.2
-Each PCM frame **MUST** be exactly **4608 bytes**:
-
-```
-1152 samples × 2 channels × 2 bytes per sample = 4608 bytes
-```
+PCM frames **MUST** be delivered atomically at **4096 bytes**.
 
 ---
 
 ## C3 — Silence Frame Standard
 
 ### C3.1
-The silence frame **MUST** be a zero-filled PCM frame of size **4608 bytes**.
+The silence frame **MUST** be a zero-filled PCM frame of size **4096 bytes**.
 
 ### C3.2
 Silence **MUST** always match the exact PCM format defined in **C2**.
@@ -74,7 +77,7 @@ The fallback provider selects the source at startup and maintains this priority 
 ### C4.2 — File Fallback Requirements
 
 #### C4.2.1
-File fallback **MUST** provide PCM frames in the format defined in **C2** (48kHz, stereo, 16-bit, 1152 samples per frame).
+File fallback **MUST** provide PCM frames in the format defined in **C2** (48kHz, stereo, 16-bit, 1024 samples per frame, 4096 bytes).
 
 #### C4.2.2
 File content **MUST** be decoded to PCM format at startup or first use.
@@ -124,7 +127,7 @@ Tone generator **MUST** return frames **immediately without blocking**.
 Silence **MUST** be used **only if tone generation is not possible for any reason**.
 
 #### C4.4.1
-Silence fallback **MUST** be a zero-filled PCM frame of size **4608 bytes** (as defined in **C3**).
+Silence fallback **MUST** be a zero-filled PCM frame of size **4096 bytes** (as defined in **C3**).
 
 #### C4.4.2
 Silence **MUST** always be available as the final fallback option.
@@ -149,20 +152,16 @@ The priority order is: **File → 440Hz Tone → Silence**. Tone is strongly pre
 
 ---
 
-## C5 — MP3 Framing
+## C5 — MP3 Framing (Encoder Domain Only)
 
 ### C5.1
-The MP3 encoder operates on the same **24ms** frame interval as PCM.
+MP3 encoders operate in their own timing domain (typically ~24ms per MP3 frame).
 
 ### C5.2
-MP3 packetization **MUST** preserve timing:
-
-```
-1 PCM frame → 1 MP3 frame → output at 24ms intervals
-```
+There is no 1:1 mapping between PCM frames and MP3 frames.
 
 ### C5.3
-FFmpeg handles MP3 packetization internally (per F9.1), and **MUST NOT** violate the tick cadence.
+FFmpeg **MUST** accept PCM at 1024-sample increments, and MP3 timing **MUST NOT** constrain PCM timing.
 
 ---
 
@@ -217,23 +216,23 @@ The buffer **MUST** expose:
 
 ---
 
-## C7 — Timing Authority
+## C7 — Global Timing Authority
 
 ### C7.1
-**AudioPump** is the single authoritative time source.
+**AudioPump** is the system timing authority, operating at PCM cadence (1024 samples / 21.333ms).
 
 ### C7.2
-No other component may maintain its own internal timing cycle.
+No other subsystem may introduce its own cadence or override PCM timing.
 
 ### C7.3
-All timing queries **MUST** use `AudioPump`'s tick or wallclock synchronization defined by the runtime (no drifting).
+MP3 broadcasting uses a separate pacing mechanism and **MUST NOT** influence PCM timing.
 
 ---
 
 ## C8 — PCM Buffer Frame Integrity
 
 ### C8.1
-All PCM buffers feeding the AudioInputRouter **MUST** be sized in exact frame multiples (4608 bytes per frame).
+All PCM buffers feeding the AudioInputRouter **MUST** be sized in exact frame multiples (4096 bytes per frame).
 
 ### C8.2
-Partial writes to PCM buffers **MUST** be forbidden; only complete 4608-byte frames may be written.
+Partial writes to PCM buffers **MUST** be forbidden; only complete 4096-byte frames may be written.

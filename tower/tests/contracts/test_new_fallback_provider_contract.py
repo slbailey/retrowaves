@@ -16,7 +16,7 @@ class TestFallbackProviderCoreInvariants:
     """Tests for core invariants FP2.1, FP2.3, FP2.4."""
     
     def test_fp2_1_always_returns_valid_frame(self):
-        """Test FP2.1: FallbackProvider always returns valid PCM frame (4608 bytes)."""
+        """Test FP2.1: FallbackProvider always returns valid PCM frame (4096 bytes)."""
         generator = FallbackGenerator()
         
         # Should always return a frame
@@ -27,14 +27,14 @@ class TestFallbackProviderCoreInvariants:
             assert len(frame) > 0
     
     def test_fp2_3_format_guarantees(self):
-        """Test FP2.3: Format guarantees (s16le, 48kHz, stereo, 4608 bytes)."""
+        """Test FP2.3: Format guarantees (s16le, 48kHz, stereo, 4096 bytes)."""
         generator = FallbackGenerator()
         
         frame = generator.next_frame()
         
         # Verify frame size
-        assert len(frame) == FRAME_SIZE_BYTES  # 4608 bytes
-        assert len(frame) == 1152 * 2 * 2  # 1152 samples × 2 channels × 2 bytes
+        assert len(frame) == FRAME_SIZE_BYTES  # 4096 bytes
+        assert len(frame) == 1024 * 2 * 2  # 1024 samples × 2 channels × 2 bytes
         
         # Format constants
         assert SAMPLE_RATE == 48000
@@ -204,9 +204,9 @@ class TestFallbackGeneratorInterface:
     
     def test_f20_idempotent(self):
         """
-        Test [F20]: next_frame() is idempotent in format only (always canonical 4608-byte PCM), not identical bytes.
+        Test [F20]: next_frame() is idempotent in format only (always canonical 4096-byte PCM), not identical bytes.
         
-        Per contract: Idempotent in format only (always canonical 4608-byte PCM), not identical bytes.
+        Per contract: Idempotent in format only (always canonical 4096-byte PCM), not identical bytes.
         """
         generator = FallbackGenerator()
         
@@ -224,7 +224,7 @@ class TestFallbackGeneratorInterface:
         # For silence: format consistent (all zeros)
         # For tone: format consistent (continuous phase, same generator)
         assert all(len(f) == len(frames[0]) for f in frames), \
-            "Idempotent: format must be consistent across calls (canonical 4608-byte PCM)"
+            "Idempotent: format must be consistent across calls (canonical 4096-byte PCM)"
     
     def test_fp6_phase_continuity(self):
         """
@@ -307,14 +307,14 @@ class TestFallbackGeneratorInterface:
 class TestFallbackGeneratorFormatGuarantees:
     """Tests for format guarantees [F21]–[F23]."""
     
-    def test_f21_exactly_4608_bytes(self):
-        """Test [F21]: All frames are exactly 4608 bytes."""
+    def test_f21_exactly_4096_bytes(self):
+        """Test [F21]: All frames are exactly 4096 bytes."""
         generator = FallbackGenerator()
         
         for _ in range(100):
             frame = generator.next_frame()
             assert len(frame) == FRAME_SIZE_BYTES
-            assert len(frame) == 4608
+            assert len(frame) == 4096
     
     def test_f22_canonical_format(self):
         """Test [F22]: Frame format matches canonical Tower format."""
@@ -322,11 +322,11 @@ class TestFallbackGeneratorFormatGuarantees:
         
         frame = generator.next_frame()
         
-        # Format: s16le, 48kHz, stereo, 1152 samples
-        assert len(frame) == 1152 * 2 * 2  # 4608 bytes
+        # Format: s16le, 48kHz, stereo, 1024 samples
+        assert len(frame) == 1024 * 2 * 2  # 4096 bytes
         # s16le = 2 bytes per sample
         # stereo = 2 channels
-        # 1152 samples per frame
+        # 1024 samples per frame
     
     def test_f23_frame_boundaries_preserved(self):
         """Test [F23]: Frame boundaries are preserved (no partial frames)."""

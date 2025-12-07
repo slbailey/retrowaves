@@ -336,6 +336,16 @@ class PlayoutEngine:
                 if buffer_status:
                     self._current_buffer_fill = buffer_status.get("fill")
                     self._current_buffer_capacity = buffer_status.get("capacity")
+                    if self._current_buffer_fill is not None and self._current_buffer_capacity is not None:
+                        fill_pct = (self._current_buffer_fill / self._current_buffer_capacity * 100) if self._current_buffer_capacity > 0 else 0.0
+                        logger.info(
+                            f"[PLAYOUT_BUFFER] Initial buffer state: fill={self._current_buffer_fill}/{self._current_buffer_capacity} "
+                            f"({fill_pct:.1f}%)"
+                        )
+                    else:
+                        logger.warning(f"[PLAYOUT_BUFFER] Initial buffer check returned incomplete data: {buffer_status}")
+                else:
+                    logger.warning(f"[PLAYOUT_BUFFER] Initial buffer check failed - no telemetry available")
                 self._last_buffer_check_time = time.time()
             
             # Decode and write frames with proportional (P-controller) rate adjustment
@@ -350,8 +360,25 @@ class PlayoutEngine:
                 if self._tower_control and (now - self._last_buffer_check_time) >= self._buffer_check_interval:
                     buffer_status = self._tower_control.get_buffer()
                     if buffer_status:
+                        old_fill = self._current_buffer_fill
+                        old_cap = self._current_buffer_capacity
                         self._current_buffer_fill = buffer_status.get("fill")
                         self._current_buffer_capacity = buffer_status.get("capacity")
+                        
+                        # Debug logging: log buffer telemetry update
+                        if self._current_buffer_fill is not None and self._current_buffer_capacity is not None:
+                            fill_pct = (self._current_buffer_fill / self._current_buffer_capacity * 100) if self._current_buffer_capacity > 0 else 0.0
+                            change = ""
+                            if old_fill is not None:
+                                change = f" (change: {old_fill}→{self._current_buffer_fill})"
+                            logger.debug(
+                                f"[PLAYOUT_BUFFER] Updated: fill={self._current_buffer_fill}/{self._current_buffer_capacity} "
+                                f"({fill_pct:.1f}%){change}"
+                            )
+                        else:
+                            logger.debug(f"[PLAYOUT_BUFFER] Updated with incomplete data: fill={self._current_buffer_fill}, cap={self._current_buffer_capacity}")
+                    else:
+                        logger.debug(f"[PLAYOUT_BUFFER] Failed to get buffer status from Tower")
                     self._last_buffer_check_time = now
                 
                 # Apply gain via mixer
@@ -371,22 +398,47 @@ class PlayoutEngine:
 
                     low_threshold  = int(0.20 * cap)   # <20% → we're too low
                     high_threshold = int(0.70 * cap)   # >70% → we're getting too full
+                    fill_pct = (fill / cap * 100) if cap > 0 else 0.0
 
                     if fill <= low_threshold:
                         # 🔴 Buffer low → push as fast as possible (no sleep)
                         adaptive_sleep = 0.0
+                        zone = "LOW"
+                        if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
+                            logger.debug(
+                                f"[PLAYOUT_PACING] Zone=LOW (fill={fill}/{cap}, {fill_pct:.1f}%), "
+                                f"sleep=0.0ms (push fast)"
+                            )
 
                     elif fill >= high_threshold:
                         # 🟢 Buffer high → slow down so we don't overflow
                         adaptive_sleep = 0.030  # 30ms
+                        zone = "HIGH"
+                        if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
+                            logger.debug(
+                                f"[PLAYOUT_PACING] Zone=HIGH (fill={fill}/{cap}, {fill_pct:.1f}%), "
+                                f"sleep=30ms (slow down)"
+                            )
 
                     else:
                         # ⚪ Sweet spot (20–70% full) → run slightly faster than Tower
                         # Tower consumes at ~21.33ms per frame; we aim ~18ms
                         adaptive_sleep = 0.018
+                        zone = "SWEET_SPOT"
+                        if frame_count % 500 == 0:  # Log every 500 frames in sweet spot (less frequent)
+                            logger.debug(
+                                f"[PLAYOUT_PACING] Zone=SWEET_SPOT (fill={fill}/{cap}, {fill_pct:.1f}%), "
+                                f"sleep=18ms (normal pace)"
+                            )
                 else:
                     # No buffer info → fall back to nominal pacing
                     adaptive_sleep = FRAME_DURATION
+                    zone = "NO_TELEMETRY"
+                    if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
+                        logger.debug(
+                            f"[PLAYOUT_PACING] Zone=NO_TELEMETRY, "
+                            f"sleep={FRAME_DURATION*1000:.1f}ms (fallback pacing)"
+                        )
                 
                 # Sleep for calculated time
                 if adaptive_sleep > 0.001:

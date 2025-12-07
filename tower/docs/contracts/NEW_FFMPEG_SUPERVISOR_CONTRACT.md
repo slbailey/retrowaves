@@ -29,6 +29,11 @@ FFmpegSupervisor **MUST**:
 - Accept PCM frames at the tick frequency defined in core timing
 - Not block the `AudioPump` / `EncoderManager` tick loop
 
+### F2.1
+FFmpegSupervisor **MUST** accept PCM frames exactly matching the format defined in the Core Timing & Formats contract.
+
+This ensures the supervisor contract never drifts if core timing evolves.
+
 ---
 
 ## U. No Audio Decisions
@@ -54,6 +59,7 @@ On initialization, FFmpegSupervisor **MUST**:
 
 - Start ffmpeg in a mode that reads PCM frames of the format defined in core timing
 - Ensure ffmpeg is ready to consume data before frames are pushed
+- Accept PCM frames exactly matching the format defined in the Core Timing & Formats contract (per F2.1)
 
 ### F6
 If ffmpeg exits or crashes:
@@ -99,6 +105,28 @@ If ffmpeg's input pipe is temporarily blocked:
 
 ### F11
 FFmpegSupervisor **MUST NOT** attempt to regulate upstream send rates; global rate control is handled by the buffer and `TowerRuntime`'s status endpoint, not by the Supervisor.
+
+### F12
+FFmpegSupervisor **MUST** sustain PCM write throughput at or above PCM cadence rate without introducing drift or buffering delays.
+
+This protects against subtle "pipe buffering stalls" in implementations.
+
+### F13
+During **RESTARTING**, `push_pcm_frame` **MUST NOT** block.
+
+Frames **MAY** be dropped if ffmpeg is not ready to receive input.
+
+This keeps AudioPump real-time.
+
+### F14
+FFmpegSupervisor **MUST** detect the first MP3 frame to transition external state from **BOOTING**/**RESTARTING** → **RUNNING**.
+
+This codifies the meaning of "first frame."
+
+### F15
+Supervisor **MUST** continuously drain ffmpeg stdout/stderr using non-blocking background threads.
+
+This ensures stdout/stderr do not block the ffmpeg process or cause pipe buffer overflows.
 
 ---
 

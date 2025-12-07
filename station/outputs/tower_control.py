@@ -102,7 +102,23 @@ class TowerControlClient:
         try:
             response = httpx.get(url, timeout=self.timeout)
             response.raise_for_status()
-            return response.json()
+            buffer_data = response.json()
+            
+            # Debug logging: log what we received from Tower
+            if buffer_data:
+                fill = buffer_data.get("fill")
+                capacity = buffer_data.get("capacity")
+                if fill is not None and capacity is not None:
+                    fill_pct = (fill / capacity * 100) if capacity > 0 else 0.0
+                    logger.debug(
+                        f"[TOWER_BUFFER_TELEMETRY] Received: fill={fill}/{capacity} ({fill_pct:.1f}%)"
+                    )
+                else:
+                    logger.debug(f"[TOWER_BUFFER_TELEMETRY] Received incomplete data: {buffer_data}")
+            else:
+                logger.debug(f"[TOWER_BUFFER_TELEMETRY] Received empty/null response")
+            
+            return buffer_data
         except httpx.HTTPError as e:
             logger.debug(f"[TOWER] Failed to get buffer status: {e}")
             return None

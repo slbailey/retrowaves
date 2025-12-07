@@ -35,13 +35,14 @@ class SupervisorState(enum.Enum):
 
 
 # Frame timing constants per contract [S15]
-FRAME_SIZE_SAMPLES = 1152
+# Note: Frame size is now 1024 samples (4096 bytes) to match PCM ingest cadence
+FRAME_SIZE_SAMPLES = 1024
 SAMPLE_RATE = 48000
-FRAME_INTERVAL_SEC = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # 0.024s
-FRAME_INTERVAL_MS = FRAME_INTERVAL_SEC * 1000.0  # 24ms
+FRAME_INTERVAL_SEC = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # 0.021333s (PCM cadence)
+FRAME_INTERVAL_MS = FRAME_INTERVAL_SEC * 1000.0  # 21.333ms
 
-# Frame size constant (4608 bytes: 1152 samples × 2 channels × 2 bytes)
-FRAME_BYTES = 4608
+# Frame size constant (4096 bytes: 1024 samples × 2 channels × 2 bytes)
+FRAME_BYTES = 4096
 
 # NOTE:
 # FRAME_BYTES is the *only* valid Tower PCM frame size.
@@ -53,7 +54,7 @@ FRAME_BYTES = 4608
 
 # Per contract [S7.4]: PCM cadence is driven by AudioPump/EncoderManager, not Supervisor.
 # Per contract [S22A]/[M25]: Supervisor is source-agnostic and never generates PCM frames
-# (silence, tone, or live). All Tower-format 4608-byte PCM frames must be supplied upstream.
+# (silence, tone, or live). All Tower-format 4096-byte PCM frames must be supplied upstream.
 
 # Startup timeout per contract [S7], [S7A]
 # Soft target: 500ms (WARN only, not restart condition) per [S7]
@@ -69,7 +70,7 @@ STARTUP_TIMEOUT_MS = _get_startup_timeout_ms()
 STARTUP_TIMEOUT_SEC = STARTUP_TIMEOUT_MS / 1000.0
 
 # Default FFmpeg command for PCM to MP3 encoding (live-mode)
-# Per contract [S19.11]: Must include -frame_size 1152 to force MP3 packetization
+# Per contract [S19.11]: Must include -frame_size 1024 to force MP3 packetization
 # at correct Tower frame boundaries and guarantee first-frame emission within startup timeout
 DEFAULT_FFMPEG_CMD = [
     "ffmpeg",
@@ -82,7 +83,7 @@ DEFAULT_FFMPEG_CMD = [
     "-i", "pipe:0",
     "-c:a", "libmp3lame",
     "-b:a", "128k",
-    "-frame_size", "1152",  # Per contract [S19.11]: Required for raw PCM encoding
+    "-frame_size", "1024",  # Per contract [S19.11]: Required for raw PCM encoding (PCM cadence)
     "-f", "mp3",
     "-fflags", "+nobuffer",
     "-flush_packets", "1",
@@ -224,7 +225,7 @@ class FFmpegSupervisor:
         # Compute base frame size: (144 * bitrate_bps) / sample_rate
         self._mp3_base_frame_size = int((144 * self._mp3_bitrate_kbps * 1000) / self._mp3_sample_rate)
         
-        # Per contract [A7], [C7.1]: AudioPump is the single timing authority.
+        # Per contract [A7], [C7.1]: AudioPump is the system timing authority at PCM cadence (21.333ms).
         # Per contract [M12]: EncoderManager handles all routing decisions.
         # Supervisor does NOT buffer or pace PCM - it writes immediately when received.
         # Removed PCM buffers and timing loop per residue sweep.
@@ -303,9 +304,9 @@ class FFmpegSupervisor:
         if self._on_state_change:
             self._on_state_change(SupervisorState.BOOTING)
         
-        # Per contract [S7.4], [A7], [C7.1]: PCM cadence is driven by AudioPump, not Supervisor.
+        # Per contract [S7.4], [A7], [C7.1]: PCM cadence (21.333ms) is driven by AudioPump, not Supervisor.
         # Supervisor does NOT operate a timing loop or buffer PCM frames.
-        # AudioPump drives timing at 24ms intervals and calls EncoderManager.next_frame() each tick.
+        # AudioPump drives timing at PCM cadence (21.333ms) and calls EncoderManager.next_frame() each tick.
         # EncoderManager handles all routing decisions (M11, M12) and calls supervisor.write_pcm().
         # Supervisor writes frames immediately when received - no buffering or pacing.
         self._last_write_ts = None  # Reset write tracking (used for telemetry)
@@ -600,10 +601,10 @@ class FFmpegSupervisor:
         EncoderManager. Supervisor is source-agnostic and simply writes whatever frame it receives.
         
         Args:
-            frame: PCM frame bytes to write (Tower format, 4608 bytes)
+            frame: PCM frame bytes to write (Tower format, 4096 bytes)
         """
         # First: validate the frame *shape*.
-        # This is the edge of the Supervisor API; enforcing the 4608-byte contract
+        # This is the edge of the Supervisor API; enforcing the 4096-byte contract
         # here keeps the write operation simple and predictable (F7/F8).
 
         if not isinstance(frame, (bytes, bytearray)):
@@ -633,8 +634,8 @@ class FFmpegSupervisor:
         # after enqueuing.
         frame_bytes = bytes(frame)
 
-        # Per contract [A7], [C7.1], [S7.4]: Write immediately - no buffering or pacing.
-        # AudioPump drives timing at 24ms intervals via EncoderManager.next_frame().
+        # Per contract [A7], [C7.1], [S7.4]: Write immediately at PCM cadence - no buffering or pacing.
+        # AudioPump drives timing at PCM cadence (21.333ms) via EncoderManager.next_frame().
         # Supervisor is a simple pass-through: receives frame, writes immediately.
         if self._stdin is not None:
             try:
@@ -659,7 +660,7 @@ class FFmpegSupervisor:
                 logger.debug(f"FFMPEG_SUPERVISOR: Error during write_pcm(): {e}")
     
     # Removed _pcm_writer_loop() per residue sweep.
-    # Per contract [A7], [C7.1]: AudioPump is the single timing authority.
+    # Per contract [A7], [C7.1]: AudioPump is the system timing authority at PCM cadence (21.333ms).
     # Per contract [M12]: EncoderManager handles all routing decisions.
     # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor.
     # Supervisor now writes PCM immediately when received via write_pcm().
@@ -882,35 +883,35 @@ class FFmpegSupervisor:
     def _build_ffmpeg_cmd(self) -> List[str]:
         """
         Build FFmpeg command with debug mode support per contract [S25].
-        Ensures -frame_size 1152 is present per contract [S19.11].
+        Ensures -frame_size 1024 is present per contract [S19.11].
         
         Returns:
             FFmpeg command list with appropriate loglevel based on TOWER_ENCODER_DEBUG
-            and guaranteed to include -frame_size 1152.
+            and guaranteed to include -frame_size 1024.
         """
         # Make a copy to avoid modifying the original
         cmd = list(self._ffmpeg_cmd)
         
-        # Per contract [S19.11]: Ensure -frame_size 1152 is present
-        # This forces MP3 packetization at correct Tower frame boundaries
+        # Per contract [S19.11]: Ensure -frame_size 1024 is present
+        # This forces MP3 packetization at correct Tower frame boundaries (PCM cadence)
         if "-frame_size" not in cmd:
-            # Insert -frame_size 1152 after -b:a (bitrate) or before -f mp3
+            # Insert -frame_size 1024 after -b:a (bitrate) or before -f mp3
             try:
                 # Try to find -b:a and insert after it
                 bitrate_idx = cmd.index("-b:a")
                 if bitrate_idx + 2 < len(cmd):
                     cmd.insert(bitrate_idx + 2, "-frame_size")
-                    cmd.insert(bitrate_idx + 3, "1152")
+                    cmd.insert(bitrate_idx + 3, "1024")
                 else:
                     # Fallback: insert before -f mp3
                     mp3_idx = cmd.index("-f")
                     if cmd[mp3_idx + 1] == "mp3":
-                        cmd.insert(mp3_idx, "1152")
+                        cmd.insert(mp3_idx, "1024")
                         cmd.insert(mp3_idx, "-frame_size")
             except ValueError:
                 # Neither -b:a nor -f mp3 found, insert before last argument (pipe:1)
                 cmd.insert(-1, "-frame_size")
-                cmd.insert(-1, "1152")
+                cmd.insert(-1, "1024")
         
         # Per contract [S25.1]: Use -loglevel debug when TOWER_ENCODER_DEBUG=1
         # Per contract [S25.2]: Use normal runtime loglevel (e.g. warning) when unset or 0
@@ -968,14 +969,6 @@ class FFmpegSupervisor:
                         # File descriptor is closed or in invalid state
                         logger.debug("Stderr readline() returned None - file descriptor closed or invalid")
                         break
-                    
-                    # Check if line is actually bytes before processing
-                    if not isinstance(line, bytes):
-                        # In tests, readline() might return a MagicMock - skip this line
-                        # This prevents test noise from MagicMock string representations
-                        if not line:  # EOF or empty
-                            break
-                        continue  # Skip MagicMock or other non-bytes objects
                     
                     if not line:
                         # EOF - stderr closed (process ended)
@@ -1083,7 +1076,9 @@ class FFmpegSupervisor:
                     # Only suppress if we haven't received first MP3 frame yet
                     if current_state == SupervisorState.BOOTING and not self._first_frame_received:
                         # Ignore read errors during BOOTING before first MP3 frame - continue monitoring
-                        logger.debug(f"Ignoring read error during BOOTING (before first MP3 frame): {e}")
+                        # This allows FFmpeg startup sequence to complete
+                        logger.debug(f"Ignoring stdout read error during BOOTING before first MP3 frame: {e}")
+                        time.sleep(0.01)  # Small sleep to avoid busy-waiting
                         continue
                     
                     logger.warning(f"Read error in drain thread: {e}")
@@ -1980,17 +1975,9 @@ class FFmpegSupervisor:
             self._stderr_thread.start()
             logger.info("Encoder stderr drain thread started")
         
-        # Ensure PCM writer thread is running (restart if needed)
-        # The writer thread should continue running through restarts, but restart it if it died
-        if self._writer_thread is None or not self._writer_thread.is_alive():
-            self._stop_event.clear()  # Clear stop event for new writer thread
-            self._writer_thread = threading.Thread(
-                target=self._pcm_writer_loop,
-                name="FFMPEG_PCM_WRITER",
-                daemon=True
-            )
-            self._writer_thread.start()
-            logger.info("Encoder PCM writer thread started (restart)")
+        # Per contract [A7], [C7.1]: AudioPump is the system timing authority at PCM cadence (21.333ms).
+        # Per contract [S7.4]: PCM cadence is driven by AudioPump, not Supervisor.
+        # No writer thread needed - AudioPump calls write_pcm() directly via EncoderManager.
         
         # Per contract [S13.8], [S29]: IMMEDIATELY set state to BOOTING after process spawn and drain threads start
         # This must happen synchronously so that tests checking state immediately after _restart_worker() returns will see BOOTING (not RESTARTING).
@@ -2088,8 +2075,7 @@ class FFmpegSupervisor:
         if self._startup_timeout_thread is not None and self._startup_timeout_thread.is_alive():
             self._startup_timeout_thread.join(timeout=0.5)
         
-        if self._writer_thread is not None and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=1.0)
+        # Per contract [A7], [C7.1]: No writer thread - AudioPump drives timing via write_pcm()
         
         # Terminate process
         if self._process is not None:
@@ -2107,7 +2093,7 @@ class FFmpegSupervisor:
         # Clear buffers and thread references to prevent memory leaks
         self._stdout_accumulator = bytearray()
         self._last_stderr = ""
-        self._writer_thread = None
+        # Per contract [A7], [C7.1]: No writer thread - AudioPump drives timing via write_pcm()
         self._stdout_thread = None
         self._stderr_thread = None
         self._startup_timeout_thread = None

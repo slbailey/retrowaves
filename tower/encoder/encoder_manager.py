@@ -318,8 +318,8 @@ class EncoderManager:
         self._grace_period_ms = int(os.getenv("TOWER_PCM_GRACE_PERIOD_MS", "1500"))
         self._fallback_use_tone = os.getenv("TOWER_PCM_FALLBACK_TONE", "0") not in ("0", "false", "False", "FALSE")
         self._fallback_grace_timer_start: Optional[float] = None
-        # Silence frame for PCM fallback (4608 bytes: 1152 samples × 2 channels × 2 bytes)
-        self._pcm_silence_frame = b'\x00' * 4608
+        # Silence frame for PCM fallback (4096 bytes: 1024 samples × 2 channels × 2 bytes)
+        self._pcm_silence_frame = b'\x00' * 4096
         # Fallback generator for tone (lazy import to avoid circular dependency)
         self._fallback_generator: Optional[object] = None
         
@@ -726,7 +726,7 @@ class EncoderManager:
         Per contract [M30] #3: Allows next_frame() calls to no-op safely if invoked post-stop.
         
         Returns:
-            bytes: Selected PCM frame (4608 bytes) - program, grace silence, or fallback
+            bytes: Selected PCM frame (4096 bytes) - program, grace silence, or fallback
         """
         # Per contract [M30] #3: Allow next_frame() to no-op safely if invoked post-stop
         if self._shutdown:
@@ -1101,7 +1101,7 @@ class EncoderManager:
         AudioPump will call get_fallback_pcm_frame() on every tick to get fallback frames.
         
         Per contract [M24A]: Does not apply in OFFLINE_TEST_MODE [O6].
-        Per contract [BG4]: Must be initialized within 1 frame interval (≈24ms) on cold start.
+        Per contract [BG4]: Must be initialized within 1 frame interval (≈21.33ms) on cold start.
         """
         # Per contract [M24A]: [M19]-[M24] do not apply in OFFLINE_TEST_MODE [O6]
         if not self._encoder_enabled:
@@ -1139,7 +1139,7 @@ class EncoderManager:
         call that instead.
         
         Returns:
-            bytes: PCM frame (4608 bytes) - fallback frame (tone or silence)
+            bytes: PCM frame (4096 bytes) - fallback frame (tone or silence)
         """
         # Get fallback frame from fallback provider/generator
         # This is the same logic as _get_fallback_frame() but without grace period checks
@@ -1149,7 +1149,7 @@ class EncoderManager:
             if hasattr(self._fallback_generator, 'next_frame'):
                 try:
                     frame = self._fallback_generator.next_frame()
-                    if frame and len(frame) == 4608:
+                    if frame and len(frame) == 4096:
                         return frame
                 except Exception as e:
                     logger.warning(f"Fallback provider next_frame() failed, using silence: {e}")
@@ -1157,7 +1157,7 @@ class EncoderManager:
             elif self._fallback_use_tone:
                 try:
                     frame = self._fallback_generator.get_frame()
-                    if frame and len(frame) == 4608:
+                    if frame and len(frame) == 4096:
                         return frame
                 except Exception as e:
                     logger.warning(f"Tone generation failed, using silence: {e}")
@@ -1173,10 +1173,10 @@ class EncoderManager:
         
         This method is called on-demand by AudioPump (or FallbackGenerator) on every tick
         when no live PCM is available. It is non-blocking and does not use any timing loops.
-        All pacing is driven by AudioPump's 24ms tick per [M25].
+        All pacing is driven by AudioPump's PCM cadence tick (21.333ms) per [M25].
         
         Returns:
-            bytes: PCM frame (4608 bytes) - silence or tone based on grace period
+            bytes: PCM frame (4096 bytes) - silence or tone based on grace period
         """
         # Per [M20]: Fallback MUST begin with SILENCE, not tone
         # Per [M21]: Silence MUST continue for GRACE_PERIOD_MS (default 1500ms)
@@ -1221,12 +1221,12 @@ class EncoderManager:
         through write_pcm()/write_fallback() - just returns the frame.
         
         Returns:
-            bytes: PCM frame (4608 bytes) selected per [S7.2B] hierarchy
+            bytes: PCM frame (4096 bytes) selected per [S7.2B] hierarchy
         """
         # Check PCM buffer first (Station PCM per [S7.2B])
         if self.pcm_buffer and len(self.pcm_buffer) > 0:
             frame = self.pcm_buffer.pop_frame(timeout=0)  # Non-blocking
-            if frame and len(frame) == 4608:
+            if frame and len(frame) == 4096:
                 return frame
         
         # Per [S7.3B] and grace period contract: use fallback selection
@@ -1258,7 +1258,7 @@ class EncoderManager:
         # Per [S7.3D]: Pre-generate frame to minimize delay between writes
         # Get frame once before loop to avoid per-iteration overhead
         frame = self._get_priming_frame()
-        if frame is None or len(frame) != 4608:
+        if frame is None or len(frame) != 4096:
             # Fallback: use silence if selection fails (shouldn't happen per [S7.2F])
             frame = self._pcm_silence_frame
         
@@ -1336,7 +1336,7 @@ class EncoderManager:
         provides a private API for tests per [M19F], [M19G].
         
         Returns:
-            bytes: PCM frame (4608 bytes) - silence or tone based on grace period
+            bytes: PCM frame (4096 bytes) - silence or tone based on grace period
         """
         # Per contract [M19G]: Internally wraps get_fallback_pcm_frame() for backwards compatibility
         return self.get_fallback_pcm_frame()

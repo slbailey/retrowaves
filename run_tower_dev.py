@@ -19,6 +19,11 @@ logging.basicConfig(
 # These generate too much noise during normal operation
 logging.getLogger("tower.fallback.generator").setLevel(logging.INFO)
 
+# Enable DEBUG for AudioPump to see diagnostic messages
+# Set LOG_LEVEL=DEBUG to enable, or set this to logging.DEBUG to always enable
+if log_level == "DEBUG":
+    logging.getLogger("tower.encoder.audio_pump").setLevel(logging.DEBUG)
+
 from tower.service import TowerService
 
 if __name__ == "__main__":
