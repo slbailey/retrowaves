@@ -47,7 +47,7 @@ class BroadcastLoop(threading.Thread):
     
     Attributes:
         encoder_manager: EncoderManager to get MP3 frames from
-        connection_manager: HTTPConnectionManager to broadcast to
+        http_server: HTTPServer to broadcast to (owns client management per NEW_TOWER_RUNTIME_CONTRACT)
         tick_interval_ms: Tick interval in milliseconds
         shutdown_event: Event to signal thread shutdown
     """
@@ -55,7 +55,7 @@ class BroadcastLoop(threading.Thread):
     def __init__(
         self,
         encoder_manager: EncoderManager,
-        connection_manager,  # HTTPConnectionManager (type hint would require import)
+        http_server,  # HTTPServer (owns client management per NEW_TOWER_RUNTIME_CONTRACT)
         tick_interval_ms: Optional[int] = None,
     ) -> None:
         """
@@ -63,12 +63,12 @@ class BroadcastLoop(threading.Thread):
         
         Args:
             encoder_manager: EncoderManager to get MP3 frames from
-            connection_manager: HTTPConnectionManager to broadcast to
+            http_server: HTTPServer to broadcast to (owns client management per NEW_TOWER_RUNTIME_CONTRACT)
             tick_interval_ms: Tick interval in milliseconds (default: from env or 15ms)
         """
         super().__init__(name="BroadcastLoop", daemon=False)
         self.encoder_manager = encoder_manager
-        self.connection_manager = connection_manager
+        self.http_server = http_server
         
         # Read tick interval from environment or use default
         if tick_interval_ms is None:
@@ -111,8 +111,9 @@ class BroadcastLoop(threading.Thread):
                 # Get frame from encoder (always returns valid frame, never None)
                 frame = self.encoder_manager.get_frame()
                 
-                # Broadcast frame to all connected clients
-                self.connection_manager.broadcast(frame)
+                # Broadcast frame to all connected clients via HTTPServer
+                # HTTPServer owns client management per NEW_TOWER_RUNTIME_CONTRACT
+                self.http_server.broadcast(frame)
                 
                 # Advance to next tick (absolute time)
                 next_tick += tick_interval

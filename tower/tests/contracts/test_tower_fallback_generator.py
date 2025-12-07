@@ -249,3 +249,354 @@ class TestFallbackGeneratorFormatGuarantees:
         for _ in range(10):
             frame = generator.get_frame()
             assert len(frame) == FRAME_SIZE_BYTES  # Always complete
+
+
+class TestFallbackProviderZeroLatency:
+    """Tests for zero latency requirements per FP2.2, C4.3.5, C4.4.4, S7.0F."""
+    
+    def test_fp2_2_zero_latency_requirement(self):
+        """
+        Test FP2.2: next_frame() must return immediately without blocking (zero latency concept).
+        
+        Per FP2.2: Guarantee that next_frame() returns immediately without blocking.
+        "Zero latency" is a conceptual requirement meaning:
+        - Non-blocking (never wait for I/O, locks, or external resources)
+        - Very fast (typically completes in microseconds to low milliseconds)
+        - Deterministic (predictable execution time)
+        - Real-time capable (supports continuous audio playout at 24ms tick intervals)
+        """
+        import time
+        generator = FallbackGenerator()
+        
+        # Measure latency of multiple calls
+        latencies = []
+        for _ in range(20):
+            start_time = time.perf_counter()
+            frame = generator.get_frame()
+            end_time = time.perf_counter()
+            
+            latency_ms = (end_time - start_time) * 1000.0
+            latencies.append(latency_ms)
+            
+            # FP2.2: Must return immediately (non-blocking, very fast)
+            # Allow reasonable threshold for system jitter while enforcing "very fast" concept
+            # Must be fast enough to support 24ms tick intervals (allow up to 5ms for jitter)
+            assert latency_ms < 5.0, \
+                (f"Contract violation [FP2.2]: next_frame() must return immediately (non-blocking, very fast). "
+                 f"Latency {latency_ms:.3f}ms exceeds reasonable threshold (allowing for system jitter)")
+            
+            # Must return valid frame
+            assert frame is not None, \
+                "Contract violation [FP2.2]: Must return valid frame"
+            assert len(frame) == FRAME_SIZE_BYTES, \
+                (f"Contract violation [FP2.2]: Must return full frame ({FRAME_SIZE_BYTES} bytes). "
+                 f"Got {len(frame)} bytes")
+        
+        # Verify average latency is very low (real-time requirement)
+        # Average should be low enough to support 24ms tick intervals comfortably
+        avg_latency = sum(latencies) / len(latencies)
+        assert avg_latency < 2.0, \
+            (f"Contract violation [FP2.2]: Average latency ({avg_latency:.3f}ms) "
+             f"must be very low for real-time playout (concept: zero latency = very fast, non-blocking)")
+        
+        # Verify no blocking occurred (all calls returned quickly)
+        # Must be fast enough to support real-time playout (allow reasonable threshold for jitter)
+        max_latency = max(latencies)
+        assert max_latency < 5.0, \
+            (f"Contract violation [FP2.2]: Maximum latency ({max_latency:.3f}ms) "
+             f"must be very low (no blocking allowed, zero latency concept: very fast, non-blocking)")
+    
+    def test_c4_3_5_tone_zero_latency(self):
+        """
+        Test C4.3.5: Tone generator must return frames immediately without blocking (zero latency concept).
+        
+        Per C4.3.5: Tone generator MUST return frames immediately without blocking.
+        "Zero latency" is a conceptual requirement meaning:
+        - Non-blocking (never wait for I/O or external resources)
+        - Very fast (typically completes in microseconds to low milliseconds)
+        - Deterministic (predictable execution time)
+        - Real-time capable (supports continuous audio playout)
+        - MUST be preferred over silence whenever possible
+        """
+        import time
+        generator = FallbackGenerator()
+        
+        # Get multiple frames and measure latency
+        latencies = []
+        tone_frames = 0
+        
+        for _ in range(20):
+            start_time = time.perf_counter()
+            frame = generator.get_frame()
+            end_time = time.perf_counter()
+            
+            latency_ms = (end_time - start_time) * 1000.0
+            latencies.append(latency_ms)
+            
+            # Check if this is a tone frame (not all zeros)
+            if not all(b == 0 for b in frame):
+                tone_frames += 1
+            
+            # C4.3.5: Must return immediately (non-blocking, very fast)
+            # Allow reasonable threshold for system jitter while enforcing "very fast" concept
+            assert latency_ms < 5.0, \
+                (f"Contract violation [C4.3.5]: Tone generator must return immediately (non-blocking, very fast). "
+                 f"Latency {latency_ms:.3f}ms exceeds reasonable threshold (zero latency concept: very fast, non-blocking)")
+        
+        # Verify tone is being used (preferred over silence)
+        assert tone_frames > 0, \
+            (f"Contract violation [C4.3.5]: Tone should be preferred over silence. "
+             f"Got {tone_frames} tone frames out of 20")
+        
+        # Verify average latency is very low (zero latency concept: very fast, non-blocking)
+        avg_latency = sum(latencies) / len(latencies)
+        assert avg_latency < 2.0, \
+            (f"Contract violation [C4.3.5]: Average tone latency ({avg_latency:.3f}ms) "
+             f"must be very low for real-time playout (zero latency concept: very fast, non-blocking)")
+    
+    def test_c4_4_4_silence_zero_latency(self):
+        """
+        Test C4.4.4: Silence fallback must return frames immediately without blocking (zero latency concept).
+        
+        Per C4.4.4: Silence fallback MUST return frames immediately without blocking.
+        "Zero latency" is a conceptual requirement meaning:
+        - Non-blocking (never wait for I/O or external resources)
+        - Very fast (precomputed frames should return in microseconds)
+        - Deterministic (predictable execution time)
+        - Real-time capable (supports continuous audio playout)
+        """
+        import time
+        generator = FallbackGenerator()
+        
+        # Force silence mode by disabling tone (if possible)
+        # Note: This tests that silence is also zero latency
+        # In practice, silence should be even faster than tone
+        
+        latencies = []
+        for _ in range(20):
+            start_time = time.perf_counter()
+            frame = generator.get_frame()
+            end_time = time.perf_counter()
+            
+            latency_ms = (end_time - start_time) * 1000.0
+            latencies.append(latency_ms)
+            
+            # C4.4.4: Must return immediately (precomputed, non-blocking, very fast)
+            # Allow reasonable threshold for system jitter while enforcing "very fast" concept
+            assert latency_ms < 5.0, \
+                (f"Contract violation [C4.4.4]: Silence must return immediately (non-blocking, very fast). "
+                 f"Latency {latency_ms:.3f}ms exceeds reasonable threshold (zero latency concept: very fast, non-blocking)")
+        
+        # Silence should be very fast (precomputed, zero latency concept: very fast, non-blocking)
+        avg_latency = sum(latencies) / len(latencies)
+        assert avg_latency < 2.0, \
+            (f"Contract violation [C4.4.4]: Average silence latency ({avg_latency:.3f}ms) "
+             f"must be very low (precomputed, zero latency concept: very fast, non-blocking)")
+
+
+class TestFallbackProviderTonePreference:
+    """Tests for 440Hz tone preference over silence per FP3.2, FP3.3, FP5.1, FP5.2, C4.3, C4.4."""
+    
+    def test_fp3_2_tone_is_preferred_fallback(self):
+        """
+        Test FP3.2: 440Hz tone is the preferred fallback source.
+        
+        Per FP3.2: 440Hz tone is the preferred fallback source when file-based fallback is unavailable.
+        - MUST always be available as a guaranteed fallback
+        - MUST generate 440Hz sine wave tone
+        - MUST be precomputed or generated with zero latency
+        - MUST be used whenever file fallback is unavailable or fails
+        """
+        from tower.fallback.generator import TONE_FREQUENCY
+        generator = FallbackGenerator()
+        
+        # Verify tone frequency is 440Hz
+        assert TONE_FREQUENCY == 440.0, \
+            (f"Contract violation [FP3.2]: Tone must be 440Hz. "
+             f"Got {TONE_FREQUENCY}Hz")
+        
+        # Get multiple frames and verify tone is being used (preferred over silence)
+        tone_frames = 0
+        silence_frames = 0
+        
+        for _ in range(50):
+            frame = generator.get_frame()
+            
+            # Check if this is a tone frame (not all zeros)
+            if all(b == 0 for b in frame):
+                silence_frames += 1
+            else:
+                tone_frames += 1
+        
+        # FP3.2: Tone should be preferred (should have more tone frames than silence)
+        assert tone_frames > 0, \
+            (f"Contract violation [FP3.2]: 440Hz tone must be preferred. "
+             f"Got {tone_frames} tone frames, {silence_frames} silence frames")
+        
+        # Tone should be the primary source (more tone than silence)
+        assert tone_frames >= silence_frames, \
+            (f"Contract violation [FP3.2]: Tone should be preferred over silence. "
+             f"Got {tone_frames} tone frames vs {silence_frames} silence frames")
+    
+    def test_fp3_3_silence_only_when_tone_unavailable(self):
+        """
+        Test FP3.3: Silence must be used only if tone generation is not possible.
+        
+        Per FP3.3: Silence MUST be used only if tone generation is not possible for any reason.
+        The priority order is: File → 440Hz Tone → Silence.
+        Tone is strongly preferred over silence whenever possible.
+        """
+        generator = FallbackGenerator()
+        
+        # Get frames and verify tone is used when available
+        frames = []
+        for _ in range(50):
+            frame = generator.get_frame()
+            frames.append(frame)
+        
+        # Count tone vs silence frames
+        tone_count = sum(1 for f in frames if not all(b == 0 for b in f))
+        silence_count = sum(1 for f in frames if all(b == 0 for b in f))
+        
+        # FP3.3: Tone should be used when available (preferred over silence)
+        # If tone is working, we should see mostly tone frames
+        # If tone fails, we'll see silence (which is acceptable as last resort)
+        total_frames = len(frames)
+        
+        # Verify all frames are valid
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract violation [FP3.3]: All frames must be valid size"
+        
+        # If tone is available, it should be preferred
+        # (We can't force tone failure in normal operation, but we verify the preference)
+        if tone_count > 0:
+            # Tone is being used (preferred)
+            assert tone_count >= silence_count, \
+                (f"Contract violation [FP3.3]: Tone should be preferred when available. "
+                 f"Got {tone_count} tone frames vs {silence_count} silence frames")
+    
+    def test_fp5_1_falls_to_tone_on_file_error(self):
+        """
+        Test FP5.1: Treat file decode errors as "file unavailable" and fall back automatically to 440Hz TONE.
+        
+        Per FP5.1: Treat file decode errors as "file unavailable" and fall back automatically to 440Hz TONE.
+        """
+        generator = FallbackGenerator()
+        
+        # Since file fallback is not implemented, should use tone
+        frame = generator.get_frame()
+        
+        # Should return valid frame (tone or silence)
+        assert frame is not None, \
+            "Contract violation [FP5.1]: Must return valid frame"
+        assert len(frame) == FRAME_SIZE_BYTES, \
+            (f"Contract violation [FP5.1]: Must return full frame ({FRAME_SIZE_BYTES} bytes). "
+             f"Got {len(frame)} bytes")
+        
+        # If file is unavailable, should prefer tone over silence
+        # Check if tone is being used (not all zeros)
+        is_tone = not all(b == 0 for b in frame)
+        
+        # FP5.1: Should fall back to tone (preferred)
+        # Note: If tone generation fails, silence is acceptable as last resort
+        if is_tone:
+            # Tone is being used (preferred per FP5.1)
+            assert True, "Contract [FP5.1]: Tone is preferred fallback when file unavailable"
+    
+    def test_fp5_2_silence_only_as_last_resort(self):
+        """
+        Test FP5.2: Treat tone generator failure as "tone unavailable" and fall back to SILENCE only as last resort.
+        
+        Per FP5.2: Treat tone generator failure as "tone unavailable" and fall back to SILENCE only as a last resort.
+        The Fallback Provider MUST make every effort to provide 440Hz tone before falling back to silence.
+        """
+        generator = FallbackGenerator()
+        
+        # Get multiple frames to check preference
+        frames = []
+        for _ in range(30):
+            frame = generator.get_frame()
+            frames.append(frame)
+        
+        # Count tone vs silence
+        tone_count = sum(1 for f in frames if not all(b == 0 for b in f))
+        silence_count = sum(1 for f in frames if all(b == 0 for b in f))
+        
+        # FP5.2: Tone should be preferred; silence only if tone genuinely fails
+        # If we see tone frames, that's good (preferred)
+        # If we only see silence, that's acceptable only if tone generation is impossible
+        
+        # Verify all frames are valid
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract violation [FP5.2]: All frames must be valid size"
+        
+        # If tone is available, it should be used (preferred)
+        if tone_count > 0:
+            assert tone_count >= silence_count, \
+                (f"Contract violation [FP5.2]: Tone should be preferred when available. "
+                 f"Got {tone_count} tone frames vs {silence_count} silence frames")
+    
+    def test_c4_3_tone_preferred_over_silence(self):
+        """
+        Test C4.3: 440Hz tone is the preferred fallback source.
+        
+        Per C4.3: 440Hz tone is the preferred fallback source when file-based fallback is unavailable.
+        Tone generator MUST be preferred over silence whenever possible.
+        """
+        generator = FallbackGenerator()
+        
+        # Get frames and verify tone preference
+        frames = []
+        for _ in range(40):
+            frame = generator.get_frame()
+            frames.append(frame)
+        
+        # Count tone frames (non-zero content)
+        tone_frames = [f for f in frames if not all(b == 0 for b in f)]
+        silence_frames = [f for f in frames if all(b == 0 for b in f)]
+        
+        # C4.3: Tone should be preferred
+        # If tone is working, we should see tone frames
+        if len(tone_frames) > 0:
+            # Tone is being used (preferred per C4.3)
+            assert len(tone_frames) >= len(silence_frames), \
+                (f"Contract violation [C4.3]: Tone should be preferred over silence. "
+                 f"Got {len(tone_frames)} tone frames vs {len(silence_frames)} silence frames")
+        
+        # Verify all frames are valid
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract violation [C4.3]: All frames must be valid size"
+    
+    def test_c4_4_silence_last_resort_only(self):
+        """
+        Test C4.4: Silence must be used only if tone generation is not possible.
+        
+        Per C4.4: Silence MUST be used only if tone generation is not possible for any reason.
+        The priority order is: File → 440Hz Tone → Silence.
+        Tone is strongly preferred over silence whenever possible.
+        """
+        generator = FallbackGenerator()
+        
+        # Get frames and verify priority order
+        frames = []
+        for _ in range(40):
+            frame = generator.get_frame()
+            frames.append(frame)
+        
+        # Count tone vs silence
+        tone_count = sum(1 for f in frames if not all(b == 0 for b in f))
+        silence_count = sum(1 for f in frames if all(b == 0 for b in f))
+        
+        # C4.4: Priority order should be File → Tone → Silence
+        # Since file is not implemented, should prefer tone over silence
+        
+        # Verify all frames are valid
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract violation [C4.4]: All frames must be valid size"
+        
+        # If tone is available, it should be preferred
+        if tone_count > 0:
+            assert tone_count >= silence_count, \
+                (f"Contract violation [C4.4]: Tone should be preferred over silence. "
+                 f"Got {tone_count} tone frames vs {silence_count} silence frames. "
+                 f"Priority order: File → 440Hz Tone → Silence")

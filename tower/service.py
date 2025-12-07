@@ -119,7 +119,7 @@ class TowerService:
             
             # TEMPORARY: Verify output buffer is filling
             mp3_buffer = self.encoder.mp3_buffer
-            if len(mp3_buffer) > 0 and count % 50 == 0:
+            if len(mp3_buffer) > 0 and count % 500 == 0:
                 stats = mp3_buffer.stats()
                 # Estimate bytes: typical MP3 frame is ~417 bytes at 128kbps
                 estimated_bytes = stats.count * 417  # Use count, not size per [B20]
@@ -241,9 +241,8 @@ class TowerService:
         # Per contract [I27] #2: Stop EncoderManager (which stops Supervisor)
         self.encoder.stop()
         
-        # Per contract [I27] #3: Stop HTTP connection manager (close client sockets)
-        if hasattr(self.http_server, 'connection_manager'):
-            self.http_server.connection_manager.close_all()
+        # Per contract [I27] #3: Stop HTTP server (close client sockets)
+        # HTTPServer now owns client management directly
         
         # Per contract [I27] #1: Ensure AudioPump thread has fully stopped
         if self.audio_pump.thread and self.audio_pump.thread.is_alive():

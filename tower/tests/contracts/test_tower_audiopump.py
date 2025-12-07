@@ -1,8 +1,13 @@
 """
 Contract tests for Tower AudioPump
 
-See docs/contracts/AUDIOPUMP_CONTRACT.md
-Covers: [A0]–[A13] (Lifecycle responsibility, metronome behavior, interface isolation, frame selection, timing, error handling)
+Per NEW_AUDIOPUMP_CONTRACT:
+- AudioPump ONLY provides timing (A4) and calls encoder_manager.next_frame() (A5)
+- AudioPump MUST NOT perform routing, grace logic, or fallback selection (A7, A8, A9)
+- All routing decisions belong to EncoderManager (M11)
+
+See docs/contracts/NEW_AUDIOPUMP_CONTRACT.md, NEW_ENCODER_MANAGER_CONTRACT.md
+Covers: A1-A13 (Metronome behavior, timing, interface isolation, error handling)
 """
 
 import pytest
@@ -117,48 +122,15 @@ class TestAudioPumpInterface:
 
 
 class TestAudioPumpFrameSelection:
-    """Tests for frame selection logic [A7]–[A8]."""
+    """Tests for interface contract [A5]–[A6], [A7]–[A9]."""
     
-    def test_a7_frame_selection_pcm_first(self, components):
-        """Test [A7]: AudioPump calls next_frame(), EncoderManager handles routing (PCM vs fallback)."""
-        pcm_buffer, fallback, encoder_manager = components
-        
-        # Mock next_frame to verify it's called with pcm_buffer
-        encoder_manager.next_frame = Mock()
-        
-        # Add frame to PCM buffer (EncoderManager will check this in next_frame())
-        test_frame = b'test_pcm_frame' * 100  # Make it large enough (4608 bytes)
-        pcm_buffer.push_frame(test_frame)
-        
-        pump = AudioPump(
-            pcm_buffer=pcm_buffer,
-            fallback_generator=fallback,
-            encoder_manager=encoder_manager,
-        )
-        
-        pump.start()
-        time.sleep(0.05)  # Let it process one frame
-        pump.stop()
-        
-        # Verify AudioPump called next_frame() (not write_pcm directly)
-        encoder_manager.next_frame.assert_called()
-        encoder_manager.next_frame.assert_called_with(pcm_buffer)
-        
-        # Verify AudioPump does NOT make routing decisions
-        # (EncoderManager.next_frame() handles routing internally)
-        assert encoder_manager.next_frame.call_count > 0, \
-            "AudioPump must call next_frame() each tick per contract [A7]"
-    
-    def test_a7_frame_selection_fallback_when_empty(self, components):
-        """Test [A7]: AudioPump calls next_frame(), EncoderManager routes to fallback when PCM buffer is empty."""
+    def test_a5_calls_next_frame_each_tick(self, components):
+        """Test [A5]: AudioPump MUST call encoder_manager.next_frame() once per tick."""
         pcm_buffer, fallback, encoder_manager = components
         
         # Mock next_frame to verify it's called
         encoder_manager.next_frame = Mock()
         
-        # PCM buffer is empty (EncoderManager will detect this in next_frame())
-        assert len(pcm_buffer) == 0, "PCM buffer should be empty"
-        
         pump = AudioPump(
             pcm_buffer=pcm_buffer,
             fallback_generator=fallback,
@@ -166,28 +138,21 @@ class TestAudioPumpFrameSelection:
         )
         
         pump.start()
-        time.sleep(0.05)  # Let it process
+        time.sleep(0.1)  # Let it tick multiple times (~4 ticks at 24ms)
         pump.stop()
         
-        # Verify AudioPump called next_frame() (routing handled by EncoderManager)
-        encoder_manager.next_frame.assert_called()
-        encoder_manager.next_frame.assert_called_with(pcm_buffer)
-        
-        # Verify AudioPump does NOT check PCM buffer or choose fallback
-        # (All routing decisions are inside EncoderManager.next_frame())
+        # Verify next_frame was called multiple times (once per tick)
         assert encoder_manager.next_frame.call_count > 0, \
-            "AudioPump must call next_frame() each tick, EncoderManager handles routing per contract [A7]"
+            "AudioPump must call next_frame() each tick per contract [A5]"
+        encoder_manager.next_frame.assert_called_with(pcm_buffer)
     
-    def test_a7_grace_period_logic_in_encoder_manager(self, components):
-        """Test [A7]: AudioPump calls next_frame(), EncoderManager handles grace period logic internally."""
+    def test_a7_no_routing_logic(self, components):
+        """Test [A7]: AudioPump MUST NOT decide whether to send program, silence, or tone."""
         pcm_buffer, fallback, encoder_manager = components
         
         # Mock next_frame to verify it's called
         encoder_manager.next_frame = Mock()
         
-        # PCM buffer is empty (EncoderManager will handle grace period logic)
-        assert len(pcm_buffer) == 0, "PCM buffer should be empty"
-        
         pump = AudioPump(
             pcm_buffer=pcm_buffer,
             fallback_generator=fallback,
@@ -195,39 +160,41 @@ class TestAudioPumpFrameSelection:
         )
         
         pump.start()
-        time.sleep(0.1)  # Let it process
+        time.sleep(0.05)
         pump.stop()
         
-        # Verify AudioPump called next_frame() (grace period handled by EncoderManager)
+        # Verify AudioPump only calls next_frame() - routing is inside EncoderManager
         encoder_manager.next_frame.assert_called()
         
-        # Verify AudioPump does NOT own or manage grace period timers
-        # (Grace period logic is in EncoderManager per updated contract)
-        assert encoder_manager.next_frame.call_count > 0, \
-            "AudioPump must call next_frame(), EncoderManager handles grace period per contract [A7], [G13]"
+        # Verify AudioPump does NOT call fallback_provider directly
+        if hasattr(fallback, 'next_frame'):
+            assert not fallback.next_frame.called if hasattr(fallback.next_frame, 'called') else True, \
+                "AudioPump MUST NOT call fallback_provider directly per contract [A7]"
     
-    def test_a7_encoder_manager_checks_pcm_buffer(self, components):
-        """Test [A7]: EncoderManager checks PCM buffer (via next_frame()), AudioPump does not check buffer."""
-        import inspect
-        from tower.encoder import encoder_manager
-        
-        # Verify EncoderManager.next_frame() checks PCM buffer internally
-        source = inspect.getsource(encoder_manager.EncoderManager.next_frame)
-        
-        # EncoderManager should call pop_frame with timeout (not AudioPump)
-        assert 'pop_frame(timeout=' in source, \
-            "EncoderManager.next_frame() should check PCM buffer internally per contract [A7], [M3A]"
-        
-        # AudioPump should NOT check PCM buffer
-        from tower.encoder import audio_pump
-        pump_source = inspect.getsource(audio_pump.AudioPump._run)
-        # AudioPump should only call next_frame(), not pop_frame()
-        assert 'next_frame(' in pump_source, \
-            "AudioPump should only call next_frame() per contract [A7]"
-    
-    def test_a8_non_blocking_selection(self, components):
-        """Test [A8]: Frame selection is non-blocking."""
+    def test_a8_no_grace_period_logic(self, components):
+        """Test [A8]: AudioPump MUST NOT implement grace period timing."""
         pcm_buffer, fallback, encoder_manager = components
+        
+        # Verify AudioPump does not have grace period attributes
+        pump = AudioPump(
+            pcm_buffer=pcm_buffer,
+            fallback_generator=fallback,
+            encoder_manager=encoder_manager,
+        )
+        
+        # AudioPump should NOT have grace period logic
+        # (Grace period is owned by EncoderManager per M-GRACE)
+        assert not hasattr(pump, 'grace_period_sec') or pump.grace_period_sec is None, \
+            "AudioPump MUST NOT implement grace period logic per contract [A8]"
+        assert not hasattr(pump, 'grace_timer_start'), \
+            "AudioPump MUST NOT manage grace timers per contract [A8]"
+    
+    def test_a9_no_fallback_selection(self, components):
+        """Test [A9]: AudioPump MUST NOT make independent decisions about fallback vs program."""
+        pcm_buffer, fallback, encoder_manager = components
+        
+        # Mock next_frame to verify it's called
+        encoder_manager.next_frame = Mock()
         
         pump = AudioPump(
             pcm_buffer=pcm_buffer,
@@ -235,13 +202,17 @@ class TestAudioPumpFrameSelection:
             encoder_manager=encoder_manager,
         )
         
-        # Start and stop quickly - should not hang
         pump.start()
-        time.sleep(0.01)
+        time.sleep(0.05)
         pump.stop()
         
-        # Should have completed without blocking
-        assert not pump.running
+        # Verify AudioPump only calls next_frame() - all decisions are in EncoderManager
+        encoder_manager.next_frame.assert_called()
+        
+        # AudioPump should NOT inspect PCM buffer or make routing decisions
+        # (All routing logic is in EncoderManager per M11)
+        assert encoder_manager.next_frame.call_count > 0, \
+            "AudioPump must call next_frame(), EncoderManager handles all routing per contract [A9], [M11]"
 
 
 class TestAudioPumpTiming:

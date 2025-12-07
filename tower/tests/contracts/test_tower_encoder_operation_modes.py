@@ -1,8 +1,12 @@
 """
 Contract tests for Encoder Operational Modes
 
-See docs/contracts/ENCODER_OPERATION_MODES.md
-Covers: [O1]–[O22] (Mode definitions, transitions, output guarantees, testing requirements, broadcast-grade requirements)
+NOTE: Operational modes [O1]-[O22] are now internal implementation details, not contract requirements.
+This file may be obsolete. Tests should be reviewed:
+- If test asserts contract-defined behavior (F5, F6, F-HEAL, M11, etc.) → keep
+- If test asserts internal state-machine detail (MODE_BOOTING, MODE_RUNNING, etc.) → delete
+
+See NEW_ENCODER_MANAGER_CONTRACT.md, NEW_FFMPEG_SUPERVISOR_CONTRACT.md for current contract clauses.
 """
 
 import pytest

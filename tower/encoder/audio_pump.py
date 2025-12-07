@@ -1,4 +1,3 @@
-import os
 import time
 import threading
 import logging
@@ -31,17 +30,6 @@ class AudioPump:
         self.encoder_manager = encoder_manager
         self.running = False
         self.thread = None
-        
-        # Grace period configuration
-        self.grace_period_sec = float(os.getenv("TOWER_PCM_GRACE_SEC", "5.0"))
-        if self.grace_period_sec <= 0:
-            self.grace_period_sec = 0  # Disable grace period if zero or negative
-        
-        # Grace period state
-        self.grace_timer_start: Optional[float] = None  # None = grace not active
-        
-        # Cached silence frame (pre-built at startup per contract [G18])
-        self.silence_frame = b'\x00' * SILENCE_FRAME_SIZE
 
     def start(self):
         if self.running:
@@ -62,9 +50,6 @@ class AudioPump:
         tick_index = 0
 
         while self.running:
-            # Telemetry: Log tick start
-            logger.debug("AUDIO_PUMP: tick", extra={"tick": tick_index})
-            
             # Telemetry: Log first PCM frame generated
             if tick_index == 0:
                 logger.info("AUDIO_PUMP: first PCM frame generated")

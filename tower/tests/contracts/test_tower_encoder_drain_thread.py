@@ -13,7 +13,7 @@ import time
 from io import BytesIO
 from unittest.mock import Mock, patch, MagicMock
 
-from tower.audio.mp3_packetizer import MP3Packetizer
+# Per contract F9.1: FFmpeg handles MP3 packetization entirely
 from tower.audio.ring_buffer import FrameRingBuffer
 from tower.encoder.drain_thread import EncoderOutputDrainThread
 
@@ -28,7 +28,7 @@ def create_fake_mp3_frame(
     """Create a fake MP3 frame with valid sync word and header."""
     import random
     
-    # Compute frame size using same formula as MP3Packetizer
+    # Compute frame size using MP3 frame header parsing
     bitrate_bps = bitrate_kbps * 1000
     frame_size = int((144 * bitrate_bps) / sample_rate) + padding
     
@@ -41,9 +41,9 @@ def create_fake_mp3_frame(
     # Byte 2: Bitrate index (bits 4-7) + sample rate index (bits 2-3) + padding (bit 1)
     # Byte 3: Channel mode, etc.
     
-    # Bitrate lookup table (same as MP3Packetizer)
+    # Bitrate lookup table (MP3 standard)
     BITRATE_TABLE = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
-    # Sample rate lookup table (same as MP3Packetizer)
+    # Sample rate lookup table (MP3 standard)
     SAMPLE_RATE_TABLE = [44100, 48000, 32000, 0]
     
     # Find bitrate index
@@ -100,10 +100,7 @@ class TestEncoderOutputDrainThread:
         """Create MP3 buffer for testing."""
         return FrameRingBuffer(capacity=100)
     
-    @pytest.fixture
-    def packetizer(self):
-        """Create MP3Packetizer for testing."""
-        return MP3Packetizer()
+    # Per contract F9.1: FFmpeg handles MP3 packetization entirely
     
     @pytest.fixture
     def mock_stdout(self):
@@ -124,54 +121,24 @@ class TestEncoderOutputDrainThread:
         """Create shutdown event."""
         return threading.Event()
     
+    # Per contract F9.1: FFmpeg handles MP3 packetization entirely
     @pytest.fixture
     def drain_thread(
-        self, mp3_buffer, packetizer, mock_stdout, on_stall_callback, shutdown_event
+        self, mp3_buffer, mock_stdout, on_stall_callback, shutdown_event
     ):
         """Create EncoderOutputDrainThread instance."""
         return EncoderOutputDrainThread(
             stdout=mock_stdout,
             mp3_buffer=mp3_buffer,
-            packetizer=packetizer,
             stall_threshold_ms=100,  # Short threshold for testing
             on_stall=on_stall_callback,
             shutdown_event=shutdown_event,
         )
     
-    def test_feeds_packetizer_correctly(self, drain_thread, packetizer, mock_stdout, mp3_buffer):
-        """Test that drain thread feeds bytes to packetizer correctly [D1]."""
-        # [D1] Drain thread MUST call packetizer.feed(data) for each read
-        # [P3] feed() returns iterable of complete MP3 frames
-        # [D3] Each frame pushed via push_frame()
-        # Create a fake MP3 frame
-        frame = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=1)
-        
-        # Configure mock to return frame data
-        mock_stdout.read.return_value = frame
-        
-        # Mock select to indicate data is available
-        with patch('select.select', return_value=([mock_stdout], [], [])):
-            # Start thread
-            drain_thread.start()
-            time.sleep(0.2)  # Give thread time to read
-            
-            # Stop thread
-            drain_thread.stop(timeout=1.0)
-        
-        # [D1] Packetizer should have received the data via feed()
-        # [P3] feed() yields complete frames incrementally
-        # [D3] Frames should be pushed to buffer via push_frame()
-        assert len(mp3_buffer) > 0
-        # Verify frame is complete (not partial)
-        popped_frame = mp3_buffer.pop_frame()
-        assert popped_frame is not None
-        assert len(popped_frame) == len(frame)  # Complete frame
-    
     def test_pushes_frames_into_mp3_buffer(self, drain_thread, mp3_buffer, mock_stdout):
         """Test that drain thread pushes complete frames into MP3 buffer [D1], [D2], [D3]."""
-        # [D1] Drain thread calls packetizer.feed(data) and iterates frames
-        # [P3] feed() yields frames incrementally (may yield multiple frames per call)
-        # [D2] MUST NOT return partial frames (packetizer ensures this)
+        # Per contract F9: Drain thread accumulates bytes and detects frame boundaries
+        # Only complete frames are pushed to buffer
         # [D3] FrameRingBuffer interface is push_frame(frame: bytes) - called once per complete frame
         # Create multiple fake MP3 frames
         frame1 = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=1)
@@ -302,9 +269,8 @@ class TestEncoderOutputDrainThread:
     
     def test_reads_in_chunks(self, drain_thread, mp3_buffer, mock_stdout):
         """Test that thread reads data in chunks (~4096 bytes) [D1], [P2], [P3]."""
-        # [D1] Drain thread reads in chunks and feeds to packetizer
-        # [P2] Packetizer maintains internal streaming state across calls
-        # [P3] feed() yields frames incrementally as they become complete
+        # Per contract F9: Drain thread reads in chunks and accumulates bytes
+        # Frame boundaries are detected and only complete frames are pushed
         # Create multiple frames
         frame1 = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=1)
         frame2 = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=2)
@@ -371,17 +337,16 @@ class TestEncoderOutputDrainThread:
             # Stop thread
             drain_thread.stop(timeout=1.0)
         
-        # [P2] Partial chunks should accumulate
-        # [P3] feed() should yield zero frames for chunk1 and chunk2, then one frame for chunk3
-        # [D3] push_frame() should be called exactly once when frame becomes complete
+        # Per contract F9: Partial chunks should accumulate in accumulator
+        # push_frame() should be called exactly once when frame becomes complete
         assert len(push_frame_calls) == 1  # Called once per complete frame
         assert push_frame_calls[0] == frame  # Complete frame pushed
         assert len(mp3_buffer) == 1  # One complete frame in buffer
     
     def test_feed_yields_frames_incrementally(self, drain_thread, mp3_buffer, mock_stdout):
         """Test that feed() yields frames incrementally [P3], [D3]."""
-        # [P3] feed() returns zero or more complete MP3 frames incrementally
-        # [D3] push_frame() is called once per complete frame yielded
+        # Per contract F9: Complete frames are detected and pushed incrementally
+        # push_frame() is called once per complete frame
         frame1 = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=20)
         frame2 = create_fake_mp3_frame(bitrate_kbps=128, sample_rate=48000, payload_seed=21)
         
@@ -410,9 +375,9 @@ class TestEncoderOutputDrainThread:
             # Stop thread
             drain_thread.stop(timeout=1.0)
         
-        # [P3] feed() should yield frame1 immediately from first data chunk
-        # [P3] feed() should yield frame2 from second data chunk (after accumulation)
-        # [D3] push_frame() called once per frame (twice total)
+        # Per contract F9: Frame1 should be detected and pushed from first data chunk
+        # Frame2 should be detected and pushed from second data chunk (after accumulation)
+        # push_frame() called once per frame (twice total)
         assert len(push_frame_calls) == 2  # One call per complete frame
         assert push_frame_calls[0] == frame1
         assert push_frame_calls[1] == frame2

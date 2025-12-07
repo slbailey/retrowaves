@@ -124,6 +124,45 @@ class FrameRingBuffer:
             if was_full:
                 self._total_dropped += 1
     
+    def push_front_frame(self, frame: bytes) -> None:
+        """
+        Push a complete MP3 frame to the front of the buffer (high priority).
+        
+        This method pushes frames to the front of the buffer, ensuring they are
+        processed before frames added via push_frame(). This is useful for prioritizing
+        real-time user PCM over priming frames.
+        
+        If the buffer is full, the newest frame (at the back) is automatically discarded
+        (deque with maxlen handles this). This operation never blocks.
+        
+        This method tracks statistics: increments total_pushed, and if a frame
+        was dropped, increments total_dropped.
+        
+        Args:
+            frame: Complete MP3 frame bytes to push (must not be None or empty)
+            
+        Raises:
+            ValueError: If frame is None or empty
+        """
+        if not frame:
+            raise ValueError("Cannot push None or empty frame")
+        
+        with self._lock:
+            # Check if buffer is full before prepending
+            # If full, deque will drop newest (back) automatically
+            was_full = len(self._buffer) >= self._capacity
+            
+            # Prepend frame to front (drops newest if full)
+            self._buffer.appendleft(frame)
+            
+            # Notify any waiting threads that a frame is available
+            self._condition.notify_all()
+            
+            # Update statistics
+            self._total_pushed += 1
+            if was_full:
+                self._total_dropped += 1
+    
     def pop_frame(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
         Pop a complete MP3 frame from the buffer.
@@ -137,28 +176,24 @@ class FrameRingBuffer:
         Returns:
             Complete MP3 frame bytes if available, None if buffer is empty (or timeout expires)
         """
-        # If timeout is None or <= 0, return immediately (non-blocking)
-        if timeout is None or timeout <= 0:
-            with self._lock:
-                if self._buffer:
-                    return self._buffer.popleft()
+        with self._lock:
+            if self._buffer:
+                return self._buffer.popleft()
+
+            if timeout is None or timeout <= 0:
                 return None
-            
-        # Per contract [B12]: With timeout, must wait up to timeout seconds
-        # Use explicit sleep-wait loop to ensure full timeout is respected
-        deadline = time.monotonic() + timeout
-        
-        while time.monotonic() < deadline:
-            with self._lock:
+
+            end = time.monotonic() + timeout
+            while True:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return None
+
+                # wait releases lock and reacquires on wake
+                self._condition.wait(timeout=remaining)
+
                 if self._buffer:
                     return self._buffer.popleft()
-            
-            # Sleep briefly and check again (contract-compliant busy-wait)
-            # This ensures we actually wait the full timeout duration
-            time.sleep(0.001)  # 1ms sleep - tiny, contract-compliant
-        
-        # Timeout expired - return None
-        return None
     
     def clear(self) -> None:
         """
