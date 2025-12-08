@@ -35,13 +35,15 @@ The DJ is the sole source of programming decisions:
 
 Decisions are made as concrete MP3 file paths during THINK, never during DO.
 
-### 2.2 Playback Engine Is the Metronome
+### 2.2 Playback Engine Uses Clock A (Decode Metronome)
 The PlayoutEngine:
-- decodes audio to frames, mixes frames, sends frames to outputs
+- decodes audio to frames, paces frame consumption using Clock A (decode metronome), mixes frames, sends frames to outputs
+- uses Clock A to ensure songs play at real duration (e.g., 200-second MP3 takes 200 seconds)
 - emits lifecycle events:
   - `on_segment_started(segment)` → THINK
   - `on_segment_finished(segment)` → DO
-- never makes programming decisions; it only plays what it’s given
+- never makes programming decisions; it only plays what it's given
+- never attempts Tower-synchronized pacing (Tower owns broadcast timing via Clock B)
 
 ### 2.3 THINK vs DO
 - THINK (Prep Window, during `on_segment_started`): plan the next break; select exact MP3s (outro?, ID(s)?, intro?, next song).
@@ -171,6 +173,12 @@ Filesystem-backed discovery for available songs:
 - 48 kHz sample rate
 - 2 channels (stereo)
 - frame_size = 1024 samples
+- frame_duration = ~21.333 ms (1024 samples / 48000 Hz)
+
+**Clock A decode pacing:**
+- Station may pace decode consumption at ~21.333ms per frame using Clock A
+- This ensures songs play at real duration (e.g., 200-second MP3 takes 200 seconds)
+- Socket writes remain non-blocking and fire immediately (no pacing on writes)
 
 ---
 
@@ -178,12 +186,22 @@ Filesystem-backed discovery for available songs:
 
 High-level loop:
 1. Start segment S → emit `on_segment_started(S)` (THINK)
-2. Decode S via FFmpegDecoder → frames → Mixer → OutputSink
+2. Decode S via FFmpegDecoder → Clock A paces frame consumption (~21.333ms per frame) → Mixer → OutputSink (writes fire immediately, non-blocking)
 3. On completion → emit `on_segment_finished(S)` (DO)
 4. DJ pushes `[outro?][id(s)?][intro?][next_song]` from `DJIntent`
 5. Repeat
 
 PlayoutEngine decodes and plays exactly one segment at a time; no prefetching or concurrent decoding occurs.
+
+**Two-Clock Architecture:**
+- **Clock A (Station decode metronome):** Paces decode consumption for local playback correctness. Ensures songs play at real duration (e.g., 200-second MP3 takes 200 seconds). Monotonic, wall-clock-fidelity. Never observes Tower state. Never alters pacing based on socket success/failure.
+- **Clock B (Tower AudioPump):** Sole authority for broadcast timing (strict 21.333ms). Station never attempts to match or influence Clock B.
+
+**Decode pacing rules:**
+- After decoding a PCM frame, Station: `next_frame_time += FRAME_DURATION` (~21.333 ms), then `sleep(max(0, next_frame_time - now))`
+- Socket writes fire immediately (non-blocking, no pacing on writes)
+- No adaptive pacing, buffer-based pacing, or rate correction
+- No Tower-synchronized pacing
 
 Non-goals in 3.2:
 - No gapless transition rules

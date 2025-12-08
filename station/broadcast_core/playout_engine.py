@@ -17,11 +17,11 @@ import time
 from abc import ABC, abstractmethod
 from typing import Optional, Protocol
 
-from broadcast_core.audio_event import AudioEvent
-from broadcast_core.playout_queue import PlayoutQueue
-from broadcast_core.ffmpeg_decoder import FFmpegDecoder
-from mixer.mixer import Mixer
-from outputs.base_sink import BaseSink
+from station.broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.playout_queue import PlayoutQueue
+from station.broadcast_core.ffmpeg_decoder import FFmpegDecoder
+from station.mixer.mixer import Mixer
+from station.outputs.base_sink import BaseSink
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class PlayoutEngine:
             dj_callback: Optional DJ callback object that implements
                         on_segment_started and on_segment_finished methods
             output_sink: Output sink to write audio frames to (required for real audio playback)
-            tower_control: Optional TowerControlClient for buffer monitoring and adaptive pacing
+            tower_control: Optional TowerControlClient (deprecated - not used for timing)
         """
         self._queue = PlayoutQueue()
         self._dj_callback = dj_callback
@@ -129,12 +129,6 @@ class PlayoutEngine:
         # Monitoring: track queue stats for debugging
         self._last_queue_log_time = time.time()
         self._queue_log_interval = 5.0  # Log queue stats every 5 seconds
-        
-        # Buffer monitoring for adaptive pacing
-        self._last_buffer_check_time = 0.0  # Start at 0 to force immediate check
-        self._buffer_check_interval = 0.5    # Check buffer every 500ms (slow control loop)
-        self._current_buffer_fill = None
-        self._current_buffer_capacity = None
         
         # Fallback segment durations (in seconds) if we can't detect real duration
         self._default_segment_duration = 180.0  # 3 minutes default for songs
@@ -293,8 +287,13 @@ class PlayoutEngine:
         """
         Decode and play an audio segment.
         
-        Decodes frames and writes them with absolute-timing pacing at exactly 21.333ms per frame.
-        Uses absolute clock timing to prevent cumulative drift.
+        ARCHITECTURAL INVARIANT: Station uses Clock A (decode metronome) for local playback correctness.
+        Station paces consumption of decoded PCM frames to ensure songs play at real duration.
+        Station MUST NOT: attempt Tower-synchronized pacing, observe Tower state, or alter pacing
+        based on socket success/failure.
+        
+        Station pushes PCM frames into the Unix domain socket immediately after decode pacing.
+        Tower is the ONLY owner of broadcast timing (AudioPump @ 21.333ms - Clock B).
         
         Args:
             segment: AudioEvent to play
@@ -311,146 +310,54 @@ class PlayoutEngine:
         expected_duration = self._get_segment_duration(segment)
         logger.info(f"[PLAYOUT] Decoding and playing: {segment.path} (expected duration: {expected_duration:.1f}s)")
         
-        start_time = time.time()
+        start_time = time.monotonic()  # Use monotonic clock for Clock A
         frame_count = 0
-        frame_size = 1024  # samples per frame
-        sample_rate = 48000  # Hz
         
-        # Calculate frame period: 1024 samples / 48000 Hz = exactly 21.333ms
-        # Station paces frames at exactly this rate using absolute clock timing
-        FRAME_DURATION = frame_size / sample_rate  # 0.021333... seconds (exactly 21.333ms)
-        
-        # Absolute clock timing - prevents cumulative drift
-        next_frame_time = time.time()
+        # Clock A: Decode pacing metronome
+        # Target: ~21.333 ms per 1024-sample frame (1024 samples / 48000 Hz)
+        FRAME_DURATION = 1024.0 / 48000.0  # ~0.021333 seconds
+        next_frame_time = start_time  # Initialize Clock A timeline
         
         try:
             # Create decoder for this segment
             # Note: decoder.read_frames() handles cleanup automatically via finally block
-            decoder = FFmpegDecoder(segment.path, frame_size=frame_size)
+            decoder = FFmpegDecoder(segment.path, frame_size=1024)
             logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
             
-            # Initial buffer check - get thresholds before starting playback
-            # Initial buffer check before starting playback
-            if self._tower_control:
-                buffer_status = self._tower_control.get_buffer()
-                if buffer_status:
-                    self._current_buffer_fill = buffer_status.get("fill")
-                    self._current_buffer_capacity = buffer_status.get("capacity")
-                    if self._current_buffer_fill is not None and self._current_buffer_capacity is not None:
-                        fill_pct = (self._current_buffer_fill / self._current_buffer_capacity * 100) if self._current_buffer_capacity > 0 else 0.0
-                        logger.info(
-                            f"[PLAYOUT_BUFFER] Initial buffer state: fill={self._current_buffer_fill}/{self._current_buffer_capacity} "
-                            f"({fill_pct:.1f}%)"
-                        )
-                    else:
-                        logger.warning(f"[PLAYOUT_BUFFER] Initial buffer check returned incomplete data: {buffer_status}")
-                else:
-                    logger.warning(f"[PLAYOUT_BUFFER] Initial buffer check failed - no telemetry available")
-                self._last_buffer_check_time = time.time()
-            
-            # Decode and write frames with proportional (P-controller) rate adjustment
+            # Decode and write frames with Clock A pacing
+            # Clock A paces consumption to ensure real-time playback duration
+            # Socket writes fire immediately (non-blocking, no pacing on writes)
             for frame in decoder.read_frames():
                 # Check if we should stop
                 if not self._is_running or self._stop_event.is_set():
                     logger.info(f"[PLAYOUT] Stopping playback early (stop requested)")
                     break
                 
-                # Check buffer status periodically for proportional rate adjustment
-                now = time.time()
-                if self._tower_control and (now - self._last_buffer_check_time) >= self._buffer_check_interval:
-                    buffer_status = self._tower_control.get_buffer()
-                    if buffer_status:
-                        old_fill = self._current_buffer_fill
-                        old_cap = self._current_buffer_capacity
-                        self._current_buffer_fill = buffer_status.get("fill")
-                        self._current_buffer_capacity = buffer_status.get("capacity")
-                        
-                        # Debug logging: log buffer telemetry update
-                        if self._current_buffer_fill is not None and self._current_buffer_capacity is not None:
-                            fill_pct = (self._current_buffer_fill / self._current_buffer_capacity * 100) if self._current_buffer_capacity > 0 else 0.0
-                            change = ""
-                            if old_fill is not None:
-                                change = f" (change: {old_fill}→{self._current_buffer_fill})"
-                            logger.debug(
-                                f"[PLAYOUT_BUFFER] Updated: fill={self._current_buffer_fill}/{self._current_buffer_capacity} "
-                                f"({fill_pct:.1f}%){change}"
-                            )
-                        else:
-                            logger.debug(f"[PLAYOUT_BUFFER] Updated with incomplete data: fill={self._current_buffer_fill}, cap={self._current_buffer_capacity}")
-                    else:
-                        logger.debug(f"[PLAYOUT_BUFFER] Failed to get buffer status from Tower")
-                    self._last_buffer_check_time = now
+                # Clock A: Pace decode consumption for real-time playback
+                # This ensures songs take their real duration (e.g., 200-second MP3 takes 200 seconds)
+                now = time.monotonic()
+                sleep_duration = next_frame_time - now
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+                # Update Clock A timeline for next frame (allow drift correction)
+                next_frame_time += FRAME_DURATION
                 
                 # Apply gain via mixer
                 processed_frame = self._mixer.mix(frame, gain=segment.gain)
                 
-                # Write frame
+                # Write frame immediately - no pacing on socket write, non-blocking
+                # TowerPCMSink handles non-blocking writes and drop-oldest semantics
+                # Clock A only paces decode consumption, NOT socket writes
                 self._output_sink.write(processed_frame)
                 frame_count += 1
                 
-                # ---- Simple zone-based pacing based on Tower ring buffer ----
-                if (
-                    self._current_buffer_fill is not None and
-                    self._current_buffer_capacity not in (None, 0)
-                ):
-                    fill = self._current_buffer_fill
-                    cap = self._current_buffer_capacity
-
-                    low_threshold  = int(0.20 * cap)   # <20% → we're too low
-                    high_threshold = int(0.70 * cap)   # >70% → we're getting too full
-                    fill_pct = (fill / cap * 100) if cap > 0 else 0.0
-
-                    if fill <= low_threshold:
-                        # 🔴 Buffer low → push as fast as possible (no sleep)
-                        adaptive_sleep = 0.0
-                        zone = "LOW"
-                        if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
-                            logger.debug(
-                                f"[PLAYOUT_PACING] Zone=LOW (fill={fill}/{cap}, {fill_pct:.1f}%), "
-                                f"sleep=0.0ms (push fast)"
-                            )
-
-                    elif fill >= high_threshold:
-                        # 🟢 Buffer high → slow down so we don't overflow
-                        adaptive_sleep = 0.030  # 30ms
-                        zone = "HIGH"
-                        if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
-                            logger.debug(
-                                f"[PLAYOUT_PACING] Zone=HIGH (fill={fill}/{cap}, {fill_pct:.1f}%), "
-                                f"sleep=30ms (slow down)"
-                            )
-
-                    else:
-                        # ⚪ Sweet spot (20–70% full) → run slightly faster than Tower
-                        # Tower consumes at ~21.33ms per frame; we aim ~18ms
-                        adaptive_sleep = 0.018
-                        zone = "SWEET_SPOT"
-                        if frame_count % 500 == 0:  # Log every 500 frames in sweet spot (less frequent)
-                            logger.debug(
-                                f"[PLAYOUT_PACING] Zone=SWEET_SPOT (fill={fill}/{cap}, {fill_pct:.1f}%), "
-                                f"sleep=18ms (normal pace)"
-                            )
-                else:
-                    # No buffer info → fall back to nominal pacing
-                    adaptive_sleep = FRAME_DURATION
-                    zone = "NO_TELEMETRY"
-                    if frame_count % 100 == 0:  # Log every 100 frames to reduce noise
-                        logger.debug(
-                            f"[PLAYOUT_PACING] Zone=NO_TELEMETRY, "
-                            f"sleep={FRAME_DURATION*1000:.1f}ms (fallback pacing)"
-                        )
-                
-                # Sleep for calculated time
-                if adaptive_sleep > 0.001:
-                    time.sleep(adaptive_sleep)
-                
-                # Log progress every 1000 frames (~21.3 seconds at 21.333ms per frame)
+                # Log progress every 1000 frames
                 if frame_count % 1000 == 0:
-                    actual_elapsed = time.time() - start_time
-                    logger.debug(f"[PLAYOUT] Played {frame_count} frames ({actual_elapsed:.1f}s elapsed)")
+                    actual_elapsed = time.monotonic() - start_time
+                    logger.debug(f"[PLAYOUT] Decoded {frame_count} frames ({actual_elapsed:.1f}s elapsed)")
             
-            total_time = time.time() - start_time
-            logger.info(f"[PLAYOUT] Finished playing {segment.path} ({frame_count} frames, {total_time:.1f}s)")
+            total_time = time.monotonic() - start_time
+            logger.info(f"[PLAYOUT] Finished decoding {segment.path} ({frame_count} frames, {total_time:.1f}s)")
             
         except FileNotFoundError:
             logger.error(f"[PLAYOUT] Audio file not found: {segment.path}")
