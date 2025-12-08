@@ -925,7 +925,7 @@ class EncoderManager:
     
     def get_frame(self) -> Optional[bytes]:
         """
-        Get MP3 frame for broadcast (non-blocking).
+        Get MP3 frame for broadcast.
         
         Per contract [M15], applies source selection rules defined in [O13] and [O14].
         Priority order per [O13]:
@@ -934,10 +934,12 @@ class EncoderManager:
         3. Tone-generated MP3 frames (if configured, FALLBACK mode)
         4. Synthetic MP3 frames (OFFLINE_TEST_MODE)
         
-        Per contract [M10]: MUST NEVER BLOCK and SHOULD avoid returning None.
-        For broadcast-grade systems: MUST NEVER return None. If no MP3 is available, MUST return silence.
+        Per contract TR-TIMING3: If no MP3 frame is available during LIVE_INPUT,
+        MUST block internally for ≤250ms waiting for a frame, then either return
+        a fresh MP3 frame or return a fallback MP3 frame. Must never return None.
         
-        Called by the tick-driven broadcast loop every TOWER_OUTPUT_TICK_INTERVAL_MS.
+        Per contract [M10]: MUST NEVER return None. If no MP3 is available after
+        bounded wait, MUST return fallback silence frame.
         
         Returns:
             bytes: MP3 frame (always returns bytes, never None per [M10])
@@ -977,7 +979,11 @@ class EncoderManager:
         # - [O7] DEGRADED: Return prebuilt silence or tone frames
         
         if supervisor_state == SupervisorState.RUNNING:
-            # [O3] LIVE_INPUT mode - try to get real MP3 frames from encoder
+            # [O3] LIVE_INPUT mode - use real MP3 frames from encoder
+            # Per TR-TIMING3: If buffer is empty, block for ≤250ms waiting for a frame
+            BOUNDED_WAIT_TIMEOUT = 0.25  # 250ms per TR-TIMING3
+            
+            # Try to get frame immediately (non-blocking)
             frame = self._mp3_buffer.pop_frame()
             
             if frame is not None:
@@ -986,35 +992,67 @@ class EncoderManager:
                 self._last_frame = frame
                 return frame
             
-            # Buffer empty: MP3-layer underflow during LIVE_INPUT
-            # Per [O13], fallback to last known good frame or silence
-            self._mp3_underflow_count += 1
+            # Buffer empty: wait up to 250ms for a frame to arrive
+            # Per TR-TIMING3: bounded wait must be inside EncoderManager
+            frame = self._mp3_buffer.pop_frame(timeout=BOUNDED_WAIT_TIMEOUT)
             
-            if self._last_frame is not None:
-                logger.debug(
-                    f"MP3 buffer underflow (count: {self._mp3_underflow_count}), "
-                    "returning last known good frame"
-                )
-                return self._last_frame
+            if frame is not None:
+                # Got a frame after waiting - update state
+                self._has_received_first_frame = True
+                self._last_frame = frame
+                return frame
             
-            # Last resort: Return static silence frame
-            logger.debug(
-                f"MP3 buffer underflow (count: {self._mp3_underflow_count}), "
-                "no last frame available, returning silence frame"
-            )
+            # Timeout expired - no frame available after bounded wait
+            # Per TR-TIMING3: return fallback MP3 frame (silence)
+            # Never return None, never return stale "last known good frame" in hot loop
             return self._silence_frame
         
         elif supervisor_state == SupervisorState.BOOTING:
-            # [O2] BOOTING mode - return prebuilt silence frames per [O14]
-            # Per [O2.1], broadcast must begin instantly, never wait for encoder
+            # [O2] BOOTING mode - wait for first MP3 frame, fallback to silence
+            # Per TR-TIMING3: If buffer is empty, block for ≤250ms waiting for a frame
+            # Per [O2.1], broadcast must begin instantly (return silence if no frame available)
+            # But we should wait for frames to arrive to prevent tight loop
+            BOUNDED_WAIT_TIMEOUT = 0.25  # 250ms per TR-TIMING3
+            
+            # Try to get frame immediately (non-blocking)
+            frame = self._mp3_buffer.pop_frame()
+            
+            if frame is not None:
+                # First frame arrived - use it and mark that we've received first frame
+                self._has_received_first_frame = True
+                self._last_frame = frame
+                return frame
+            
+            # Buffer empty: wait up to 250ms for a frame to arrive
+            # Per TR-TIMING3: bounded wait must be inside EncoderManager
+            frame = self._mp3_buffer.pop_frame(timeout=BOUNDED_WAIT_TIMEOUT)
+            
+            if frame is not None:
+                # Got first frame after waiting - use it
+                self._has_received_first_frame = True
+                self._last_frame = frame
+                return frame
+            
+            # Timeout expired - no frame available after bounded wait
+            # Per [O14]: return prebuilt silence frame during BOOTING
             return self._silence_frame
         
         elif supervisor_state in (SupervisorState.RESTARTING, SupervisorState.FAILED):
             # [O5] RESTART_RECOVERY or [O7] DEGRADED - return prebuilt silence frames per [O14]
+            # But still consume frames from buffer to prevent accumulation
+            frame = self._mp3_buffer.pop_frame()
+            if frame is not None:
+                # Discard frame but update last_frame for potential use later
+                self._last_frame = frame
             return self._silence_frame
         
         elif supervisor_state in (SupervisorState.STOPPED, SupervisorState.STARTING):
             # [O1] COLD_START - return prebuilt silence frames per [O1], [O2.1]
+            # But still consume frames from buffer to prevent accumulation
+            frame = self._mp3_buffer.pop_frame()
+            if frame is not None:
+                # Discard frame but update last_frame for potential use later
+                self._last_frame = frame
             return self._silence_frame
         
         # Fallback: return silence frame

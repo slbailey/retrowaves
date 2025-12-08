@@ -1,8 +1,8 @@
 import os
 from typing import Optional
 
-from music_logic.media_library import MediaLibrary
-from music_logic.rotation_manager import RotationManager
+from station.music_logic.media_library import MediaLibrary
+from station.music_logic.rotation_manager import RotationManager
 
 
 def _load_dotenv_simple(dotenv_path: Optional[str] = None) -> None:

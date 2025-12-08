@@ -13,7 +13,7 @@ It abstracts all fallback audio generation or retrieval mechanisms so that Encod
 The Fallback Provider **MUST**:
 
 ### FP2.1
-Produce exactly one **4608-byte PCM frame** on every call to `next_frame()`.
+Produce exactly one **4096-byte PCM frame** on every call to `next_frame()`.
 
 ### FP2.2 — Immediate Return Requirement (Zero Latency Concept)
 Guarantee that `next_frame()` returns **immediately without blocking**.
@@ -22,7 +22,7 @@ Guarantee that `next_frame()` returns **immediately without blocking**.
 - **Non-blocking** — never wait for I/O, locks, or external resources
 - **Very fast** — typically completes in microseconds to low milliseconds
 - **Deterministic** — predictable execution time, not dependent on external factors
-- **Real-time capable** — supports continuous audio playout at 24ms tick intervals
+- **Real-time capable** — supports continuous audio playout at 21.333ms tick intervals (PCM cadence)
 
 **MUST NOT**:
 - Block or wait for any I/O operations
@@ -37,15 +37,19 @@ Guarantee that `next_frame()` returns **immediately without blocking**.
 This ensures that EncoderManager can always obtain a fallback frame without any blocking delay, supporting continuous audio output.
 
 ### FP2.3
-Provide audio in the PCM format defined by the Core Timing Contract:
+Frame format **MUST** match Tower's canonical PCM format (per `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md`):
 
-- 48kHz
-- Stereo
-- 1152 samples (per tick)
-- 4608 bytes
+- Sample rate: 48,000 Hz
+- Channels: 2 (stereo)
+- Frame size: 1024 samples per frame (4096 bytes)
 
 ### FP2.4
 Guarantee that it always returns a valid frame — **no exceptions**.
+
+### FP2.5 — Phase Continuity
+The fallback tone generator, when used, **MUST** maintain phase continuity across frame boundaries to prevent discontinuities in PCM output.
+
+This ensures purity and avoids audible or visual artifacts. The phase accumulator **MUST** be updated once per frame (by `step * 1024`) and wrapped using modulo arithmetic, rather than updating and wrapping per sample within the frame loop.
 
 ---
 
@@ -79,7 +83,7 @@ The tone generator **MUST** be designed to return frames immediately without any
 Silence **MUST** be used **only if tone generation is not possible for any reason**.
 
 - Used only if both file and tone sources fail
-- **MUST** be a precomputed zero-filled frame (4608 bytes)
+- **MUST** be a precomputed zero-filled frame (4096 bytes, per `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md`)
 - **MUST** be available instantly with zero latency
 - **MUST** serve as the final fallback to ensure continuous PCM output
 
@@ -98,10 +102,10 @@ next_frame() -> bytes
 ```
 
 ### FP4.1
-Returns a PCM frame of size **4608 bytes**.
+Returns a PCM frame of size **4096 bytes** (canonical PCM frame size as defined in `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md`).
 
 ### FP4.2
-**MUST** be safe to call once per tick (24ms cadence).
+**MUST** be safe to call once per tick (21.333ms cadence - PCM cadence).
 
 ### FP4.3
 **MUST NOT** raise exceptions during normal operation.

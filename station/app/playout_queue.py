@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.audio_event import AudioEvent
 
 
 class PlayoutQueue:

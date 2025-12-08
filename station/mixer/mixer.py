@@ -4,6 +4,9 @@ import numpy as np
 class Mixer:
     """
     Simple pass-through mixer that applies gain only.
+    
+    ARCHITECTURAL INVARIANT: No timing logic. Processes frames immediately.
+    Station pushes frames as fast as decoder produces them - Tower owns all timing.
     """
 
     def mix(self, frame: np.ndarray, gain: float = 1.0) -> np.ndarray:

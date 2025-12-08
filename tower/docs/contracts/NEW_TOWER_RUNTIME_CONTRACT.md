@@ -70,6 +70,47 @@ Socket send return values **MUST** be validated (0 or error = disconnect).
 
 ---
 
+## TR-TIMING — MP3 Output Timing Requirements (Revised)
+
+### TR-TIMING1 — Frame-Driven Output
+TowerRuntime **MUST** broadcast MP3 frames immediately as they become available from EncoderManager. TowerRuntime **MUST NOT** synthesize or enforce a fixed MP3 cadence (e.g., sleeping 24ms).
+
+### TR-TIMING2 — No Independent MP3 Clock
+TowerRuntime **MUST NOT** create or maintain its own timing interval for MP3 output. Timing **MUST** be derived solely from upstream PCM cadence via: AudioPump → EncoderManager → FFmpegSupervisor → MP3 frame availability.
+
+### TR-TIMING3 — Bounded Wait
+If no MP3 frame becomes available within a bounded timeout (≤250ms), the broadcast loop **MUST** output a fallback MP3 frame (silence or tone) to prevent stalling.
+
+### TR-TIMING4 — Zero Drift Guarantee
+Broadcast timing **MUST** follow encoder-produced MP3 frames directly. Timing drift between PCM cadence and MP3 output **MUST** be impossible by design.
+
+---
+
+## TR-HTTP — HTTP Streaming Contract
+
+### TR-HTTP1 — Push-Based Streaming
+The /stream endpoint **MUST** deliver MP3 frames immediately upon receipt from the broadcast loop. The HTTP layer **MUST NOT** impose its own timing cadence.
+
+### TR-HTTP2 — Non-Blocking Writes
+Writing MP3 bytes to clients **MUST** be non-blocking. Slow clients **MUST NOT** block the broadcast loop or other clients.
+
+### TR-HTTP3 — Slow Client Disconnect
+Any client unable to accept data for >250ms **MUST** be disconnected.
+
+### TR-HTTP4 — Fanout Model
+All clients **MUST** receive bytes from the same MP3 frame source. Per-client state **MUST NOT** create additional timing paths.
+
+### TR-HTTP5 — No Timing Responsibilities
+The HTTP layer **MUST NOT**:
+
+- Sleep to enforce cadence
+- Estimate MP3 frame durations
+- Retry timing compensation
+
+It **MUST** simply forward frames as they arrive.
+
+---
+
 ## U. PCM Buffer Status / Backpressure Endpoint
 
 ### T7
@@ -124,7 +165,7 @@ Stats **MUST** originate from `AudioInputRouter.get_stats()`.
 ## TR-AIR — Audio Input Router Interface Requirements
 
 ### TR-AIR1
-TowerRuntime depends on an upstream PCM router ("AudioInputRouter") that supplies whole **4608-byte PCM frames**.
+TowerRuntime depends on an upstream PCM router ("AudioInputRouter") that supplies whole **4096-byte PCM frames** (canonical PCM frame size as defined in `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md`).
 
 ### TR-AIR2
 Partial frames **MUST** be discarded by the AudioInputRouter.
@@ -179,6 +220,7 @@ Startup order **MUST** be:
 4. Construct AudioPump
 5. Start FFmpegSupervisor
 6. Start HTTP server
+7. Start the frame-driven broadcast loop which retrieves MP3 frames from EncoderManager as they become available.
 
 ### T-ORDER2
 Shutdown **MUST** be reverse order.
@@ -212,6 +254,9 @@ TowerRuntime **MUST** rely on `EncoderManager`, `AudioPump`, and `FFmpegSupervis
 - Audio content selection
 - Tick timing
 - Encoding and process management
+
+### T13.5
+TowerRuntime **MUST NOT** implement MP3 timing, cadence enforcement, or synthetic frame intervals. Timing responsibilities belong exclusively to upstream PCM cadence.
 
 ---
 

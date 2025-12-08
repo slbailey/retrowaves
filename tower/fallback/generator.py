@@ -123,15 +123,22 @@ class FallbackGenerator:
         """
         Generate one frame of 440Hz sine tone.
         
+        Maintains phase continuity across frames by updating the persistent phase
+        accumulator once per frame (by step * 1024) rather than per sample.
+        
         Returns:
             bytes: PCM frame with sine wave data
         """
         frame_data = bytearray(FRAME_SIZE_BYTES)
         
-        # Generate samples using phase accumulator
+        # Use local phase variable starting from persistent phase accumulator
+        # This ensures continuity: the persistent phase is only updated once per frame
+        local_phase = self._phase
+        
+        # Generate samples using local phase (incremented per sample)
         for i in range(FRAME_SIZE_SAMPLES):
-            # Calculate sample value from current phase
-            sample_value = int(AMPLITUDE * math.sin(self._phase))
+            # Calculate sample value from current local phase
+            sample_value = int(AMPLITUDE * math.sin(local_phase))
             
             # Pack as s16le (signed 16-bit little-endian)
             # Write to both left and right channels (stereo)
@@ -144,12 +151,17 @@ class FallbackGenerator:
             # Write to right channel (same value for stereo)
             frame_data[offset + BYTES_PER_SAMPLE:offset + BYTES_PER_SAMPLE * 2] = sample_bytes
             
-            # Advance phase accumulator
-            self._phase += PHASE_INCREMENT
-            
-            # Wrap phase to prevent overflow (keep in [0, 2π) range)
-            if self._phase >= 2.0 * math.pi:
-                self._phase -= 2.0 * math.pi
+            # Advance local phase for next sample
+            local_phase += PHASE_INCREMENT
+        
+        # Update persistent phase accumulator once per frame (by step * 1024)
+        # This maintains phase continuity across frame boundaries
+        PHASE_INCREMENT_PER_FRAME = PHASE_INCREMENT * FRAME_SIZE_SAMPLES
+        self._phase += PHASE_INCREMENT_PER_FRAME
+        
+        # Wrap phase to prevent overflow (keep in [0, 2π) range)
+        # Use modulo for numerically stable wrapping
+        self._phase = self._phase % (2.0 * math.pi)
         
         return bytes(frame_data)
     

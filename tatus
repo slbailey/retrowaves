@@ -1,0 +1,36 @@
+[33mcommit d76610c04bee5111a3eb9e7d919e46f5c4b2f286[m[33m ([m[1;36mHEAD -> [m[1;32mmain[m[33m)[m
+Author: slbailey <slbailey@users.noreply.github.com>
+Date:   Mon Dec 8 07:40:53 2025 -0500
+
+    Add Clock A decode pacing metronome to Station subsystem
+    
+    - Implement Clock A (decode metronome) in PlayoutEngine to pace frame consumption at ~21.333ms per frame
+    - Ensures songs play at real duration (e.g., 200-second MP3 takes 200 seconds)
+    - Clock A is monotonic, wall-clock-fidelity, never observes Tower state
+    - Socket writes remain non-blocking and fire immediately (no pacing on writes)
+    
+    Contract updates:
+    - PLAYOUT_ENGINE_CONTRACT.md: Allow Clock A for decode pacing, explicitly forbid Tower-synchronized pacing
+    - STATION_TOWER_PCM_BRIDGE_CONTRACT.md: Document two-clock architecture (Clock A for decode, Clock B for broadcast)
+    - OUTPUT_SINK_CONTRACT.md: Clarify Clock A decode pacing vs Clock B broadcast timing
+    
+    Architecture updates:
+    - ARCHITECTURE_STATION.md: Document Clock A decode pacing rules
+    - ARCHITECTURE_DIAGRAM.md: Update diagram to show Clock A (decode metronome) and Clock B (Tower AudioPump)
+    
+    Invariants preserved:
+    - Tower still owns ALL broadcast timing (Clock B)
+    - Station never blocks Tower
+    - Station never interprets Tower timing
+    - Station never adjusts decode speed based on Tower behavior
+    - Station-to-Tower interface remains asynchronous, non-blocking, timing-agnostic
+    
+    All 95 station contract tests pass.
+
+ ARCHITECTURE_DIAGRAM.md                            | 115 [32m++++++++[m
+ ARCHITECTURE_STATION.md                            |  26 [32m+[m[31m-[m
+ station/broadcast_core/playout_engine.py           | 169 [32m+++[m[31m--------[m
+ station/docs/contracts/OUTPUT_SINK_CONTRACT.md     | 112 [32m++++++++[m
+ station/docs/contracts/PLAYOUT_ENGINE_CONTRACT.md  | 178 [32m++++++++++++[m
+ .../contracts/STATION_TOWER_PCM_BRIDGE_CONTRACT.md | 313 [32m+++++++++++++++++++++[m
+ 6 files changed, 778 insertions(+), 135 deletions(-)

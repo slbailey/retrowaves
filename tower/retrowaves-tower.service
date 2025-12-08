@@ -9,13 +9,19 @@ Type=simple
 User=retrowaves
 Group=retrowaves
 
+# Create runtime directory for Unix socket with proper permissions
+# This creates /run/retrowaves (or /var/run/retrowaves) owned by retrowaves:retrowaves
+RuntimeDirectory=retrowaves
+RuntimeDirectoryMode=0755
+
 # Tower lives in its own directory
 WorkingDirectory=/opt/retrowaves/tower
 
 # Ensure imports resolve correctly
 Environment="PYTHONPATH=/opt/retrowaves"
 
-# Optional environment overrides
+# Load environment variables from configuration file
+# The '-' prefix means the file is optional (won't fail if missing)
 EnvironmentFile=-/etc/retrowaves/tower.env
 
 # Correct venv path (same as Station)

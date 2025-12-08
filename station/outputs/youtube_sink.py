@@ -10,7 +10,7 @@ Architecture 3.1 Reference:
 import logging
 from typing import Iterator, Optional
 
-from outputs.sink_base import SinkBase
+from station.outputs.sink_base import SinkBase
 
 logger = logging.getLogger(__name__)
 

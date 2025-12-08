@@ -68,10 +68,11 @@ class TowerService:
         
         # Create HTTP server (manages its own connection manager internally)
         # Pass PCM buffer as buffer_stats_provider for /tower/buffer endpoint per contract T-BUF5
-        # Port is configurable via TOWER_PORT env var, defaults to 8005 to match Station's expectation
+        # Host and port are configurable via TOWER_HOST and TOWER_PORT env vars
+        http_host = os.getenv("TOWER_HOST", "0.0.0.0")
         http_port = int(os.getenv("TOWER_PORT", "8005"))
         self.http_server = HTTPServer(
-            host="0.0.0.0", 
+            host=http_host, 
             port=http_port, 
             frame_source=self.encoder,
             buffer_stats_provider=self.pcm_buffer  # PCM buffer has .stats() method
@@ -80,7 +81,7 @@ class TowerService:
         # Create PCM Ingestion subsystem
         # Per contract I43: Deliver to same upstream buffer AudioPump reads from
         # Per contract I12-I16: Transport is implementation-defined (Unix socket)
-        socket_path = os.getenv("TOWER_PCM_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
+        socket_path = os.getenv("TOWER_PCM_SOCKET_PATH", "/run/retrowaves/pcm.sock")
         transport = UnixSocketIngestTransport(socket_path)
         self.pcm_ingestor = PCMIngestor(
             upstream_buffer=self.pcm_buffer,  # Same buffer AudioPump reads from
@@ -126,49 +127,34 @@ class TowerService:
 
     def main_loop(self):
         """
-        Main broadcast loop with MP3 frame-rate pacing.
-        
-        Per contract [I23]: HTTP broadcast MUST run on a wall-clock interval tick 
-        (default 24ms pacing), NOT only when new frames are available. 
-        Lack of frames MUST NOT stall transmission.
-        
-        Per contract [I24]: During encoder restart, HTTP broadcast MUST continue 
-        uninterrupted using existing MP3 buffer frames or fallback frames. 
-        Restart events MUST NOT stop streaming.
+        Main broadcast loop — frame-driven, no synthetic timing.
+
+        Per TR-TIMING1–4: 
+        - Broadcast MP3 frames immediately when available.
+        - No independent timing.
+        - Bounded wait handled by EncoderManager.
+        - No drift possible.
+
+        Per TR-HTTP5:
+        - HTTP layer must not sleep, time, or estimate cadence.
+        - TowerRuntime simply forwards whatever frames it receives.
         """
-        logger.info("Main broadcast loop started")
-        # Audio math for 128kbps MP3:
-        # 128000 bits/sec = 16000 bytes/sec
-        # typical frame = 417 bytes
-        # 41 frames/sec → 24ms spacing
-        FRAME_INTERVAL = 0.024  # real MP3 frame clock per [I23]
-        
-        count = 0
+        logger.info("Main broadcast loop started (frame-driven, no synthetic timing)")
+
         while self.running:
+            # EncoderManager is the ONLY authoritative source of MP3 frames.
+            # TowerRuntime must not pass timeout - EncoderManager handles all timing internally.
             frame = self.encoder.get_frame()
-            
-            # Per contract [O2.1], broadcast MUST begin instantly on cold start
-            # get_frame() now always returns frames (silence during BOOTING/COLD_START, real frames during LIVE_INPUT)
-            # Never returns None per [O9] (continuous output requirement)
-            # Per contract [I24]: Handle None gracefully to ensure broadcast continues during restart
+
             if frame is None:
-                # Should not happen per [O9], but handle gracefully per [I24]
-                logger.warning("get_frame() returned None - using silence frame")
-                frame = self.encoder._silence_frame
-            
-            # Buffer stats tracking (demoted to DEBUG - not contract-required)
-            mp3_buffer = self.encoder.mp3_buffer
-            if len(mp3_buffer) > 0 and count % 500 == 0:
-                stats = mp3_buffer.stats()
-                # Estimate bytes: typical MP3 frame is ~417 bytes at 128kbps
-                estimated_bytes = stats.count * 417
-                logger.debug(f"MP3 buffer size: {stats.count} frames, ~{estimated_bytes} bytes")
-            
+                # This should never occur per contract, but handle defensively.
+                # Do NOT call fallback directly - fallback is handled inside get_frame().
+                # On next iteration, get_frame() will produce fallback itself.
+                logger.error("EncoderManager returned None — violating contract. Retrying...")
+                continue
+
+            # Broadcast immediately — no sleeps, no pacing, no timing window.
             self.http_server.broadcast(frame)
-            count += 1
-            # Per contract [I23]: Sleep unconditionally on every iteration to ensure
-            # clock-driven pacing regardless of frame availability
-            time.sleep(FRAME_INTERVAL)
 
     def run_forever(self):
         """Block forever like systemd would."""

@@ -6,6 +6,7 @@ Allows testing without Station, so fallback tone → MP3 chain can be validated.
 """
 import logging
 import os
+import sys
 
 # Set default log level from environment, or INFO if not set
 # Use DEBUG only if explicitly requested: LOG_LEVEL=DEBUG python run_tower_dev.py
@@ -27,6 +28,13 @@ if log_level == "DEBUG":
 from tower.service import TowerService
 
 if __name__ == "__main__":
-    tower = TowerService()
-    tower.start()
-    tower.run_forever()
+    try:
+        tower = TowerService()
+        tower.start()
+        tower.run_forever()
+    except KeyboardInterrupt:
+        logging.info("Tower shutdown requested")
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Tower failed to start: {e}", exc_info=True)
+        sys.exit(1)

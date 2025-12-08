@@ -9,6 +9,6 @@ Architecture 3.1 Reference:
 """
 
 # AudioEvent is imported from audio_event module
-from broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.audio_event import AudioEvent
 
 __all__ = ["AudioEvent"]

@@ -42,8 +42,8 @@ If upstream PCM is not yet available, EncoderManager **MUST** return fallback PC
 Fallback PCM **MUST** fully conform to EncoderManager's PCM format contract, including:
 - Sample rate (48,000 Hz)
 - Channel count (2 channels, stereo)
-- Bytes per frame (4608 bytes)
-- Frame cadence expectations (24ms intervals)
+- Bytes per frame (4096 bytes)
+- Frame cadence expectations: one frame per tick, where tick duration is defined by `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md` (currently ≈21.333ms)
 
 EncoderManager defines the PCM shape. FallbackProvider only supplies it.
 
@@ -66,7 +66,7 @@ FallbackProvider **MUST**:
 - **Prefer 440Hz tone** over silence whenever possible
 - Use silence only if tone generation is not possible for any reason
 
-"Zero latency" is a conceptual requirement meaning the operation must be very fast, non-blocking, and deterministic. The actual timing may vary based on system load, but the operation must never block and must complete quickly enough to support real-time playout at 24ms tick intervals.
+"Zero latency" is a conceptual requirement meaning the operation must be very fast, non-blocking, and deterministic. The actual timing may vary based on system load, but the operation must never block and must complete quickly enough to support real-time playout at 21.333ms tick intervals (PCM cadence).
 
 This supports real-time playout and ensures continuous, audible fallback audio (tone) rather than silence whenever feasible.
 

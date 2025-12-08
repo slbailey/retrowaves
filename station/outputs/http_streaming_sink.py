@@ -13,8 +13,8 @@ from typing import Optional
 
 import numpy as np
 
-from outputs.base_sink import BaseSink
-from outputs.http_connection_manager import HTTPConnectionManager
+from station.outputs.base_sink import BaseSink
+from station.outputs.http_connection_manager import HTTPConnectionManager
 
 logger = logging.getLogger(__name__)
 

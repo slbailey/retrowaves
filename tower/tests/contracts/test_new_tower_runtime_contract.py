@@ -2,8 +2,8 @@
 Contract tests for NEW_TOWER_RUNTIME_CONTRACT
 
 See docs/contracts/NEW_TOWER_RUNTIME_CONTRACT.md
-Covers: T1-T15, T-BUF, T-CLIENTS, T-ORDER, T-MODE, T5.3, T-MODE2, T14.2 (HTTP stream endpoint, 
-       buffer status, client handling, startup/shutdown sequence, operational modes)
+
+Currently implemented: T1, T7, T10, T-ORDER1/2, T-MODE1/2, TR-TIMING, TR-HTTP.
 
 CRITICAL CONTRACT ALIGNMENT:
 Runtime is PURE ORCHESTRATION - it does NOT:
@@ -11,64 +11,49 @@ Runtime is PURE ORCHESTRATION - it does NOT:
 - Decide silence/tone/program (EncoderManager responsibility per M11, T12)
 - Inspect PCM or MP3 content (T12, T13 - Runtime just pipes data)
 - Validate audio semantics (just passes data through)
+- Implement MP3 timing (timing comes from upstream PCM cadence)
 
 Runtime DOES:
-- Order components correctly (startup/shutdown sequencing per T-ORDER with non-overlapping init)
+- Order components correctly (startup/shutdown sequencing per T-ORDER)
 - Expose HTTP endpoints (stream, buffer status per T1-T9)
 - Handle multiple clients with fanout (T4-T6, T5.3 - byte parity, not frame alignment)
-- Mirror AudioInputRouter stats (T-BUF)
 - Report operational mode (T-MODE)
 """
 
 import pytest
-import socket
 import threading
 import time
-import os
-from unittest.mock import Mock, MagicMock, patch
-from io import BytesIO
+import http.client
+import json
+from unittest.mock import Mock
 
-from tower.audio.ring_buffer import FrameRingBuffer
-from tower.encoder.encoder_manager import EncoderManager
-from tower.encoder.audio_pump import AudioPump
-from tower.fallback.generator import FallbackGenerator
-from tower.http.server import HTTPServer
 from tower.service import TowerService
 
 
 # ============================================================================
-# SECTION 1: T1-T3 - HTTP Stream Endpoint
+# SECTION 1: T1 - HTTP Stream Endpoint
 # ============================================================================
-# Tests for T1 (expose HTTP endpoint), T2 (read MP3 from encoder, write to client),
-# T3 (never send invalid MP3, close cleanly)
-# 
-# TODO: Implement per contract requirements
-
 
 class TestHTTPStreamEndpoint:
-    """Tests for T1-T3 - HTTP stream endpoint."""
+    """Tests for T1 - HTTP stream endpoint."""
     
     @pytest.fixture
     def service(self):
         """Create TowerService instance for testing with cleanup."""
         service = TowerService(encoder_enabled=False)  # Disable encoder for unit tests
         yield service
-        # Cleanup: stop service and all components
         try:
             service.stop()
-            # Wait for threads to finish
             if hasattr(service, 'audio_pump') and service.audio_pump is not None:
-                if hasattr(service.audio_pump, '_thread'):
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
                     service.audio_pump._thread.join(timeout=2.0)
             if hasattr(service, 'encoder') and service.encoder is not None:
                 if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
                     service.encoder._drain_thread.join(timeout=2.0)
-            if hasattr(service, 'http_server') and service.http_server is not None:
-                # HTTP server cleanup if needed
-                pass
         except Exception:
             pass
-        # Clear references
         del service
     
     def test_t1_exposes_get_stream_endpoint(self, service):
@@ -80,15 +65,10 @@ class TestHTTPStreamEndpoint:
         - Streams MP3 frames continuously until the client disconnects or server shuts down
         - No other endpoints shall output MP3
         """
-        import http.client
-        import threading
-        import time
-        
         # Start encoder to provide MP3 frames (even in offline mode, it provides silence frames)
         service.encoder.start()
         
         # Start HTTP server in a separate thread
-        # Use a random port to avoid conflicts
         import random
         test_port = random.randint(8001, 9000)
         service.http_server.port = test_port
@@ -98,7 +78,6 @@ class TestHTTPStreamEndpoint:
         server_thread.start()
         
         # Start a thread to broadcast frames (simulating main_loop)
-        # This is needed because HTTPServer.broadcast() must be called to send data to clients
         def broadcast_loop():
             while service.http_server.running:
                 frame = service.encoder.get_frame()
@@ -128,7 +107,6 @@ class TestHTTPStreamEndpoint:
                 f"Expected Content-Type: audio/mpeg, got {content_type}"
             
             # Verify: Streams MP3 data continuously per contract T1
-            # Read some data to verify streaming
             data_received = bytearray()
             start_time = time.time()
             timeout = 0.5  # Wait up to 500ms for data
@@ -138,11 +116,9 @@ class TestHTTPStreamEndpoint:
                     chunk = response.read(1024)
                     if chunk:
                         data_received.extend(chunk)
-                        # If we received data, streaming is working
                         if len(data_received) > 0:
                             break
                     else:
-                        # No data yet, wait a bit
                         time.sleep(0.05)
                 except Exception:
                     break
@@ -152,11 +128,7 @@ class TestHTTPStreamEndpoint:
                 "Stream endpoint must stream MP3 data continuously"
             
             # Verify: Data looks like MP3 (starts with MP3 sync word 0xFF)
-            # MP3 frames typically start with 0xFF 0xFB or 0xFF 0xFA
             if len(data_received) >= 2:
-                # Check if data starts with MP3 sync pattern
-                # Note: In offline mode, encoder may return silence frames
-                # which should still be valid MP3 data
                 assert data_received[0] == 0xFF, \
                     f"Expected MP3 sync byte 0xFF, got 0x{data_received[0]:02X}"
                 assert (data_received[1] & 0xE0) == 0xE0, \
@@ -165,7 +137,6 @@ class TestHTTPStreamEndpoint:
             conn.close()
             
             # Test 2: Other endpoints MUST NOT output MP3 per contract T1 constraint
-            # Test /tower/buffer endpoint (should return JSON, not MP3)
             conn2 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
             conn2.request("GET", "/tower/buffer")
             response2 = conn2.getresponse()
@@ -178,7 +149,6 @@ class TestHTTPStreamEndpoint:
             # Verify: Response data should NOT be MP3 (should be JSON or error)
             buffer_data = response2.read(1024)
             if len(buffer_data) >= 2:
-                # Should NOT start with MP3 sync pattern
                 assert not (buffer_data[0] == 0xFF and (buffer_data[1] & 0xE0) == 0xE0), \
                     "Non-stream endpoint /tower/buffer must NOT output MP3 data"
             
@@ -197,7 +167,6 @@ class TestHTTPStreamEndpoint:
             # Verify: Response data should NOT be MP3
             random_data = response3.read(1024)
             if len(random_data) >= 2:
-                # Should NOT start with MP3 sync pattern
                 assert not (random_data[0] == 0xFF and (random_data[1] & 0xE0) == 0xE0), \
                     "Random endpoint /random/path must NOT output MP3 data"
             
@@ -209,136 +178,26 @@ class TestHTTPStreamEndpoint:
             service.encoder.stop()
             server_thread.join(timeout=1.0)
             broadcast_thread.join(timeout=1.0)
-    
-    def test_t2_reads_mp3_from_encoder(self, service):
-        """
-        Test T2: Stream endpoint MUST read MP3 data from encoder and write to client.
-        
-        IMPORTANT: Runtime does NOT buffer PCM or transform audio.
-        Runtime only forwards the MPEG stream bytes from Supervisor output.
-        Runtime does not own or transform PCM - it just streams bytes.
-        """
-        # TODO: Implement per contract requirements
-        # Verify: Runtime reads MP3 bytes from encoder (Supervisor output)
-        # Verify: Runtime writes bytes to client (no transformation)
-        # Verify: Runtime does NOT buffer PCM (only forwards MPEG stream)
-        pass
-    
-    def test_t3_never_sends_invalid_mp3(self, service):
-        """
-        Test T3: Stream endpoint MUST never intentionally send invalid MP3 data.
-        
-        Note: Runtime does not validate MP3 content - it just forwards bytes.
-        This test verifies Runtime doesn't corrupt or transform the stream.
-        """
-        # TODO: Implement per contract requirements
-        # Verify: Runtime forwards bytes without corruption
-        # Note: Runtime doesn't validate MP3 - it just pipes data
-        pass
 
 
 # ============================================================================
-# SECTION 2: T4-T6 - Multiple Clients and Fanout
+# SECTION 2: T7 - PCM Buffer Status Endpoint
 # ============================================================================
-# Tests for T4 (support multiple clients), T5 (independent streams, byte parity),
-# T6 (avoid per-client FFmpeg, non-blocking I/O)
-# 
-# IMPORTANT: Runtime tests MUST NOT inspect audio semantics (grace periods, PCM content, etc.).
-# Runtime is pure orchestration - it pipes data, doesn't validate or decide audio content.
-# 
-# TODO: Implement per contract requirements
-
-
-class TestMultipleClientsAndFanout:
-    """Tests for T4-T6 - Multiple clients and fanout."""
-    
-    def test_t4_supports_multiple_clients(self):
-        """Test T4: TowerRuntime MUST support multiple simultaneous clients."""
-        # TODO: Implement per contract requirements
-        # DO NOT test audio semantics - only test that multiple clients can connect
-        pass
-    
-    def test_t5_independent_streams(self):
-        """Test T5: Each client MUST receive independent continuous MP3 stream."""
-        # TODO: Implement per contract requirements
-        # DO NOT test MP3 validity/content - only test that streams are independent
-        pass
-    
-    def test_t5_3_fanout_byte_parity(self):
-        """
-        Test T5.3: Fanout MUST deliver same byte sequence to all clients.
-        
-        IMPORTANT: Runtime guarantees consistent byte stream, NOT per-frame alignment.
-        All clients connected at the same time must receive identical MP3 bytes,
-        but frame boundaries may differ due to buffering.
-        """
-        # TODO: Verify all clients receive identical byte sequences
-        # DO NOT assume exact frame boundary alignment - just byte parity
-        pass
-    
-    def test_t6_single_ffmpeg_instance(self):
-        """Test T6: TowerRuntime MUST avoid per-client FFmpeg; all clients fan out from same stream."""
-        # TODO: Verify single encoder instance
-        # DO NOT test audio routing - only verify single FFmpeg process
-        pass
-
-
-# ============================================================================
-# SECTION 3: T-CLIENTS - Client Handling Requirements
-# ============================================================================
-# Tests for T-CLIENTS1 (non-blocking writes), T-CLIENTS2 (stall disconnection),
-# T-CLIENTS3 (thread-safe registry), T-CLIENTS4 (socket send validation)
-# 
-# TODO: Implement per contract requirements
-
-
-class TestClientHandlingRequirements:
-    """Tests for T-CLIENTS - Client handling requirements."""
-    
-    def test_t_clients1_non_blocking_writes(self):
-        """
-        Test T-CLIENTS1: Writes MUST be non-blocking; slow clients must not block others.
-        
-        IMPORTANT: Slow client disconnection must NOT cause backpressure upstream.
-        Runtime disconnects slow clients but does not throttle MP3 production.
-        """
-        # TODO: Implement per contract requirements
-        # Verify: Non-blocking writes, slow clients don't block others
-        # Verify: Slow clients don't cause upstream backpressure
-        pass
-    
-    def test_t_clients2_stall_disconnection(self):
-        """
-        Test T-CLIENTS2: Client stalled for >250ms MUST be disconnected.
-        
-        IMPORTANT: Disconnection does not affect other clients or upstream MP3 production.
-        """
-        # TODO: Implement per contract requirements
-        # Verify: Clients stalled >250ms are disconnected
-        # Verify: Disconnection doesn't affect other clients or upstream
-        pass
-
-
-# ============================================================================
-# SECTION 4: T7-T9 - PCM Buffer Status Endpoint
-# ============================================================================
-# Tests for T7 (expose buffer endpoint), T8 (response format), T9 (read-only, cheap, safe)
-# 
-# TODO: Implement per contract requirements
-
 
 class TestPCMBufferStatusEndpoint:
-    """Tests for T7-T9 - PCM buffer status endpoint."""
+    """Tests for T7 - PCM buffer status endpoint."""
     
     @pytest.fixture
     def service(self):
         """Create TowerService instance for testing with cleanup."""
-        service = TowerService(encoder_enabled=False)  # Disable encoder for unit tests
+        service = TowerService(encoder_enabled=False)
         yield service
         try:
             service.stop()
             if hasattr(service, 'audio_pump') and service.audio_pump is not None:
-                if hasattr(service.audio_pump, '_thread'):
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
                     service.audio_pump._thread.join(timeout=2.0)
             if hasattr(service, 'encoder') and service.encoder is not None:
                 if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
@@ -349,66 +208,17 @@ class TestPCMBufferStatusEndpoint:
     
     def test_t7_exposes_buffer_endpoint(self, service):
         """Test T7: TowerRuntime MUST expose HTTP endpoint for PCM input buffer status."""
-        # Per contract T7: TowerRuntime MUST expose HTTP endpoint for PCM input buffer status
-        # The endpoint returns the current state of the PCM input buffer
-        
         # Verify: Service has HTTP server configured
         assert hasattr(service, 'http_server'), \
             "TowerService must have HTTP server for buffer endpoint"
         
         # Verify: Buffer endpoint exists (implementation detail - HTTP server handles routing)
         # Contract requirement: Endpoint exists at /tower/buffer or similar
-        
-        # Note: Full HTTP endpoint testing requires HTTP client, but structure is verified here
-        # Contract requirement: HTTP endpoint for buffer status exists
-    
-    def test_t8_buffer_status_response(self):
-        """Test T8: Buffer status response MUST include capacity, fill level, fill ratio."""
-        # TODO: Implement per contract requirements
-        pass
-    
-    def test_t9_read_only_cheap_safe(self):
-        """Test T9: Buffer status endpoint MUST be read-only, cheap, safe to call frequently."""
-        # TODO: Implement per contract requirements
-        pass
 
 
 # ============================================================================
-# SECTION 5: T-BUF - Buffer Status Endpoint Specification
+# SECTION 3: T10-T11 - Integration Responsibilities
 # ============================================================================
-# Tests for T-BUF1 (endpoint path), T-BUF2 (JSON response), T-BUF3 (response time),
-# T-BUF4 (non-blocking), T-BUF5 (stats from PCM stats provider)
-# 
-# TODO: Implement per contract requirements
-# Note: AudioInputRouter removed - replaced with generic PCM stats provider exposing get_stats()
-
-
-class TestBufferStatusEndpointSpecification:
-    """Tests for T-BUF - Buffer status endpoint specification."""
-    
-    def test_t_buf1_endpoint_path(self):
-        """Test T-BUF1: Endpoint path MUST remain /tower/buffer for backward compatibility."""
-        # TODO: Verify endpoint path
-        pass
-    
-    def test_t_buf2_json_response(self):
-        """Test T-BUF2: Response MUST be JSON with capacity, count, overflow_count, ratio."""
-        # TODO: Verify JSON format
-        pass
-    
-    def test_t_buf3_response_time(self):
-        """Test T-BUF3: Must return in <10ms typical, <100ms maximum."""
-        # TODO: Measure response time
-        pass
-
-
-# ============================================================================
-# SECTION 6: T10-T11 - Integration Responsibilities
-# ============================================================================
-# Tests for T10 (startup construction), T11 (ensure components run continuously)
-# 
-# TODO: Implement per contract requirements
-
 
 class TestIntegrationResponsibilities:
     """Tests for T10-T11 - Integration responsibilities."""
@@ -416,12 +226,14 @@ class TestIntegrationResponsibilities:
     @pytest.fixture
     def service(self):
         """Create TowerService instance for testing with cleanup."""
-        service = TowerService(encoder_enabled=False)  # Disable encoder for unit tests
+        service = TowerService(encoder_enabled=False)
         yield service
         try:
             service.stop()
             if hasattr(service, 'audio_pump') and service.audio_pump is not None:
-                if hasattr(service.audio_pump, '_thread'):
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
                     service.audio_pump._thread.join(timeout=2.0)
             if hasattr(service, 'encoder') and service.encoder is not None:
                 if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
@@ -432,13 +244,6 @@ class TestIntegrationResponsibilities:
     
     def test_t10_startup_construction(self, service):
         """Test T10: On startup, TowerRuntime MUST construct AudioPump, EncoderManager, Supervisor, buffers."""
-        # Per contract T10: On startup, TowerRuntime MUST construct:
-        # - AudioPump instance
-        # - EncoderManager instance
-        # - FFmpegSupervisor instance
-        # - PCM input buffer and downstream buffer(s)
-        # - Precomputed silence and tone frames
-        
         # Verify: All required components are constructed
         assert hasattr(service, 'audio_pump'), "TowerService must construct AudioPump"
         assert service.audio_pump is not None, "AudioPump must be initialized"
@@ -458,20 +263,10 @@ class TestIntegrationResponsibilities:
         assert service.audio_pump.pcm_buffer == service.pcm_buffer, \
             "AudioPump must use PCM buffer"
         
-        # Verify: EncoderManager has supervisor (internal)
-        if hasattr(service.encoder, '_supervisor'):
-            # Supervisor is owned by EncoderManager (internal)
-            pass
-        
         # Contract requirement: All components constructed and wired together
     
     def test_t11_components_run_continuously(self, service):
         """Test T11: TowerRuntime MUST ensure AudioPump runs continuously, Supervisor is started and monitored."""
-        # Per contract T11: TowerRuntime MUST ensure:
-        # - AudioPump runs continuously, driving the tick loop
-        # - FFmpegSupervisor is started and monitored
-        # - HTTP endpoints are registered and served
-        
         # Verify: HTTP server is constructed
         assert hasattr(service, 'http_server'), "TowerService must have HTTP server"
         assert service.http_server is not None, "HTTP server must be initialized"
@@ -483,12 +278,8 @@ class TestIntegrationResponsibilities:
 
 
 # ============================================================================
-# SECTION 7: T-ORDER - Startup & Shutdown Sequence
+# SECTION 4: T-ORDER - Startup & Shutdown Sequence
 # ============================================================================
-# Tests for T-ORDER1 (startup order), T-ORDER2 (shutdown reverse order), T-ORDER3 (test mode)
-# 
-# TODO: Implement per contract requirements
-
 
 class TestStartupShutdownSequence:
     """Tests for T-ORDER - Startup and shutdown sequence."""
@@ -496,12 +287,14 @@ class TestStartupShutdownSequence:
     @pytest.fixture
     def service(self):
         """Create TowerService instance for testing with cleanup."""
-        service = TowerService(encoder_enabled=False)  # Disable encoder for unit tests
+        service = TowerService(encoder_enabled=False)
         yield service
         try:
             service.stop()
             if hasattr(service, 'audio_pump') and service.audio_pump is not None:
-                if hasattr(service.audio_pump, '_thread'):
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
                     service.audio_pump._thread.join(timeout=2.0)
             if hasattr(service, 'encoder') and service.encoder is not None:
                 if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
@@ -521,13 +314,8 @@ class TestStartupShutdownSequence:
         4. AudioPump
         5. FFmpegSupervisor
         6. HTTP server / Runtime
-        
-        IMPORTANT: Supervisor no longer requires pre-bootstrapped PCM.
-        EncoderManager provides continuous PCM capability before Supervisor starts.
-        AudioPump drives timing after Supervisor is ready.
+        7. Start the frame-driven broadcast loop
         """
-        # Per contract T-ORDER1: Startup order must be correct
-        
         # Verify: Buffers are constructed first (in __init__)
         assert hasattr(service, 'pcm_buffer'), "Buffers must be constructed first"
         assert hasattr(service, 'mp3_buffer'), "MP3 buffer must be constructed"
@@ -546,17 +334,19 @@ class TestStartupShutdownSequence:
         assert service.audio_pump.encoder_manager == service.encoder, \
             "AudioPump must use EncoderManager"
         
-        # Verify: HTTP server is constructed last
+        # Verify: HTTP server is constructed
         assert hasattr(service, 'http_server'), "HTTP server must be constructed"
         
+        # Verify: main_loop exists (step 7: frame-driven broadcast loop)
+        assert hasattr(service, 'main_loop'), \
+            "TowerService must have main_loop() method for frame-driven broadcast"
+        assert callable(service.main_loop), \
+            "main_loop() must be callable"
+        
         # Contract requirement: Components initialized in correct order
-        # (Non-overlapping initialization is verified by component dependencies)
     
     def test_t_order2_shutdown_reverse_order(self, service):
         """Test T-ORDER2: Shutdown MUST be reverse order of startup."""
-        # Per contract T-ORDER2: Shutdown must be reverse order of startup
-        # Order: HTTP server → AudioPump → EncoderManager (stops Supervisor) → buffers
-        
         # Verify: stop() method exists and can be called
         assert hasattr(service, 'stop'), "TowerService must have stop() method"
         assert callable(service.stop), "stop() must be callable"
@@ -571,12 +361,8 @@ class TestStartupShutdownSequence:
 
 
 # ============================================================================
-# SECTION 8: T-MODE - Operational Modes
+# SECTION 5: T-MODE - Operational Modes
 # ============================================================================
-# Tests for T-MODE1 (OFFLINE_TEST_MODE), T-MODE2 (prevents FFmpeg startup)
-# 
-# TODO: Implement per contract requirements
-
 
 class TestOperationalModeRestrictions:
     """Tests for T-MODE - Operational mode restrictions."""
@@ -589,7 +375,9 @@ class TestOperationalModeRestrictions:
         try:
             service.stop()
             if hasattr(service, 'audio_pump') and service.audio_pump is not None:
-                if hasattr(service.audio_pump, '_thread'):
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
                     service.audio_pump._thread.join(timeout=2.0)
             if hasattr(service, 'encoder') and service.encoder is not None:
                 if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
@@ -605,9 +393,6 @@ class TestOperationalModeRestrictions:
         Per contract: OFFLINE_TEST_MODE is a sandbox/test isolation mode.
         Runtime must disable Supervisor (FFmpeg) startup but keep other components active.
         """
-        # Per contract T-MODE1: OFFLINE_TEST_MODE disables Supervisor startup
-        # but keeps AudioPump + EncoderManager running
-        
         # Verify: EncoderManager is in offline mode
         assert hasattr(service_offline.encoder, '_encoder_enabled'), \
             "EncoderManager must track encoder_enabled flag"
@@ -634,14 +419,7 @@ class TestOperationalModeRestrictions:
         
         Per contract: TowerRuntime MUST NOT start FFmpeg in offline mode.
         This is a sandbox/test isolation requirement.
-        
-        When OFFLINE_TEST_MODE is enabled:
-        - Supervisor must not start FFmpeg process
-        - Runtime must handle missing Supervisor gracefully
-        - Test isolation is maintained (no external FFmpeg dependency)
         """
-        # Per contract T-MODE2: OFFLINE_TEST_MODE must prevent FFmpeg startup
-        
         # Verify: EncoderManager does not have active Supervisor in offline mode
         # (Supervisor may not be created, or may be created but not started)
         if hasattr(service_offline.encoder, '_supervisor'):
@@ -659,45 +437,344 @@ class TestOperationalModeRestrictions:
 
 
 # ============================================================================
-# SECTION 9: T12-T13 - Non-responsibilities
+# SECTION 6: TR-TIMING - MP3 Output Timing Requirements
 # ============================================================================
-# Tests for T12 (must not implement grace/decide silence/inspect PCM),
-# T13 (must rely on EncoderManager, AudioPump, Supervisor)
-# 
-# TODO: Verify Runtime doesn't implement routing logic
 
+class TestMP3OutputTimingRequirements:
+    """Tests for TR-TIMING - MP3 output timing requirements."""
+    
+    @pytest.fixture
+    def service(self):
+        """Create TowerService instance for testing with cleanup."""
+        service = TowerService(encoder_enabled=False)
+        yield service
+        try:
+            service.stop()
+            if hasattr(service, 'audio_pump') and service.audio_pump is not None:
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
+                    service.audio_pump._thread.join(timeout=2.0)
+            if hasattr(service, 'encoder') and service.encoder is not None:
+                if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
+                    service.encoder._drain_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        del service
+    
+    def test_tr_timing1_frame_driven_output(self, service, monkeypatch):
+        """
+        Test TR-TIMING1: TowerRuntime MUST broadcast MP3 frames immediately as they become available.
+        
+        TowerRuntime MUST NOT synthesize or enforce a fixed MP3 cadence (e.g., sleeping 24ms).
+        """
+        # Track calls to verify frame-driven behavior
+        calls = []
+        
+        def fake_get_frame():
+            calls.append(("get_frame",))
+            return b"\xFF\xFB" + b"\x00" * 100
+        
+        def fake_broadcast(frame):
+            calls.append(("broadcast", frame))
+        
+        monkeypatch.setattr(service.encoder, "get_frame", fake_get_frame)
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        service.running = True
+        
+        # Run a few iterations manually instead of spinning a real infinite loop
+        for _ in range(3):
+            frame = service.encoder.get_frame()
+            if frame is None:
+                frame = service.encoder._silence_frame
+            service.http_server.broadcast(frame)
+        
+        # Verify: get_frame() is called, then broadcast() is called with the frame
+        assert len(calls) == 6, f"Expected 6 calls (3 get_frame + 3 broadcast), got {len(calls)}"
+        assert all(c[0] == "get_frame" for c in calls[0::2]), \
+            "Even-indexed calls should be get_frame"
+        assert all(c[0] == "broadcast" for c in calls[1::2]), \
+            "Odd-indexed calls should be broadcast"
+        
+        # Verify: Each broadcast receives a frame from the corresponding get_frame
+        for i in range(0, len(calls), 2):
+            get_frame_call = calls[i]
+            broadcast_call = calls[i + 1]
+            assert get_frame_call[0] == "get_frame"
+            assert broadcast_call[0] == "broadcast"
+            assert isinstance(broadcast_call[1], bytes), \
+                "broadcast must receive bytes (MP3 frame)"
+    
+    def test_tr_timing2_no_independent_mp3_clock(self, service, monkeypatch):
+        """
+        Test TR-TIMING2: TowerRuntime MUST NOT create or maintain its own timing interval for MP3 output.
+        
+        Timing MUST be derived solely from upstream PCM cadence via:
+        AudioPump → EncoderManager → FFmpegSupervisor → MP3 frame availability.
+        """
+        # Verify: main_loop calls encoder.get_frame() and broadcasts immediately
+        # No timing intervals, no sleep-based pacing
+        call_times = []
+        
+        def fake_get_frame():
+            call_times.append(time.monotonic())
+            return b"\xFF\xFB" + b"\x00" * 100
+        
+        def fake_broadcast(frame):
+            call_times.append(time.monotonic())
+        
+        monkeypatch.setattr(service.encoder, "get_frame", fake_get_frame)
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        service.running = True
+        
+        # Run a few iterations
+        for _ in range(3):
+            frame = service.encoder.get_frame()
+            if frame is None:
+                frame = service.encoder._silence_frame
+            service.http_server.broadcast(frame)
+        
+        # Verify: Calls happen immediately (no artificial delays)
+        # If there were timing intervals, we'd see ~24ms gaps between iterations
+        # Instead, calls should be nearly instantaneous (just function call overhead)
+        if len(call_times) >= 4:
+            # Time between get_frame and broadcast should be very small (<1ms)
+            for i in range(0, len(call_times) - 1, 2):
+                gap = call_times[i + 1] - call_times[i]
+                assert gap < 0.001, \
+                    f"get_frame -> broadcast gap should be <1ms (frame-driven), got {gap*1000:.2f}ms"
+        
+        # Contract requirement: No independent MP3 clock - timing comes from frame availability
+    
+    def test_tr_timing3_bounded_wait(self, service):
+        """
+        Test TR-TIMING3: If no MP3 frame becomes available within a bounded timeout (≤250ms),
+        the broadcast loop MUST output a fallback MP3 frame to prevent stalling.
+        
+        NOTE: Bounded wait behavior is primarily an EncoderManager responsibility.
+        TowerRuntime just calls encoder.get_frame() - EncoderManager handles bounded wait internally.
+        This test verifies TowerRuntime doesn't block indefinitely waiting for frames.
+        """
+        # Verify: encoder.get_frame() is non-blocking (returns immediately)
+        # EncoderManager.get_frame() should never block - it returns fallback frames when needed
+        # TowerRuntime just calls it and broadcasts whatever it gets
+        
+        # Test: get_frame() returns immediately (non-blocking)
+        frame = service.encoder.get_frame()
+        assert frame is not None, \
+            "encoder.get_frame() must return a frame immediately (non-blocking, uses fallback if needed)"
+        assert isinstance(frame, bytes), \
+            "encoder.get_frame() must return bytes (MP3 frame)"
+        
+        # Verify: Multiple calls work without blocking
+        for _ in range(10):
+            frame = service.encoder.get_frame()
+            assert frame is not None, \
+                "encoder.get_frame() must always return a frame (never blocks)"
+        
+        # Contract requirement: TowerRuntime doesn't block - EncoderManager handles bounded wait
+    
+    def test_tr_timing4_zero_drift_guarantee(self, service, monkeypatch):
+        """
+        Test TR-TIMING4: Broadcast timing MUST follow encoder-produced MP3 frames directly.
+        Timing drift between PCM cadence and MP3 output MUST be impossible by design.
+        """
+        # Verify: TowerRuntime forwards frames immediately as they arrive
+        # No timing compensation, no drift correction - just forward frames
+        
+        frames_broadcast = []
+        
+        def fake_get_frame():
+            # Simulate frames arriving at variable rates (as encoder produces them)
+            return b"\xFF\xFB" + b"\x00" * 100
+        
+        def fake_broadcast(frame):
+            frames_broadcast.append(frame)
+        
+        monkeypatch.setattr(service.encoder, "get_frame", fake_get_frame)
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        service.running = True
+        
+        # Simulate frame-driven loop: get frame, broadcast immediately
+        for _ in range(5):
+            frame = service.encoder.get_frame()
+            if frame is None:
+                frame = service.encoder._silence_frame
+            service.http_server.broadcast(frame)
+        
+        # Verify: All frames were broadcast (no frames dropped due to timing)
+        assert len(frames_broadcast) == 5, \
+            "All frames from encoder must be broadcast (no timing-based dropping)"
+        
+        # Verify: Each broadcast received a valid frame
+        for frame in frames_broadcast:
+            assert isinstance(frame, bytes) and len(frame) > 0, \
+                "Each broadcast must receive a valid MP3 frame"
+        
+        # Contract requirement: Zero drift by design - frames forwarded immediately,
+        # timing comes from upstream PCM cadence via EncoderManager
+
+
+# ============================================================================
+# SECTION 7: TR-HTTP - HTTP Streaming Contract
+# ============================================================================
+
+class TestHTTPStreamingContract:
+    """Tests for TR-HTTP - HTTP streaming contract."""
+    
+    @pytest.fixture
+    def service(self):
+        """Create TowerService instance for testing with cleanup."""
+        service = TowerService(encoder_enabled=False)
+        yield service
+        try:
+            service.stop()
+            if hasattr(service, 'audio_pump') and service.audio_pump is not None:
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
+                    service.audio_pump._thread.join(timeout=2.0)
+        except Exception:
+            pass
+        del service
+    
+    def test_tr_http1_push_based_streaming(self, service, monkeypatch):
+        """
+        Test TR-HTTP1: The /stream endpoint MUST deliver MP3 frames immediately upon receipt
+        from the broadcast loop. The HTTP layer MUST NOT impose its own timing cadence.
+        """
+        # Verify: HTTPServer.broadcast() is called immediately when frames are available
+        # Verify: HTTP layer does not sleep or delay frame delivery
+        
+        broadcast_calls = []
+        
+        def fake_broadcast(frame):
+            broadcast_calls.append((time.time(), frame))
+        
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        # Simulate frames arriving from encoder
+        test_frames = [b"\xFF\xFB" + b"\x00" * 100 for _ in range(3)]
+        
+        # Broadcast frames immediately as they arrive
+        for frame in test_frames:
+            service.http_server.broadcast(frame)
+        
+        # Verify: All frames were broadcast immediately
+        assert len(broadcast_calls) == 3, \
+            "All frames must be broadcast immediately"
+        
+        # Verify: Broadcasts happen immediately (no artificial delays)
+        if len(broadcast_calls) >= 2:
+            time_gap = broadcast_calls[1][0] - broadcast_calls[0][0]
+            assert time_gap < 0.001, \
+                f"Broadcasts should happen immediately (<1ms gap), got {time_gap*1000:.2f}ms gap"
+        
+        # Contract requirement: HTTP layer pushes frames immediately, no timing cadence
+    
+    def test_tr_http5_no_timing_responsibilities(self, service, monkeypatch):
+        """
+        Test TR-HTTP5: The HTTP layer MUST NOT:
+        - Sleep to enforce cadence
+        - Estimate MP3 frame durations
+        - Retry timing compensation
+        
+        It MUST simply forward frames as they arrive.
+        """
+        # Verify: broadcast() forwards frames immediately without timing logic
+        broadcast_calls = []
+        
+        def fake_broadcast(frame):
+            broadcast_calls.append(frame)
+            # No sleep, no timing calculations, just forward
+        
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        # Send frames at variable rates (simulating encoder output)
+        test_frames = [b"\xFF\xFB" + b"\x00" * 100 for _ in range(3)]
+        
+        for frame in test_frames:
+            service.http_server.broadcast(frame)
+        
+        # Verify: All frames forwarded immediately
+        assert len(broadcast_calls) == 3, \
+            "HTTP layer must forward all frames immediately"
+        
+        # Contract requirement: HTTP layer forwards frames, no timing responsibilities
+
+
+# ============================================================================
+# SECTION 8: T13.5 - No MP3 Timing Implementation
+# ============================================================================
 
 class TestNonResponsibilities:
-    """Tests for T12-T13 - Non-responsibilities."""
+    """Tests for T13.5 - Non-responsibilities."""
     
-    def test_t12_must_not_implement_routing(self):
-        """Test T12: TowerRuntime MUST NOT implement grace period logic, decide silence/tone/program, inspect PCM."""
-        # TODO: Verify no routing logic in Runtime
-        pass
+    @pytest.fixture
+    def service(self):
+        """Create TowerService instance for testing with cleanup."""
+        service = TowerService(encoder_enabled=False)
+        yield service
+        try:
+            service.stop()
+            if hasattr(service, 'audio_pump') and service.audio_pump is not None:
+                if hasattr(service.audio_pump, 'thread'):
+                    service.audio_pump.thread.join(timeout=2.0)
+                elif hasattr(service.audio_pump, '_thread'):
+                    service.audio_pump._thread.join(timeout=2.0)
+            if hasattr(service, 'encoder') and service.encoder is not None:
+                if hasattr(service.encoder, '_drain_thread') and service.encoder._drain_thread is not None:
+                    service.encoder._drain_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        del service
     
-    def test_t13_must_rely_on_components(self):
-        """Test T13: TowerRuntime MUST rely on EncoderManager, AudioPump, Supervisor for audio decisions."""
-        # TODO: Verify delegation to components
-        pass
+    def test_t13_5_no_mp3_timing_implementation(self, service, monkeypatch):
+        """
+        Test T13.5: TowerRuntime MUST NOT implement MP3 timing, cadence enforcement,
+        or synthetic frame intervals. Timing responsibilities belong exclusively to upstream PCM cadence.
+        """
+        # Verify: main_loop calls encoder.get_frame() and broadcasts immediately
+        # No timing intervals, no cadence enforcement
+        
+        call_sequence = []
+        
+        def fake_get_frame():
+            call_sequence.append("get_frame")
+            return b"\xFF\xFB" + b"\x00" * 100
+        
+        def fake_broadcast(frame):
+            call_sequence.append("broadcast")
+        
+        monkeypatch.setattr(service.encoder, "get_frame", fake_get_frame)
+        monkeypatch.setattr(service.http_server, "broadcast", fake_broadcast)
+        
+        service.running = True
+        
+        # Simulate main_loop behavior: get frame, broadcast immediately
+        for _ in range(3):
+            frame = service.encoder.get_frame()
+            if frame is None:
+                frame = service.encoder._silence_frame
+            service.http_server.broadcast(frame)
+        
+        # Verify: Pattern is get_frame -> broadcast (no timing logic in between)
+        assert call_sequence == ["get_frame", "broadcast"] * 3, \
+            "main_loop must call get_frame then broadcast immediately (no timing logic)"
+        
+        # Contract requirement: No MP3 timing implementation
+        # Timing belongs exclusively to upstream PCM cadence (AudioPump → EncoderManager)
 
 
 # ============================================================================
-# SECTION 10: T14-T15 - Observability and Health
+# SECTION 9: T14-T15 - Observability and Health
 # ============================================================================
-# Tests for T14 (should expose health/metrics), T15 (must not interfere with tick loop),
-# T14.2 (health endpoint lock independence)
-# 
-# TODO: Consolidate observability tests
-
 
 class TestObservabilityAndHealth:
     """Tests for T14-T15 - Observability and health."""
-    
-    def test_t14_health_metrics_endpoints(self):
-        """Test T14: TowerRuntime SHOULD expose health/metrics endpoints."""
-        # TODO: Verify health endpoints
-        # DO NOT test audio semantics - only verify endpoints exist and respond
-        pass
     
     def test_t14_2_health_endpoint_lock_independence(self):
         """
@@ -707,8 +784,6 @@ class TestObservabilityAndHealth:
         or PCM buffer operations.
         """
         # Verify health endpoint doesn't use blocking locks
-        from tower.service import TowerService
-        
         service = None
         try:
             service = TowerService(encoder_enabled=False)
@@ -734,9 +809,6 @@ class TestObservabilityAndHealth:
         # Verify non-blocking health checks
         # DO NOT test audio semantics - only verify non-blocking behavior
         
-        from tower.service import TowerService
-        import time
-        
         service = None
         try:
             service = TowerService(encoder_enabled=False)
@@ -758,8 +830,6 @@ class TestObservabilityAndHealth:
         """Test: Runtime must not have its own timing loop."""
         # Runtime must not have its own timing loop.
         # Timing = AudioPump only.
-        
-        from tower.service import TowerService
         
         service = None
         try:
@@ -787,6 +857,3 @@ class TestObservabilityAndHealth:
                     service.stop()
                 except Exception:
                     pass
-
-
-

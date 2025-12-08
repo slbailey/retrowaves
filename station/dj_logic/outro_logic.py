@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.audio_event import AudioEvent
 
 logger = logging.getLogger(__name__)
 

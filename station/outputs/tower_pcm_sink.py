@@ -13,7 +13,7 @@ from typing import Optional
 
 import numpy as np
 
-from outputs.base_sink import BaseSink
+from station.outputs.base_sink import BaseSink
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,8 @@ class TowerPCMSink(BaseSink):
         """
         Write PCM frame to Tower's Unix socket without pacing (burst mode).
         
-        Similar to write() but sends exactly ONE frame immediately without waiting.
-        Controlled bursts are handled in the playout loop, not here.
+        ARCHITECTURAL NOTE: This method is equivalent to write() - Station never paces.
+        Station pushes frames as fast as decoder produces them. Tower owns all timing.
         
         Args:
             frame: numpy array containing PCM audio data (must be 1024 samples, 2 channels, s16le)
@@ -97,17 +97,25 @@ class TowerPCMSink(BaseSink):
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
-        # Send exactly ONE complete frame if available (controlled burst - no blasting)
+        # Send exactly ONE complete frame if available (no pacing - push immediately)
         if len(self._buffer) >= self.frame_bytes:
             # Extract exactly one complete frame
             frame_bytes = bytes(self._buffer[:self.frame_bytes])
             self._buffer = self._buffer[self.frame_bytes:]
             
-            # Send complete frame to socket immediately (no pacing)
+            # Send complete frame to socket immediately (non-blocking)
+            # ARCHITECTURAL INVARIANT: Station must NEVER block Tower.
+            # If socket buffer is full, drop frame silently (drop-oldest semantics).
             try:
                 if self._socket:
-                    self._socket.sendall(frame_bytes)
-                    self._frames_sent += 1
+                    # Non-blocking send: if buffer is full, drop frame
+                    try:
+                        self._socket.sendall(frame_bytes)
+                        self._frames_sent += 1
+                    except BlockingIOError:
+                        # Socket buffer full - drop frame (Tower is not reading fast enough)
+                        # This is expected behavior: Station never blocks, Tower handles pacing
+                        pass
             except BrokenPipeError:
                 if self._connection_start_time:
                     connection_duration = time.time() - self._connection_start_time
@@ -193,8 +201,10 @@ class TowerPCMSink(BaseSink):
             # Connect to Tower's socket (blocking connect for Unix sockets)
             sock.connect(self.socket_path)
             
-            # Keep socket blocking - Tower's reader should be fast enough to prevent buffer fill
-            # If buffer fills, it indicates Tower is not reading fast enough (investigate Tower side)
+            # ARCHITECTURAL INVARIANT: Station must NEVER block Tower.
+            # Set socket to non-blocking mode to prevent stalls.
+            # If socket buffer is full, we drop frames (drop-oldest semantics).
+            sock.setblocking(False)
             
             self._socket = sock
             self._connected = True
@@ -285,9 +295,8 @@ class TowerPCMSink(BaseSink):
         
         # Extract and send complete 4096-byte frames from buffer
         # NEVER send partial frames - if <4096 remain, wait for next decode cycle
-        # CRITICAL: Only send ONE frame per write() call to prevent burst flooding
-        # PlayoutEngine is the metronome - it calls write() at the correct rate (21.33ms per frame)
-        # The sink should NOT add pacing - it just writes frames as provided by the engine
+        # ARCHITECTURAL INVARIANT: Station pushes frames as fast as decoder produces them.
+        # No pacing, no throttling, no timing logic. Tower owns all timing.
         
         # Send exactly ONE frame if available (no pacing - engine handles timing)
         if len(self._buffer) >= self.frame_bytes:
@@ -295,12 +304,20 @@ class TowerPCMSink(BaseSink):
             frame_bytes = bytes(self._buffer[:self.frame_bytes])
             self._buffer = self._buffer[self.frame_bytes:]
             
-            # Send complete frame to socket immediately
-            # PlayoutEngine has already paced this correctly
+            # Send complete frame to socket immediately (non-blocking)
+            # ARCHITECTURAL INVARIANT: Station must NEVER block Tower.
+            # If socket buffer is full, drop frame silently (drop-oldest semantics).
+            # Station pushes frames as fast as decoder produces them - no pacing here.
             try:
                 if self._socket:
-                    self._socket.sendall(frame_bytes)
-                    self._frames_sent += 1
+                    # Non-blocking send: if buffer is full, drop frame
+                    try:
+                        self._socket.sendall(frame_bytes)
+                        self._frames_sent += 1
+                    except BlockingIOError:
+                        # Socket buffer full - drop frame (Tower is not reading fast enough)
+                        # This is expected behavior: Station never blocks, Tower handles pacing
+                        pass
             except BrokenPipeError:
                 if self._connection_start_time:
                     connection_duration = time.time() - self._connection_start_time

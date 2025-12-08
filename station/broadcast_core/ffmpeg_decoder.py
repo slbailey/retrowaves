@@ -10,6 +10,10 @@ class FFmpegDecoder:
     Minimal real MP3 → PCM decoder using ffmpeg.
     - Outputs 16-bit signed little-endian stereo at 48 kHz
     - Yields numpy int16 frames of shape (N, 2)
+    
+    ARCHITECTURAL INVARIANT: This decoder has NO timing responsibility.
+    It produces frames at natural decoder pacing (may burst or stall).
+    Station pushes frames immediately as decoded - Tower owns all timing.
     """
 
     def __init__(self, path: str, frame_size: int = 1024):
@@ -35,6 +39,10 @@ class FFmpegDecoder:
         Generator yielding PCM frames as numpy int16 arrays shaped (N, 2).
         
         Each frame is exactly frame_size samples (1024 samples = 4096 bytes).
+        
+        ARCHITECTURAL INVARIANT: Yields frames at natural decoder pacing.
+        No timing logic, no rate limiting, no synchronization.
+        If decoder bursts → yields immediately. If decoder stalls → yields when ready.
         """
         assert self.proc.stdout is not None
         bytes_per_frame = self.frame_size * 2 * 2  # samples * 2 bytes * 2 channels

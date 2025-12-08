@@ -85,10 +85,6 @@ class AudioPump:
             if tick_index == 0:
                 logger.info("AUDIO_PUMP: first PCM frame generated")
             
-            # DEBUG: Diagnostic logging - buffer count on every tick
-            buffer_stats = self.pcm_buffer.stats()
-            logger.debug(f"Tick start. Buffer count={buffer_stats.count}")
-            
             # Per contract [A5]: AudioPump calls encoder_manager.next_frame() with NO arguments
             # EncoderManager reads from its internal buffer (populated via write_pcm() from upstream)
             # EncoderManager handles ALL routing decisions internally (operational mode, thresholds, etc.)

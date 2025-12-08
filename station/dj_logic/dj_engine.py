@@ -21,12 +21,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from broadcast_core.audio_event import AudioEvent
-from broadcast_core.playout_engine import DJCallback, PlayoutEngine
-from dj_logic.intent_model import DJIntent
-from dj_logic.ticklers import Tickler, GenerateIntroTickler, GenerateOutroTickler, RefillGenericIDTickler
-from dj_logic.asset_discovery import AssetDiscoveryManager
-from music_logic.rotation import RotationManager
+from station.broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.playout_engine import DJCallback, PlayoutEngine
+from station.dj_logic.intent_model import DJIntent
+from station.dj_logic.ticklers import Tickler, GenerateIntroTickler, GenerateOutroTickler, RefillGenericIDTickler
+from station.dj_logic.asset_discovery import AssetDiscoveryManager
+from station.music_logic.rotation import RotationManager
 
 logger = logging.getLogger(__name__)
 

@@ -11,7 +11,7 @@ import socketserver
 import threading
 from http.server import BaseHTTPRequestHandler
 
-from outputs.http_connection_manager import HTTPConnectionManager
+from station.outputs.http_connection_manager import HTTPConnectionManager
 
 logger = logging.getLogger(__name__)
 

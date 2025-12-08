@@ -184,7 +184,7 @@ PCM Ingestion **MUST** deliver frames to the same upstream PCM buffer that Audio
 PCM Ingestion **MUST NOT** have direct knowledge of AudioPump, EncoderManager, or FFmpegSupervisor; it interacts only with the upstream PCM buffer.
 
 ### I45
-PCM Ingestion **MUST NOT** interfere with AudioPump's tick loop or timing; all operations **MUST** be non-blocking relative to the 24ms tick interval.
+PCM Ingestion **MUST NOT** interfere with AudioPump's tick loop or timing; all operations **MUST** be non-blocking relative to the 21.333ms tick interval (PCM cadence).
 
 ### I46
 PCM Ingestion **MUST** operate independently of the audio processing pipeline; frame delivery **MUST** continue even if EncoderManager is in fallback mode or FFmpegSupervisor is restarting.

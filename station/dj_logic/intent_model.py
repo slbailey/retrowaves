@@ -11,7 +11,7 @@ Architecture 3.1 Reference:
 from dataclasses import dataclass
 from typing import Optional, List
 
-from broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.audio_event import AudioEvent
 
 
 @dataclass

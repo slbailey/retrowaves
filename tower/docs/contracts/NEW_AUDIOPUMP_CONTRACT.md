@@ -17,10 +17,10 @@ AudioPump does not decide whether to send program, silence, or tone; it simply e
 ## B. Relationship to Core Timing
 
 ### A1
-AudioPump **MUST** use the tick interval defined in `NEW_CORE_TIMING_AND_FORMATS_CONTRACT` (**24 ms**).
+AudioPump **MUST** use the tick interval implied by the canonical PCM frame defined in `NEW_CORE_TIMING_AND_FORMATS_CONTRACT.md` (i.e., one tick per PCM frame).
 
 ### A2
-AudioPump **MUST** assume the PCM frame format defined there (48kHz, stereo, 1152 samples, 4608 bytes).
+AudioPump **MUST** assume the PCM frame format defined there (48kHz, stereo, 1024 samples per frame, 4096 bytes), and **MUST NOT** invent its own PCM shape.
 
 ### A3
 AudioPump **MUST NOT** invent or use a different tick interval for any part of the system.
@@ -30,7 +30,7 @@ AudioPump **MUST NOT** invent or use a different tick interval for any part of t
 ## C. Tick Loop Responsibilities
 
 ### A4
-AudioPump **MUST** run a periodic loop at the global tick interval (**24ms**).
+AudioPump **MUST** run a periodic loop at that global tick interval (currently ≈21.333ms for 1024-sample frames at 48kHz), and **MUST NOT** redefine the cadence independently of the Core Timing contract.
 
 ### A5
 On each tick, AudioPump **MUST**:
