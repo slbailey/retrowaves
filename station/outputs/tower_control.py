@@ -7,7 +7,6 @@ Sends control commands to Tower's HTTP control API (e.g., source switching).
 import json
 import logging
 import os
-import threading
 from typing import Optional, Dict, Any
 
 import httpx
@@ -22,17 +21,12 @@ class TowerControlClient:
     Allows Station to send commands to Tower, such as:
     - Switching source modes (tone, silence, file)
     - Setting file sources
+    - Sending heartbeat events
     
-    IMPORTANT: Lifecycle events (station_starting_up, station_shutting_down) MUST only
-    be sent by the top-level Station/StationService class, not by subcomponents.
+    This client is stateless and transport-only. It makes no decisions about
+    when to send events - it simply sends whatever it's asked to send.
+    Lifecycle state management is handled by StationService, not this client.
     """
-    
-    # Class-level tracking to prevent duplicate lifecycle events across all instances
-    _lifecycle_events_sent = {
-        "station_starting_up": False,
-        "station_shutting_down": False
-    }
-    _lifecycle_lock = threading.Lock()
     
     def __init__(self, tower_host: str = "127.0.0.1", tower_port: int = 8005):
         """
@@ -144,27 +138,17 @@ class TowerControlClient:
         Per contract T-EVENTS1: Events are sent via HTTP POST to /tower/events/ingest.
         Per contract T-EVENTS6: Event sending MUST be non-blocking (< 1ms typical, < 10ms maximum).
         
-        IMPORTANT: Lifecycle events (station_starting_up, station_shutting_down) are
-        tracked at the class level to prevent duplicates across all TowerControlClient instances.
-        Only the first call to send a lifecycle event will succeed; subsequent calls are ignored.
+        This method is stateless and transport-only. It always attempts to send the event
+        if called. Lifecycle event de-duplication is handled by StationService, not this client.
         
         Args:
-            event_type: Event type (e.g., "segment_started", "dj_think_started")
+            event_type: Event type (e.g., "segment_started", "dj_think_started", "station_starting_up")
             timestamp: Station Clock A timestamp (time.monotonic())
             metadata: Event metadata dictionary
             
         Returns:
             True if event was sent successfully, False otherwise
         """
-        # Check if this is a lifecycle event that should only be sent once
-        if event_type in ("station_starting_up", "station_shutting_down"):
-            with self._lifecycle_lock:
-                if self._lifecycle_events_sent.get(event_type, False):
-                    logger.debug(f"[TOWER] Lifecycle event {event_type} already sent by another TowerControlClient instance, skipping duplicate")
-                    return False
-                # Mark as sent before actually sending (prevents race conditions)
-                self._lifecycle_events_sent[event_type] = True
-        
         url = f"{self.base_url}/tower/events/ingest"
         
         payload = {
@@ -181,16 +165,8 @@ class TowerControlClient:
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             # Silently drop events if Tower is unavailable (non-blocking per T-EVENTS6)
             logger.debug(f"[TOWER] Failed to send event {event_type}: {e}")
-            # If send failed, reset the lifecycle flag so it can be retried
-            if event_type in ("station_starting_up", "station_shutting_down"):
-                with self._lifecycle_lock:
-                    self._lifecycle_events_sent[event_type] = False
             return False
         except Exception as e:
             logger.debug(f"[TOWER] Unexpected error sending event {event_type}: {e}")
-            # If send failed, reset the lifecycle flag so it can be retried
-            if event_type in ("station_starting_up", "station_shutting_down"):
-                with self._lifecycle_lock:
-                    self._lifecycle_events_sent[event_type] = False
             return False
 

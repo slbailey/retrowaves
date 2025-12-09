@@ -78,9 +78,12 @@ class Station:
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)
         
-        # Track lifecycle events to ensure they're only sent once per contract
-        self._startup_event_sent = False
-        self._shutdown_event_sent = False
+        # Lifecycle state tracking per contract SL1/SL2
+        # Per contract: Lifecycle is defined at Station level, not at transport level
+        self._lifecycle_state = {
+            "station_starting_up": False,
+            "station_shutting_down": False
+        }
 
     def start(self) -> None:
         """
@@ -117,19 +120,16 @@ class Station:
         # Start playout loop
         self.engine.run()
         
-        # Send station_starting_up event to Tower (only once per contract)
-        if self.tower_control and not self._startup_event_sent:
-            try:
-                self.tower_control.send_event(
-                    event_type="station_starting_up",
-                    timestamp=time.monotonic(),
-                    metadata={}
-                )
-                self._startup_event_sent = True
+        # Send station_starting_up event to Tower (only once per contract SL1/SL2)
+        if self.tower_control and not self._lifecycle_state["station_starting_up"]:
+            if self.tower_control.send_event(
+                event_type="station_starting_up",
+                timestamp=time.monotonic(),
+                metadata={}
+            ):
+                self._lifecycle_state["station_starting_up"] = True
                 logger.info("[STATION] Sent station_starting_up event to Tower")
-            except Exception as e:
-                logger.warning(f"[STATION] Failed to send station_starting_up event: {e}")
-        elif self._startup_event_sent:
+        elif self._lifecycle_state["station_starting_up"]:
             logger.debug("[STATION] station_starting_up event already sent, skipping duplicate")
         
         # Mark as started to prevent duplicate start() calls
@@ -141,19 +141,16 @@ class Station:
         
         Phase 7: Saves DJ state before shutdown.
         """
-        # Send station_shutting_down event to Tower (only once per contract)
-        if self.tower_control and not self._shutdown_event_sent:
-            try:
-                self.tower_control.send_event(
-                    event_type="station_shutting_down",
-                    timestamp=time.monotonic(),
-                    metadata={}
-                )
-                self._shutdown_event_sent = True
+        # Send station_shutting_down event to Tower (only once per contract SL1/SL2)
+        if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+            if self.tower_control.send_event(
+                event_type="station_shutting_down",
+                timestamp=time.monotonic(),
+                metadata={}
+            ):
+                self._lifecycle_state["station_shutting_down"] = True
                 logger.info("[STATION] Sent station_shutting_down event to Tower")
-            except Exception as e:
-                logger.warning(f"[STATION] Failed to send station_shutting_down event: {e}")
-        elif self._shutdown_event_sent:
+        elif self._lifecycle_state["station_shutting_down"]:
             logger.debug("[STATION] station_shutting_down event already sent, skipping duplicate")
         
         # Save DJ state before stopping

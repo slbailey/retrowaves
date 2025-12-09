@@ -57,9 +57,13 @@ class StationService:
         # Runtime state
         self.running = False
         self._shutdown_initiated = False
-        # Track lifecycle events to ensure they're only sent once
-        self._startup_event_sent = False
-        self._shutdown_event_sent = False
+        
+        # Lifecycle state tracking per contract SL1/SL2
+        # Per contract: Lifecycle is defined at Station level, not at transport level
+        self._lifecycle_state = {
+            "station_starting_up": False,
+            "station_shutting_down": False
+        }
     
     def start(self):
         """
@@ -168,27 +172,28 @@ class StationService:
         self.engine.queue_audio([first_audio_event])
         logger.info("First song queued for playout")
         
-        # SL1.4: Start playout loop (non-blocking - runs in background thread)
+        # SL1.3: Send lifecycle event BEFORE starting playout
+        # Per SL1.3: Lifecycle event MUST be sent before playout begins to guarantee
+        # that THINK events cannot fire before the lifecycle notification is transmitted
+        # Send station_starting_up event to Tower (only once per contract SL1/SL2)
+        if self.tower_control and not self._lifecycle_state["station_starting_up"]:
+            if self.tower_control.send_event(
+                event_type="station_starting_up",
+                timestamp=time.monotonic(),
+                metadata={}
+            ):
+                self._lifecycle_state["station_starting_up"] = True
+                logger.info("Sent station_starting_up event to Tower")
+        elif self._lifecycle_state["station_starting_up"]:
+            logger.debug("station_starting_up event already sent, skipping duplicate")
+        
+        # SL1.4: Start playout loop AFTER lifecycle event is sent (non-blocking - runs in background thread)
         # Per SL1.4: Startup MUST not block playout once initiated
+        # Per SL1.3: Playout MUST start AFTER lifecycle event to ensure proper ordering
         # PlayoutEngine.run() starts a background thread, so startup returns immediately
         logger.info("Starting playout engine...")
         self.engine.run()  # This starts the playout loop in a background thread
         logger.info("Playout engine started (startup complete, playout running in background)")
-        
-        # Send station_starting_up event to Tower (only once per contract)
-        if self.tower_control and not self._startup_event_sent:
-            try:
-                self.tower_control.send_event(
-                    event_type="station_starting_up",
-                    timestamp=time.monotonic(),
-                    metadata={}
-                )
-                self._startup_event_sent = True
-                logger.info("Sent station_starting_up event to Tower")
-            except Exception as e:
-                logger.warning(f"Failed to send station_starting_up event: {e}")
-        elif self._startup_event_sent:
-            logger.debug("station_starting_up event already sent, skipping duplicate")
         
         self.running = True
         logger.info("=== Station started successfully ===")
@@ -222,26 +227,25 @@ class StationService:
         self._shutdown_initiated = True
         self.running = False
         
-        # Send station_shutting_down event to Tower (only once per contract)
-        if self.tower_control and not self._shutdown_event_sent:
-            try:
-                self.tower_control.send_event(
-                    event_type="station_shutting_down",
-                    timestamp=time.monotonic(),
-                    metadata={}
-                )
-                self._shutdown_event_sent = True
+        # Send station_shutting_down event to Tower (only once per contract SL1/SL2)
+        if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+            if self.tower_control.send_event(
+                event_type="station_shutting_down",
+                timestamp=time.monotonic(),
+                metadata={}
+            ):
+                self._lifecycle_state["station_shutting_down"] = True
                 logger.info("Sent station_shutting_down event to Tower")
-            except Exception as e:
-                logger.warning(f"Failed to send station_shutting_down event: {e}")
-        elif self._shutdown_event_sent:
+        elif self._lifecycle_state["station_shutting_down"]:
             logger.debug("station_shutting_down event already sent, skipping duplicate")
         
-        # SL2.2: Prevent new THINK/DO cycles by disabling DJ callbacks
+        # SL2.2: Prevent new THINK/DO cycles
         # Per SL2.2: No THINK or DO events MAY fire after shutdown begins
-        # Disabling the callback prevents PlayoutEngine from triggering new THINK/DO cycles
+        # First request shutdown (prevents callbacks in playout thread)
+        # Then set callback to None (additional safety for race conditions)
         if self.engine:
-            self.engine.set_dj_callback(None)  # Disable callbacks to prevent new THINK/DO
+            self.engine.request_shutdown()  # Set shutdown flag before modifying callback
+            self.engine.set_dj_callback(None)  # Additional safety: clear callback reference
         
         # SL2.3: Stop playout engine cleanly (waits for current segment to finish)
         if self.engine:

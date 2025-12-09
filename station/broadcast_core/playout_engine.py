@@ -126,6 +126,7 @@ class PlayoutEngine:
         self._stop_event = threading.Event()
         self._play_thread: Optional[threading.Thread] = None
         self._mixer = Mixer()
+        self._shutdown_requested = False  # Per contract SL2.2: Prevent THINK/DO after shutdown
         
         # Monitoring: track queue stats for debugging
         self._last_queue_log_time = time.time()
@@ -141,15 +142,24 @@ class PlayoutEngine:
             "id": 5.0,          # 5 seconds
         }
     
-    def set_dj_callback(self, dj_callback: DJCallback) -> None:
+    def set_dj_callback(self, dj_callback: Optional[DJCallback]) -> None:
         """
         Set the DJ callback object.
         
         Args:
             dj_callback: DJ callback object implementing on_segment_started
-                        and on_segment_finished methods
+                        and on_segment_finished methods, or None to disable callbacks
         """
         self._dj_callback = dj_callback
+    
+    def request_shutdown(self) -> None:
+        """
+        Request shutdown of the playout engine.
+        
+        Per contract SL2.2: Prevents new THINK/DO events from firing after shutdown begins.
+        This flag is checked before firing callbacks to ensure strict compliance.
+        """
+        self._shutdown_requested = True
     
     def queue_audio(self, audio_events: list[AudioEvent]) -> None:
         """
@@ -189,7 +199,9 @@ class PlayoutEngine:
         logger.info(f"Starting segment: {segment.type} - {segment.path}")
         
         # Emit segment_started heartbeat event to Tower (per contract PE4.1)
-        if self._tower_control:
+        # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
+        # (Not required by contract - heartbeat events are transport-level and observational)
+        if self._tower_control and not self._shutdown_requested:
             try:
                 expected_duration = self._get_segment_duration(segment)
                 segment_id = f"{segment.type}_{os.path.basename(segment.path)}_{int(time.monotonic() * 1000)}"
@@ -209,8 +221,10 @@ class PlayoutEngine:
             except Exception as e:
                 logger.debug(f"Error sending segment_started event: {e}")
         
-        # Emit on_segment_started callback
-        if self._dj_callback:
+        # Emit on_segment_started callback (THINK phase)
+        # Per contract SL2.2: No THINK events MAY fire after shutdown begins
+        # Per contract SL2.2: Check both shutdown_requested and callback existence
+        if not self._shutdown_requested and self._dj_callback:
             try:
                 self._dj_callback.on_segment_started(segment)
             except Exception as e:
@@ -234,7 +248,9 @@ class PlayoutEngine:
         logger.info(f"Finishing segment: {segment.type} - {segment.path}")
         
         # Emit segment_finished heartbeat event to Tower (per contract PE4.3)
-        if self._tower_control:
+        # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
+        # (Not required by contract - heartbeat events are transport-level and observational)
+        if self._tower_control and not self._shutdown_requested:
             try:
                 total_duration = time.monotonic() - getattr(self, '_segment_start_time', time.monotonic())
                 segment_id = getattr(self, '_current_segment_id', f"{segment.type}_{os.path.basename(segment.path)}")
@@ -254,8 +270,10 @@ class PlayoutEngine:
             except Exception as e:
                 logger.debug(f"Error sending segment_finished event: {e}")
         
-        # Emit on_segment_finished callback
-        if self._dj_callback:
+        # Emit on_segment_finished callback (DO phase)
+        # Per contract SL2.2: No DO events MAY fire after shutdown begins
+        # Per contract SL2.2: Check both shutdown_requested and callback existence
+        if not self._shutdown_requested and self._dj_callback:
             try:
                 self._dj_callback.on_segment_finished(segment)
             except Exception as e:
@@ -291,10 +309,14 @@ class PlayoutEngine:
         Internal playout loop that processes segments from queue.
         
         Decodes audio and sends frames to output sink for real playback.
+        
+        Per contract SL2.2: No THINK or DO events MAY fire after shutdown begins.
+        This loop checks _shutdown_requested at multiple points to ensure strict compliance.
         """
         logger.info("Playout loop started")
         
-        while self._is_running and not self._stop_event.is_set():
+        # Per contract SL2.2: Check shutdown_requested in loop condition
+        while self._is_running and not self._stop_event.is_set() and not self._shutdown_requested:
             # Periodic queue monitoring (every 5 seconds)
             now = time.time()
             if now - self._last_queue_log_time >= self._queue_log_interval:
@@ -304,16 +326,35 @@ class PlayoutEngine:
                 )
                 self._last_queue_log_time = now
             
+            # Per contract SL2.2: Check shutdown before dequeueing new segment
+            if self._shutdown_requested:
+                logger.info("Playout loop stopping: shutdown requested")
+                break
+            
             # Try to get next segment from queue
             segment = self._queue.dequeue()
             
             if segment is None:
                 # Queue is empty, wait a bit before checking again
+                # Per contract SL2.2: Check shutdown during wait
+                if self._shutdown_requested:
+                    break
                 time.sleep(0.1)
                 continue
             
-            # Start the segment (triggers on_segment_started)
+            # Per contract SL2.2: Check shutdown before THINK phase (on_segment_started)
+            if self._shutdown_requested:
+                logger.info("Playout loop stopping: shutdown requested before THINK phase")
+                break
+            
+            # Start the segment (triggers on_segment_started - THINK phase)
+            # start_segment() internally checks shutdown_requested before firing callback
             self.start_segment(segment)
+            
+            # Per contract SL2.2: Check shutdown after THINK, before playback
+            if self._shutdown_requested:
+                logger.info("Playout loop stopping: shutdown requested after THINK phase")
+                break
             
             # Decode and play the audio segment
             try:
@@ -323,7 +364,13 @@ class PlayoutEngine:
                 # Don't continue to finish_segment if playback failed
                 continue
             
-            # Finish the segment (triggers on_segment_finished)
+            # Per contract SL2.2: Check shutdown before DO phase (on_segment_finished)
+            if self._shutdown_requested:
+                logger.info("Playout loop stopping: shutdown requested before DO phase")
+                break
+            
+            # Finish the segment (triggers on_segment_finished - DO phase)
+            # finish_segment() internally checks shutdown_requested before firing callback
             if self._is_playing and self._current_segment == segment:
                 self.finish_segment(segment)
         
@@ -374,9 +421,10 @@ class PlayoutEngine:
             # Clock A paces consumption to ensure real-time playback duration
             # Socket writes fire immediately (non-blocking, no pacing on writes)
             for frame in decoder.read_frames():
-                # Check if we should stop
-                if not self._is_running or self._stop_event.is_set():
-                    logger.info(f"[PLAYOUT] Stopping playback early (stop requested)")
+                # Per contract SL2.2: Check shutdown_requested in playback loop
+                # Check if we should stop (shutdown or stop event)
+                if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
+                    logger.info(f"[PLAYOUT] Stopping playback early (shutdown={self._shutdown_requested}, stop requested)")
                     break
                 
                 # Clock A: Pace decode consumption for real-time playback
@@ -398,9 +446,11 @@ class PlayoutEngine:
                 frame_count += 1
                 
                 # Emit segment_progress heartbeat event at least once per second (per contract PE4.2)
+                # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
+                # (Not required by contract - heartbeat events are transport-level and observational)
                 now = time.monotonic()
                 if now - getattr(self, '_last_progress_event_time', now) >= 1.0:
-                    if self._tower_control and self._current_segment:
+                    if self._tower_control and self._current_segment and not self._shutdown_requested:
                         try:
                             elapsed_time = now - getattr(self, '_segment_start_time', now)
                             expected_duration = self._get_segment_duration(self._current_segment)
