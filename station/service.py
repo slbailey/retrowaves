@@ -12,6 +12,7 @@ from station.music_logic.rotation import RotationManager
 from station.dj_logic.dj_engine import DJEngine
 from station.dj_logic.asset_discovery import AssetDiscoveryManager
 from station.broadcast_core.audio_event import AudioEvent
+from station.broadcast_core.playout_engine import _get_mp3_metadata
 from station.broadcast_core.playout_engine import PlayoutEngine
 from station.outputs.factory import create_output_sink
 from station.outputs.tower_pcm_sink import TowerPCMSink
@@ -136,7 +137,7 @@ class StationService:
         # Initialize output sink (Tower PCM socket)
         logger.info("Initializing Tower PCM sink...")
         tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
-        self.sink = TowerPCMSink(socket_path=tower_socket_path, tower_control=tower_control)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path)
         logger.info(f"Tower PCM sink initialized (socket={tower_socket_path})")
         
         # Store tower_control for PlayoutEngine
@@ -168,7 +169,9 @@ class StationService:
         # 1. First song is ready when playout starts
         # 2. THINK will only be triggered when the first segment actually begins (after startup completes)
         # 3. Startup is complete before any THINK events occur
-        first_audio_event = AudioEvent(first_song, "song")
+        # Extract metadata for first song during startup (since it doesn't go through THINK phase)
+        first_song_metadata = _get_mp3_metadata(first_song)
+        first_audio_event = AudioEvent(first_song, "song", metadata=first_song_metadata)
         self.engine.queue_audio([first_audio_event])
         logger.info("First song queued for playout")
         

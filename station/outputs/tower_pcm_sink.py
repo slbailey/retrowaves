@@ -27,8 +27,7 @@ class TowerPCMSink(BaseSink):
     """
     
     def __init__(self, socket_path: str = "/var/run/retrowaves/pcm.sock", 
-                 sample_rate: int = 48000, channels: int = 2, frame_size: int = 1024,
-                 tower_control=None):
+                 sample_rate: int = 48000, channels: int = 2, frame_size: int = 1024):
         """
         Initialize Tower PCM sink.
         
@@ -37,14 +36,12 @@ class TowerPCMSink(BaseSink):
             sample_rate: Audio sample rate (default: 48000)
             channels: Number of audio channels (default: 2)
             frame_size: Samples per frame (default: 1024)
-            tower_control: Optional TowerControlClient for sending buffer health events
         """
         self.socket_path = socket_path
         self.sample_rate = sample_rate
         self.channels = channels
         self.frame_size = frame_size
         self.frame_bytes = frame_size * channels * 2  # 1024 * 2 * 2 = 4096 bytes
-        self._tower_control = tower_control
         
         self._socket: Optional[socket.socket] = None
         self._connected = False
@@ -60,19 +57,10 @@ class TowerPCMSink(BaseSink):
         
         # Frame statistics (for close() logging only)
         self._frames_sent = 0
-        self._frames_dropped_overflow = 0  # Track frames dropped due to overflow
-        self._last_overflow_event_time: Optional[float] = None  # Rate limit overflow events
-        self._overflow_event_cooldown = 1.0  # Minimum seconds between overflow events
         
         # Track last write time to detect track transitions (gaps > 1 second)
         self._last_write_time: Optional[float] = None
         self._track_transition_threshold = 1.0  # 1 second gap = track transition
-        
-        # Buffer health tracking (for underflow detection)
-        self._last_buffer_check_time: Optional[float] = None
-        self._buffer_check_interval = 0.5  # Check buffer every 500ms
-        self._last_underflow_event_time: Optional[float] = None
-        self._underflow_event_cooldown = 1.0  # Minimum seconds between underflow events
         
         logger.info(f"TowerPCMSink initialized (socket={socket_path}, frame_size={frame_size} samples, frame_bytes={self.frame_bytes})")
     
@@ -109,12 +97,6 @@ class TowerPCMSink(BaseSink):
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
-        # Check for buffer underflow condition (periodically, per contract OS3.1)
-        now = time.monotonic()
-        if self._last_buffer_check_time is None or (now - self._last_buffer_check_time) >= self._buffer_check_interval:
-            self._check_and_emit_underflow_event()
-            self._last_buffer_check_time = now
-        
         # Send exactly ONE complete frame if available (no pacing - push immediately)
         if len(self._buffer) >= self.frame_bytes:
             # Extract exactly one complete frame
@@ -133,9 +115,7 @@ class TowerPCMSink(BaseSink):
                     except BlockingIOError:
                         # Socket buffer full - drop frame (Tower is not reading fast enough)
                         # This is expected behavior: Station never blocks, Tower handles pacing
-                        # Emit station_overflow event per contract OS3.2
-                        self._frames_dropped_overflow += 1
-                        self._emit_overflow_event()
+                        pass
             except BrokenPipeError:
                 if self._connection_start_time:
                     connection_duration = time.time() - self._connection_start_time
@@ -313,12 +293,6 @@ class TowerPCMSink(BaseSink):
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
-        # Check for buffer underflow condition (periodically, per contract OS3.1)
-        now = time.monotonic()
-        if self._last_buffer_check_time is None or (now - self._last_buffer_check_time) >= self._buffer_check_interval:
-            self._check_and_emit_underflow_event()
-            self._last_buffer_check_time = now
-        
         # Extract and send complete 4096-byte frames from buffer
         # NEVER send partial frames - if <4096 remain, wait for next decode cycle
         # ARCHITECTURAL INVARIANT: Station pushes frames as fast as decoder produces them.
@@ -343,9 +317,7 @@ class TowerPCMSink(BaseSink):
                     except BlockingIOError:
                         # Socket buffer full - drop frame (Tower is not reading fast enough)
                         # This is expected behavior: Station never blocks, Tower handles pacing
-                        # Emit station_overflow event per contract OS3.2
-                        self._frames_dropped_overflow += 1
-                        self._emit_overflow_event()
+                        pass
             except BrokenPipeError:
                 if self._connection_start_time:
                     connection_duration = time.time() - self._connection_start_time
@@ -426,138 +398,3 @@ class TowerPCMSink(BaseSink):
             self._socket = None
         self._connection_start_time = None
         logger.info("[PCM] Tower PCM socket closed")
-    
-    def _emit_overflow_event(self):
-        """
-        Emit station_overflow event when frames are dropped due to buffer full condition.
-        
-        Per contract OS3.2: Event MUST be emitted when buffer overflow is detected.
-        Event MUST be non-blocking and purely observational.
-        """
-        if not self._tower_control:
-            return
-        
-        # Rate limit overflow events to avoid spam
-        now = time.monotonic()
-        if self._last_overflow_event_time is not None:
-            if (now - self._last_overflow_event_time) < self._overflow_event_cooldown:
-                return
-        self._last_overflow_event_time = now
-        
-        try:
-            # Calculate buffer depth in frames (approximate - based on bytes in buffer)
-            buffer_depth_frames = len(self._buffer) // self.frame_bytes
-            
-            self._tower_control.send_event(
-                event_type="station_overflow",
-                timestamp=now,
-                metadata={
-                    "buffer_depth": buffer_depth_frames,
-                    "frames_dropped": self._frames_dropped_overflow
-                }
-            )
-        except Exception as e:
-            # Non-blocking per contract - silently drop if event send fails
-            logger.debug(f"Error sending station_overflow event: {e}")
-    
-    def _check_and_emit_underflow_event(self):
-        """
-        Check for buffer underflow condition and emit event if detected.
-        
-        Per contract OS3.1: Event MUST be emitted when buffer becomes empty.
-        For TowerPCMSink, underflow means internal buffer is empty and no complete frame available.
-        Event MUST be non-blocking and purely observational.
-        """
-        if not self._tower_control:
-            return
-        
-        # Check if buffer is empty (no complete frames available)
-        buffer_depth_frames = len(self._buffer) // self.frame_bytes
-        if buffer_depth_frames == 0 and len(self._buffer) == 0:
-            # Rate limit underflow events
-            now = time.monotonic()
-            if self._last_underflow_event_time is not None:
-                if (now - self._last_underflow_event_time) < self._underflow_event_cooldown:
-                    return
-            self._last_underflow_event_time = now
-            
-            try:
-                self._tower_control.send_event(
-                    event_type="station_underflow",
-                    timestamp=now,
-                    metadata={
-                        "buffer_depth": 0,
-                        "frames_dropped": 0  # No frames dropped for underflow, just waiting for data
-                    }
-                )
-            except Exception as e:
-                # Non-blocking per contract - silently drop if event send fails
-                logger.debug(f"Error sending station_underflow event: {e}")
-    
-    def _emit_overflow_event(self):
-        """
-        Emit station_overflow event when frames are dropped due to buffer full condition.
-        
-        Per contract OS3.2: Event MUST be emitted when buffer overflow is detected.
-        Event MUST be non-blocking and purely observational.
-        """
-        if not self._tower_control:
-            return
-        
-        # Rate limit overflow events to avoid spam
-        now = time.monotonic()
-        if self._last_overflow_event_time is not None:
-            if (now - self._last_overflow_event_time) < self._overflow_event_cooldown:
-                return
-        self._last_overflow_event_time = now
-        
-        try:
-            # Calculate buffer depth in frames (approximate - based on bytes in buffer)
-            buffer_depth_frames = len(self._buffer) // self.frame_bytes
-            
-            self._tower_control.send_event(
-                event_type="station_overflow",
-                timestamp=now,
-                metadata={
-                    "buffer_depth": buffer_depth_frames,
-                    "frames_dropped": self._frames_dropped_overflow
-                }
-            )
-        except Exception as e:
-            # Non-blocking per contract - silently drop if event send fails
-            logger.debug(f"Error sending station_overflow event: {e}")
-    
-    def _check_and_emit_underflow_event(self):
-        """
-        Check for buffer underflow condition and emit event if detected.
-        
-        Per contract OS3.1: Event MUST be emitted when buffer becomes empty.
-        For TowerPCMSink, underflow means internal buffer is empty and no complete frame available.
-        Event MUST be non-blocking and purely observational.
-        """
-        if not self._tower_control:
-            return
-        
-        # Check if buffer is empty (no complete frames available)
-        buffer_depth_frames = len(self._buffer) // self.frame_bytes
-        if buffer_depth_frames == 0 and len(self._buffer) == 0:
-            # Rate limit underflow events
-            now = time.monotonic()
-            if self._last_underflow_event_time is not None:
-                if (now - self._last_underflow_event_time) < self._underflow_event_cooldown:
-                    return
-            self._last_underflow_event_time = now
-            
-            try:
-                self._tower_control.send_event(
-                    event_type="station_underflow",
-                    timestamp=now,
-                    metadata={
-                        "buffer_depth": 0,
-                        "frames_dropped": 0  # No frames dropped for underflow, just waiting for data
-                    }
-                )
-            except Exception as e:
-                # Non-blocking per contract - silently drop if event send fails
-                logger.debug(f"Error sending station_underflow event: {e}")
-

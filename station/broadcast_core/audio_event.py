@@ -7,8 +7,8 @@ Architecture 3.1 Reference:
 - Section 6: Audio Event Model
 """
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Dict, Any
 
 
 @dataclass
@@ -25,8 +25,10 @@ class AudioEvent:
         path: Path to the MP3 file
         type: Type of audio segment
         gain: Gain multiplier for audio level (default 1.0)
+        metadata: Optional MP3 metadata (title, artist, duration) extracted during THINK phase
     """
     path: str
     type: Literal["song", "intro", "outro", "talk", "id"]
     gain: float = 1.0
+    metadata: Optional[Dict[str, Any]] = field(default=None)
 

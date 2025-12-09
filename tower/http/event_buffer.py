@@ -34,16 +34,10 @@ class StationEvent:
 
 # Accepted event types per contract T-EVENTS1
 ACCEPTED_EVENT_TYPES = {
-    "segment_started",
-    "segment_progress",
-    "segment_finished",
-    "dj_think_started",
-    "dj_think_completed",
-    "decode_clock_skew",
-    "station_underflow",
-    "station_overflow",
-    "station_shutting_down",
     "station_starting_up",
+    "station_shutting_down",
+    "new_song",
+    "dj_talking",
 }
 
 
@@ -69,6 +63,9 @@ class EventBuffer:
         self._events: deque[StationEvent] = deque(maxlen=capacity)
         self._lock = threading.Lock()
         self._overflow_count = 0
+        # Track overflow rate for better logging
+        self._last_overflow_log_time = time.time()
+        self._overflow_count_since_last_log = 0
         # Track station shutdown state per contract T-EVENTS5 exception
         self._station_shutting_down = False
     
@@ -87,7 +84,7 @@ class EventBuffer:
             True if event was stored, False if validation failed
         """
         # Validate event per contract T-EVENTS7
-        if not self._validate_event(event_type, timestamp, metadata):
+        if not self.validate_event(event_type, timestamp, metadata):
             return False
         
         # Create event with tower_received_at timestamp per contract T-EVENTS2
@@ -114,11 +111,25 @@ class EventBuffer:
             # Track overflow per contract T-EVENTS2.5
             if was_full:
                 self._overflow_count += 1
-                if self._overflow_count % 100 == 1:  # Log every 100th overflow
+                self._overflow_count_since_last_log += 1
+                
+                # Log periodically (every 60 seconds or every 1000 overflows, whichever comes first)
+                now = time.time()
+                time_since_last_log = now - self._last_overflow_log_time
+                
+                if time_since_last_log >= 60.0 or self._overflow_count_since_last_log >= 1000:
+                    # Calculate overflow rate (events per second)
+                    # Use a minimum time window of 1 second to avoid division by zero or misleading rates
+                    effective_time = max(time_since_last_log, 1.0)
+                    overflow_rate = self._overflow_count_since_last_log / effective_time
                     logger.warning(
-                        f"Event buffer overflow: {self._overflow_count} events dropped "
-                        f"(FIFO eviction per contract T-EVENTS2.5)"
+                        f"Event buffer overflow: {self._overflow_count_since_last_log} events dropped "
+                        f"in last {time_since_last_log:.1f}s "
+                        f"(rate: {overflow_rate:.1f} events/s, total: {self._overflow_count} since startup). "
+                        f"Buffer capacity: {self.capacity}. FIFO eviction per contract T-EVENTS2.5"
                     )
+                    self._last_overflow_log_time = now
+                    self._overflow_count_since_last_log = 0
         
         return True
     
@@ -227,9 +238,11 @@ class EventBuffer:
         with self._lock:
             return self._station_shutting_down
     
-    def _validate_event(self, event_type: str, timestamp: float, metadata: Dict[str, Any]) -> bool:
+    def validate_event(self, event_type: str, timestamp: float, metadata: Dict[str, Any]) -> bool:
         """
         Validate event per contract T-EVENTS7.
+        
+        Public method for validating events without storing them.
         
         Returns:
             True if valid, False otherwise

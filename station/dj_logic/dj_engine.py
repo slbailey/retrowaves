@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from station.broadcast_core.audio_event import AudioEvent
-from station.broadcast_core.playout_engine import DJCallback, PlayoutEngine
+from station.broadcast_core.playout_engine import DJCallback, PlayoutEngine, _get_mp3_metadata
 from station.dj_logic.intent_model import DJIntent
 from station.dj_logic.ticklers import Tickler, GenerateIntroTickler, GenerateOutroTickler, RefillGenericIDTickler
 from station.dj_logic.asset_discovery import AssetDiscoveryManager
@@ -161,18 +161,6 @@ class DJEngine:
         
         logger.info(f"[DJ] THINK Phase: Segment started - {segment.type} - {segment.path}")
         
-        # Emit dj_think_started heartbeat event to Tower (per contract DJ4.1)
-        think_start_time = time.monotonic()
-        if self._tower_control:
-            try:
-                self._tower_control.send_event(
-                    event_type="dj_think_started",
-                    timestamp=think_start_time,
-                    metadata={}
-                )
-            except Exception as e:
-                logger.debug(f"Error sending dj_think_started event: {e}")
-        
         # Phase 9: Maybe rescan assets (only once per hour, non-blocking)
         self.asset_manager.maybe_rescan()
         
@@ -215,7 +203,11 @@ class DJEngine:
         
         # Choose next song using rotation logic (weighted variety)
         next_song_path = self._select_next_song(current_song_path=segment.path)
-        next_song = AudioEvent(path=next_song_path, type="song")
+        
+        # Extract MP3 metadata during THINK phase (not DO phase)
+        # This ensures metadata extraction doesn't block playout
+        metadata = _get_mp3_metadata(next_song_path) if next_song_path else None
+        next_song = AudioEvent(path=next_song_path, type="song", metadata=metadata)
         logger.info(f"[DJ] THINK: Selected next song - {next_song_path}")
         
         # Select outro if talking
@@ -278,29 +270,6 @@ class DJEngine:
         logger.info(f"[DJ] THINK: DJIntent committed - "
                    f"outro={outro is not None}, ids={len(station_ids) if station_ids else 0}, "
                    f"intro={intro is not None}, song={next_song.path}")
-        
-        # Emit dj_think_completed heartbeat event to Tower (per contract DJ4.2)
-        think_end_time = time.monotonic()
-        think_duration_ms = (think_end_time - think_start_time) * 1000.0
-        if self._tower_control:
-            try:
-                # Create a read-only representation of DJIntent for metadata
-                intent_dict = {
-                    "next_song": next_song.path if next_song else None,
-                    "has_outro": outro is not None,
-                    "has_station_ids": station_ids is not None and len(station_ids) > 0,
-                    "has_intro": intro is not None
-                }
-                self._tower_control.send_event(
-                    event_type="dj_think_completed",
-                    timestamp=think_end_time,
-                    metadata={
-                        "dj_intent": intent_dict,
-                        "think_duration_ms": think_duration_ms
-                    }
-                )
-            except Exception as e:
-                logger.debug(f"Error sending dj_think_completed event: {e}")
     
     def on_segment_finished(self, segment: AudioEvent) -> None:
         """

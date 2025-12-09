@@ -9,9 +9,9 @@ import uuid
 import json
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from tower.http.event_buffer import EventBuffer
+from tower.http.event_broadcaster import EventBroadcaster
 from tower.http.websocket import (
     parse_upgrade_request,
     create_upgrade_response,
@@ -74,7 +74,7 @@ class HTTPServer:
     - Maintains thread-safe client registry (T-CLIENTS3)
     - Validates socket send return values (T-CLIENTS4)
     """
-    def __init__(self, host, port, frame_source, buffer_stats_provider=None, event_buffer_capacity=1000):
+    def __init__(self, host, port, frame_source, buffer_stats_provider=None):
         """
         Initialize HTTPServer.
         
@@ -83,7 +83,6 @@ class HTTPServer:
             port: Port to listen on
             frame_source: Must implement .pop() returning bytes (for /stream endpoint)
             buffer_stats_provider: Optional object with .stats() method returning buffer stats (for /tower/buffer endpoint)
-            event_buffer_capacity: Maximum number of events to store (default: 1000)
         """
         self.host = host
         self.port = port
@@ -95,15 +94,11 @@ class HTTPServer:
         self._connected_clients: dict[str, _ClientState] = {}
         self._clients_lock = threading.Lock()
         
-        # Event buffer per contract T-EVENTS2
-        self.event_buffer = EventBuffer(capacity=event_buffer_capacity)
-        
-        # Track last broadcasted event ID to prevent duplicate broadcasts
-        self._last_broadcasted_event_id: Optional[str] = None
-        self._last_broadcasted_lock = threading.Lock()
+        # Event broadcaster per contract T-EVENTS2 (no storage, only tracks shutdown state)
+        self.event_buffer = EventBroadcaster()
         
         # Event streaming clients (for /tower/events WebSocket endpoint) per contract T-EXPOSE1
-        self._event_clients: dict[str, socket.socket] = {}
+        self._event_clients: dict[str, dict] = {}
         self._event_clients_lock = threading.Lock()
         
         # Backwards compatibility: connection_manager proxy for tests
@@ -203,9 +198,7 @@ class HTTPServer:
                                 key, value = param.split("=", 1)
                                 query_params[key] = value
                     
-                    if base_path == "/tower/events/recent":
-                        self._handle_websocket_events_recent(client, client_id, ws_info['sec-websocket-key'], query_params)
-                    elif base_path == "/tower/events":
+                    if base_path == "/tower/events":
                         self._handle_websocket_events(client, client_id, ws_info['sec-websocket-key'], query_params)
                     else:
                         self._handle_404(client, path)
@@ -675,17 +668,23 @@ class HTTPServer:
             timestamp = event_data.get("timestamp")
             metadata = event_data.get("metadata", {})
             
-            # Validate and store event per contract T-EVENTS7
-            success = self.event_buffer.add_event(event_type, timestamp, metadata)
+            # Validate event per contract T-EVENTS7
+            success = self.event_buffer.validate_event(event_type, timestamp, metadata)
             
             if success:
+                # Update shutdown state for critical events (per contract T-EVENTS5 exception)
+                critical_events = {"station_starting_up", "station_shutting_down"}
+                if event_type in critical_events:
+                    self.event_buffer.update_shutdown_state(event_type)
+                
+                # Broadcast event immediately to connected clients (per contract T-EXPOSE1.7)
+                self._broadcast_event_to_streaming_clients(event_type, timestamp, metadata)
+                
                 response = (
                     "HTTP/1.1 204 No Content\r\n"
                     "Connection: close\r\n"
                     "\r\n"
                 )
-                # Broadcast to streaming clients per contract T-EXPOSE1.7 (immediate flush)
-                self._broadcast_event_to_streaming_clients()
             else:
                 # Invalid event - silently dropped per contract T-EVENTS7
                 response = (
@@ -718,32 +717,13 @@ class HTTPServer:
         
         Per contract T-EXPOSE1:
         - Accepts WebSocket upgrade requests from clients
-        - Streams heartbeat events immediately as they are stored
+        - Broadcasts heartbeat events immediately upon receipt
         - Supports multiple simultaneous WS clients
         - Broadcasts events to all connected clients without delay
         """
         # Parse query parameters
         event_type_filter = query_params.get("event_type")
-        since = query_params.get("since")
-        since_timestamp = None
-        if since:
-            try:
-                since_timestamp = float(since)
-            except ValueError:
-                # Reject upgrade with 400
-                response = (
-                    "HTTP/1.1 400 Bad Request\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    '{"error": "Invalid since parameter"}\n'
-                )
-                try:
-                    client.sendall(response.encode("ascii"))
-                except Exception:
-                    pass
-                client.close()
-                return
+        # Note: 'since' parameter removed per contract - events are not stored
         
         # Perform WebSocket upgrade
         try:
@@ -754,69 +734,12 @@ class HTTPServer:
             client.close()
             return
         
-        # Get the timestamp of the most recent event BEFORE adding client to prevent race condition
-        # This ensures we don't receive events via broadcast that we'll also get from the stream
-        with self._event_clients_lock:
-            # Get the most recent event timestamp to use as a cutoff
-            recent_result = self.event_buffer.get_recent_events(limit=1)
-            cutoff_timestamp = None
-            cutoff_event_id = None
-            if recent_result["events"]:
-                # Use a timestamp slightly after the most recent event to ensure we don't duplicate it
-                cutoff_timestamp = recent_result["events"][0].get("tower_received_at", 0) + 0.001
-                cutoff_event_id = recent_result["events"][0].get("event_id")
-        
-        # Track which events we've sent to this client to prevent duplicates
-        sent_event_ids = set()
-        
-        # Send existing events that match filters (BEFORE adding client to avoid race condition)
-        # Send all events up to (but not including) the cutoff timestamp
-        try:
-            for event in self.event_buffer.get_events_stream(
-                event_type=event_type_filter,
-                since=since_timestamp
-            ):
-                # Stop before events that will be sent via broadcast
-                if cutoff_timestamp is not None and event.tower_received_at >= cutoff_timestamp:
-                    break
-                if not self.running:
-                    break
-                
-                # Skip if we've already sent this event (defensive check)
-                if event.event_id in sent_event_ids:
-                    continue
-                sent_event_ids.add(event.event_id)
-                
-                # Format as JSON message per contract T-EXPOSE1
-                event_json = json.dumps({
-                    "event_type": event.event_type,
-                    "timestamp": event.timestamp,
-                    "tower_received_at": event.tower_received_at,
-                    "event_id": event.event_id,
-                    "metadata": event.metadata
-                })
-                
-                # Send WebSocket text frame
-                try:
-                    frame = encode_websocket_frame(event_json.encode('utf-8'), opcode=0x1)  # Text frame
-                    client.sendall(frame)
-                except (OSError, BrokenPipeError, ConnectionError):
-                    # Client disconnected
-                    break
-        except Exception as e:
-            logger.warning(f"Error sending initial events to client {client_id}: {e}")
-        
         # Add client to event streaming clients per contract T-EXPOSE1.2
-        # Do this AFTER sending initial events to avoid race condition with broadcasts
         with self._event_clients_lock:
             self._event_clients[client_id] = {
                 'socket': client,
                 'event_type_filter': event_type_filter,
-                'since_timestamp': since_timestamp,
-                'last_send_time': time.time(),
-                'cutoff_timestamp': cutoff_timestamp,  # Track events received before connection
-                'cutoff_event_id': cutoff_event_id,  # Track the specific event at cutoff
-                'sent_event_ids': sent_event_ids  # Track which events we've already sent
+                'last_send_time': time.time()
             }
         
         # Keep connection alive and handle incoming frames (ping/pong, close)
@@ -882,114 +805,29 @@ class HTTPServer:
             except Exception:
                 pass
     
-    def _handle_websocket_events_recent(self, client, client_id, sec_websocket_key, query_params):
+    def _broadcast_event_to_streaming_clients(self, event_type: str, timestamp: float, metadata: Dict[str, Any]):
         """
-        Handle WebSocket upgrade and send recent events for /tower/events/recent endpoint.
-        
-        Per contract T-EXPOSE2:
-        - Accepts WebSocket upgrade requests from clients
-        - Sends the most recent N events immediately upon connection
-        - Each event sent as a separate WebSocket text message
-        """
-        try:
-            # Parse query parameters
-            limit = 100  # Default per contract
-            if "limit" in query_params:
-                try:
-                    limit = int(query_params["limit"])
-                    if limit < 1:
-                        limit = 100
-                    if limit > 1000:
-                        limit = 1000
-                except ValueError:
-                    limit = 100
-            
-            event_type_filter = query_params.get("event_type")
-            since = query_params.get("since")
-            since_timestamp = None
-            if since:
-                try:
-                    since_timestamp = float(since)
-                except ValueError:
-                    # Reject upgrade with 400
-                    response = (
-                        "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                        '{"error": "Invalid since parameter"}\n'
-                    )
-                    try:
-                        client.sendall(response.encode("ascii"))
-                    except Exception:
-                        pass
-                    client.close()
-                    return
-            
-            # Perform WebSocket upgrade
-            try:
-                upgrade_response = create_upgrade_response(sec_websocket_key)
-                client.sendall(upgrade_response)
-            except Exception as e:
-                logger.warning(f"Error sending WebSocket upgrade response: {e}")
-                client.close()
-                return
-            
-            # Get recent events per contract T-EXPOSE2
-            result = self.event_buffer.get_recent_events(
-                limit=limit,
-                event_type=event_type_filter,
-                since=since_timestamp
-            )
-            
-            # Send each event as a separate WebSocket text message
-            for event_dict in result.get("events", []):
-                try:
-                    event_json = json.dumps(event_dict)
-                    frame = encode_websocket_frame(event_json.encode('utf-8'), opcode=0x1)  # Text frame
-                    client.sendall(frame)
-                except (OSError, BrokenPipeError, ConnectionError):
-                    # Client disconnected
-                    client.close()
-                    return
-            
-            # Close WebSocket connection after sending events
-            # Per contract: "MAY close after sending the initial batch"
-            try:
-                close_frame = create_close_frame()
-                client.sendall(close_frame)
-            except Exception:
-                pass
-            client.close()
-            
-        except Exception as e:
-            logger.warning(f"Error handling /tower/events/recent WebSocket: {e}")
-            try:
-                client.close()
-            except Exception:
-                pass
-    
-    def _broadcast_event_to_streaming_clients(self):
-        """
-        Broadcast most recent event to all connected WebSocket clients.
+        Broadcast event to all connected WebSocket clients.
         
         Per contract T-EXPOSE1.7: Immediate flush requirement.
-        Events MUST be pushed to clients as soon as they are stored.
+        Events MUST be pushed to clients as soon as they are received.
+        
+        Args:
+            event_type: Event type
+            timestamp: Station Clock A timestamp
+            metadata: Event metadata
         """
-        # Get the most recent event (just added)
-        result = self.event_buffer.get_recent_events(limit=1)
-        if not result["events"]:
-            return
+        import time as time_module
+        import uuid
         
-        event_dict = result["events"][0]
-        event_id = event_dict.get("event_id")
-        
-        # Prevent duplicate broadcasts of the same event
-        with self._last_broadcasted_lock:
-            if event_id == self._last_broadcasted_event_id:
-                # This event was already broadcasted, skip
-                return
-            self._last_broadcasted_event_id = event_id
+        # Create event dict with tower_received_at timestamp
+        event_dict = {
+            "event_type": event_type,
+            "timestamp": timestamp,
+            "tower_received_at": time_module.time(),  # Tower wall-clock time
+            "event_id": str(uuid.uuid4()),
+            "metadata": metadata
+        }
         
         event_json = json.dumps(event_dict)
         
@@ -998,56 +836,24 @@ class HTTPServer:
         
         # Broadcast to all streaming clients
         dead_clients = []
-        event_received_at = event_dict.get('tower_received_at', 0)
         
         with self._event_clients_lock:
             clients_copy = dict(self._event_clients)
         
         for client_id, client_info in clients_copy.items():
-            # Skip if this client is for /tower/events/recent (one-shot)
             if isinstance(client_info, dict) and 'socket' in client_info:
                 client_sock = client_info['socket']
                 
-                # Skip if this event was received before the client connected
-                # (it will be sent via get_events_stream instead)
-                cutoff_timestamp = client_info.get('cutoff_timestamp')
-                cutoff_event_id = client_info.get('cutoff_event_id')
-                if cutoff_timestamp is not None and event_received_at <= cutoff_timestamp:
-                    continue
-                # Also skip if this is the exact event at the cutoff (defensive check)
-                if cutoff_event_id and event_id == cutoff_event_id:
-                    continue
-                
-                # Skip if we've already sent this event to this client (defensive check)
-                sent_event_ids = client_info.get('sent_event_ids')
-                if sent_event_ids and event_id in sent_event_ids:
-                    continue
-                
                 # Check filters
                 event_type_filter = client_info.get('event_type_filter')
-                since_timestamp = client_info.get('since_timestamp')
                 
                 # Apply filters
-                if event_type_filter and event_dict.get('event_type') != event_type_filter:
+                if event_type_filter and event_type != event_type_filter:
                     continue
-                if since_timestamp and event_received_at < since_timestamp:
-                    continue
-                
-                # Mark this event as sent to this client
-                if sent_event_ids is not None:
-                    sent_event_ids.add(event_id)
                 
                 try:
                     client_sock.sendall(ws_frame)
                     client_info['last_send_time'] = time.time()
-                except (OSError, BrokenPipeError, ConnectionError):
-                    dead_clients.append(client_id)
-            else:
-                # Old format (socket directly) - backward compatibility
-                try:
-                    client_sock = client_info if isinstance(client_info, socket.socket) else None
-                    if client_sock:
-                        client_sock.sendall(ws_frame)
                 except (OSError, BrokenPipeError, ConnectionError):
                     dead_clients.append(client_id)
         

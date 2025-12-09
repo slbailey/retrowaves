@@ -219,7 +219,7 @@ Startup order **MUST** be:
 2. Construct FallbackProvider
 3. Construct EncoderManager
 4. Construct AudioPump
-5. Construct event buffer (for Station heartbeat events)
+5. Initialize event broadcaster (no storage or buffering; real-time delivery only)
 6. Start FFmpegSupervisor
 7. Start HTTP server (including event endpoints)
 8. Start the frame-driven broadcast loop which retrieves MP3 frames from EncoderManager as they become available.
@@ -286,22 +286,18 @@ TowerRuntime **MUST** accept Station heartbeat events and expose them via WebSoc
 TowerRuntime **MUST** accept Station heartbeat events via HTTP POST to `/tower/events/ingest` (or equivalent internal interface).
 
 **Accepted event types:**
-- `segment_started` — Segment playback started
-- `segment_progress` — Segment playback progress update
-- `segment_finished` — Segment playback finished
-- `dj_think_started` — THINK phase started
-- `dj_think_completed` — THINK phase completed
-- `decode_clock_skew` — Clock A drift detected (if drift compensation enabled)
-- `station_underflow` — Station buffer underflow
-- `station_overflow` — Station buffer overflow
-- `station_shutting_down` — Station is shutting down
 - `station_starting_up` — Station is starting up
+- `station_shutting_down` — Station is shutting down
+- `new_song` — A new song (MP3) has started playing
+- `dj_talking` — DJ has started talking between songs
 
 **Event sending requirements:**
 - `station_starting_up` **MUST** be sent exactly once when Station starts up
 - `station_shutting_down` **MUST** be sent exactly once when Station shuts down
+- `new_song` **MUST** be sent every time a new song MP3 starts playing
+- `dj_talking` **MUST** be sent when DJ starts talking, but only once even if multiple talking MP3 files are strung together
 - Station **MUST NOT** send multiple `station_starting_up` or `station_shutting_down` events
-- Station **MUST** track whether these events have been sent to prevent duplicates
+- Station **MUST** track whether lifecycle events have been sent to prevent duplicates
 
 #### T-EVENTS1.4 — Event Ingestion Access Control
 TowerRuntime **MUST** expose `/tower/events/ingest` only to trusted internal systems.
@@ -313,23 +309,22 @@ TowerRuntime **MUST** expose `/tower/events/ingest` only to trusted internal sys
 
 This mirrors the PCM ingest contract (Station→Tower PCM is also internal-only). The ingestion endpoint is an internal interface, not a public API.
 
-#### T-EVENTS2 — Event Storage
-TowerRuntime **MUST** store received events in a bounded, thread-safe event buffer.
+#### T-EVENTS2 — Event Delivery
+TowerRuntime **MUST NOT** store events.
 
-- Events **MUST** be stored with timestamps (Tower wall-clock time when received)
-- Event buffer **MUST** have a maximum capacity (implementation-defined, e.g., 1000 events)
-- When buffer is full, oldest events **MUST** be dropped (FIFO eviction)
-- Event storage **MUST** be thread-safe
+- Events are delivered only to currently connected WebSocket clients
+- Events **MUST** be dropped immediately if no clients are connected
+- Events **MUST** include `tower_received_at` timestamp (Tower wall-clock time when received) before delivery
 
 #### T-EVENTS2.5 — Overload Handling
-If TowerRuntime receives events faster than they can be stored or streamed:
+Since no event storage exists, overload conditions do not apply.
 
-- **MUST** drop oldest events (FIFO eviction)
-- **MUST NOT** block ingestion
-- **MUST NOT** exert backpressure on Station
-- **MUST** log overflow events for observability
+- TowerRuntime **MUST** drop events that cannot be delivered immediately
+- TowerRuntime **MUST NOT** block ingestion
+- TowerRuntime **MUST NOT** exert backpressure on Station
+- TowerRuntime **MUST NOT** queue events for clients who are not currently connected
 
-Since Tower does not influence Station timing, it also cannot influence event pacing. Tower **MUST** accept events at whatever rate Station sends them, dropping oldest events when buffer is full, without blocking or backpressure.
+Since Tower does not influence Station timing, it also cannot influence event pacing. Tower **MUST** accept events at whatever rate Station sends them, delivering them immediately to connected clients or dropping them if no clients are connected, without blocking or backpressure.
 
 #### T-EVENTS3 — Event Format
 Received events **MUST** conform to Station heartbeat event format:
@@ -341,10 +336,15 @@ Received events **MUST** conform to Station heartbeat event format:
   "tower_received_at": <float>,  // Tower wall-clock timestamp when received
   "metadata": {
     // Event-specific metadata (varies by event type)
-    "segment_id": "<string>",
-    "elapsed_time": <float>,
-    "expected_duration": <float>,
-    // ... other fields per event type
+    // For "new_song" events:
+    //   "file_path": "<string>",  // Path to MP3 file
+    //   "title": "<string>",      // Song title (from MP3 metadata, if available)
+    //   "artist": "<string>",      // Artist name (from MP3 metadata, if available)
+    //   "duration": <float>,       // Duration in seconds (from MP3 metadata, if available)
+    // For "dj_talking" events:
+    //   (no metadata required)
+    // For lifecycle events ("station_starting_up", "station_shutting_down"):
+    //   (no metadata required)
   }
 }
 ```
@@ -394,7 +394,7 @@ Event reception **MUST** be non-blocking.
 - Event ingestion **MUST NOT** block MP3 encoding
 - Event ingestion **MUST NOT** block HTTP streaming
 
-Event storage **MUST** complete quickly (< 1ms typical, < 10ms maximum).
+Event delivery **MUST** complete quickly (< 1ms typical, < 10ms maximum).
 
 #### T-EVENTS7 — Event Validation
 TowerRuntime **MUST** validate received events:
@@ -417,20 +417,20 @@ TowerRuntime **MUST** expose a WebSocket endpoint `/tower/events` that:
 
 - Accepts WebSocket upgrade requests from clients
 - Maintains a persistent, bidirectional WS connection (Tower will only send; clients MAY send pings)
-- Streams heartbeat events immediately as they are stored in the event buffer
+- Broadcasts heartbeat events immediately upon receipt to all connected WebSocket clients
 - Supports multiple simultaneous WS clients
 - Ensures each new event is broadcast to all connected clients without batching or delay
+- **MUST NOT** queue or buffer events for clients who are not currently connected
 - Disconnects any client that cannot accept data for >250ms
 - Closes WS connections cleanly on server shutdown
 
 **WebSocket message format:**
 - Each WS message **MUST** contain exactly one event as a complete JSON object
 - Messages **MUST** be text-format JSON (not binary)
-- Events **MUST** be emitted in order of reception (FIFO)
+- Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** store events for ordering enforcement
 
 **Query parameters (optional, supported during WS upgrade):**
-- `event_type`: Filter by event type (e.g., `?event_type=segment_started`)
-- `since`: Only stream events received after this timestamp (Unix timestamp)
+- `event_type`: Filter by event type (e.g., `?event_type=new_song`)
 
 #### T-EXPOSE1.2 — WebSocket Fanout
 TowerRuntime **MUST** maintain a registry of connected WebSocket clients.
@@ -442,36 +442,18 @@ Slow or stalled WS clients **MUST** be dropped without impacting other clients.
 WebSocket client handling **MUST** follow the same rules as MP3 stream clients (T-CLIENTS1–4): non-blocking writes, >250ms disconnect threshold, thread-safe registry, socket send validation.
 
 #### T-EXPOSE1.7 — Immediate Flush Requirement
-When a new event is stored in the buffer, and clients are connected to `/tower/events`, TowerRuntime **MUST** send the event to all connected WebSocket clients immediately upon storage, with no batching or intentional delay.
+When a new event is received, and clients are connected to `/tower/events`, TowerRuntime **MUST** send the event to all connected WebSocket clients immediately upon receipt, with no batching or intentional delay.
 
-- Events **MUST** be pushed to clients as soon as they are stored
+- Events **MUST** be pushed to clients as soon as they are received
 - Events **MUST NOT** be batched or delayed for efficiency
 - Events **MUST** be flushed immediately to maintain real-time synchronization
+- TowerRuntime **MAY** drop events if a WebSocket write is non-blocking and fails or stalls
 - This ensures event visual overlays stay in sync with audio as closely as possible (observational sync)
-
-#### T-EXPOSE2 — `/tower/events/recent` WebSocket Endpoint
-TowerRuntime **MUST** expose a WebSocket endpoint `/tower/events/recent` that:
-
-- Accepts WebSocket upgrade requests from clients
-- Maintains a persistent, bidirectional WS connection (Tower will only send; clients MAY send pings)
-- Sends the most recent N events immediately upon connection (N is implementation-defined, e.g., 100)
-- Supports query parameters during WS upgrade to filter events
-- Closes WS connections cleanly on server shutdown
-
-**Query parameters (optional, supported during WS upgrade):**
-- `limit`: Maximum number of recent events to send initially (default: implementation-defined, e.g., 100)
-- `event_type`: Filter by event type (e.g., `?event_type=segment_progress`)
-- `since`: Only return events received after this timestamp (Unix timestamp)
-
-**Message format:**
-Each WebSocket message **MUST** contain exactly one event as a complete JSON object. Messages **MUST** be text-format JSON (not binary).
-
-After sending the initial batch of recent events, the connection **MAY** remain open to receive new events as they arrive (same behavior as `/tower/events`), or it **MAY** close after sending the initial batch (implementation-defined).
 
 **Note:** All event exposure **MUST** occur exclusively via WebSocket. TowerRuntime **MUST NOT** expose HTTP endpoints for event retrieval.
 
 #### T-EXPOSE3 — Non-Blocking Endpoints
-Both WebSocket event endpoints **MUST** be non-blocking:
+The WebSocket event endpoint **MUST** be non-blocking:
 
 - Endpoints **MUST NOT** block the audio tick loop
 - Endpoints **MUST NOT** block PCM processing
@@ -479,15 +461,8 @@ Both WebSocket event endpoints **MUST** be non-blocking:
 - Endpoints **MUST NOT** block HTTP streaming
 - WebSocket operations **MUST NOT** block event ingestion
 
-Event retrieval and transmission **MUST** complete quickly (< 10ms typical, < 100ms maximum).
+Event delivery **MUST** complete quickly (< 10ms typical, < 100ms maximum).
 
-#### T-EXPOSE4 — Thread-Safe Event Access
-Event buffer access **MUST** be thread-safe:
-
-- Multiple clients **MAY** read events concurrently
-- Event ingestion **MAY** occur concurrently with event retrieval
-- No locks **MUST** block the audio tick loop
-- No locks **MUST** block PCM processing
 
 #### T-EXPOSE5 — Client Handling
 Event endpoints **MUST** follow the same client handling rules as `/stream`:
@@ -498,26 +473,25 @@ Event endpoints **MUST** follow the same client handling rules as `/stream`:
 - Socket send return values **MUST** be validated (per T-CLIENTS4)
 
 #### T-EXPOSE6 — Event Ordering
-Events **MUST** be returned in order of reception (FIFO):
+Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** store events for ordering enforcement.
 
-- Events received earlier **MUST** appear before events received later
-- Event ordering **MUST** be preserved across multiple clients
-- Event ordering **MUST** be preserved in `/tower/events/recent` initial batch
+- TowerRuntime cannot guarantee strict FIFO ordering across clients because events are not queued
+- Events are delivered immediately upon receipt to all connected clients
 
 #### T-EXPOSE7 — Event Filtering
-WebSocket event endpoints **MAY** support filtering by:
+The WebSocket event endpoint **MAY** support filtering by:
 
-- Event type (e.g., only `segment_started` events)
-- Timestamp range (e.g., events since a specific time)
+- Event type (e.g., only `new_song` events)
 - Other metadata fields (implementation-defined)
 
 Filtering parameters **MUST** be specified during WebSocket upgrade (via query parameters). Filtering **MUST** be fast (< 1ms) and **MUST NOT** block the audio tick loop.
 
+**Note:** Timestamp-based filtering (e.g., `since`) is not supported because events are not stored.
+
 #### T-EXPOSE8 — Error Handling
-WebSocket event endpoints **MUST** handle errors gracefully:
+The WebSocket event endpoint **MUST** handle errors gracefully:
 
 - Invalid query parameters during upgrade **MUST** reject the WebSocket upgrade with HTTP 400 (Bad Request)
-- Missing events (e.g., buffer cleared) **MUST** send empty message or close connection gracefully, not error frame
 - Server errors **MUST** close the WebSocket connection with appropriate close code
 - Errors **MUST NOT** affect audio processing or other endpoints
 - WebSocket connection failures **MUST NOT** block event ingestion
@@ -539,15 +513,14 @@ WebSocket event endpoints **MUST NOT** depend on Station timing:
 - Events may be received via Unix socket or other IPC mechanism (implementation-defined)
 - Event reception must be asynchronous and non-blocking
 
-### Event Storage
-- Events should be stored in a bounded ring buffer or similar structure
-- Buffer size should be configurable (e.g., 1000 events)
-- Oldest events should be evicted when buffer is full (FIFO)
+### Event Delivery
+- Events are not stored; they are delivered immediately to connected WebSocket clients
+- Events are dropped if no clients are connected
+- No buffering or queuing of events
 
 ### Event Exposure
 - `/tower/events` **MUST** use WebSockets for real-time event streaming
-- `/tower/events/recent` **MUST** use WebSockets to send recent events
-- Both WebSocket endpoints should support filtering via query parameters during upgrade
+- The WebSocket endpoint should support filtering via query parameters during upgrade
 - TowerRuntime **MUST NOT** expose HTTP endpoints for event retrieval
 
 ### Performance
@@ -561,7 +534,7 @@ WebSocket event endpoints **MUST NOT** depend on Station timing:
 - Tower **MUST NOT** expect clients to send data; WS is used for push/broadcast only
 - Tower **MAY** support ping/pong frames for liveness
 - Writes **MUST** be non-blocking; stalled clients **MUST** be disconnected
-- Event ordering **MUST** be preserved during WS broadcast (FIFO)
+- Events are delivered immediately upon receipt; no ordering guarantees across clients
 
 ### Security
 - Event ingestion endpoint should be internal-only (not exposed to external clients)

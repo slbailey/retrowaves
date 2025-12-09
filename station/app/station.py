@@ -43,18 +43,11 @@ class Station:
         state_path = os.getenv("DJ_STATE_PATH", "/tmp/appalachia_dj_state.json")
         self.state_store = DJStateStore(path=state_path)
 
-        # Initialize Tower control client first (needed for DJEngine events)
-        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
-        tower_port = int(os.getenv("TOWER_PORT", "8005"))
-        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
-        logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
-        
         # Initialize DJ engine
         self.dj = DJEngine(
             playout_engine=None,  # Will be set after engine creation
             rotation_manager=self.rotation,
-            dj_asset_path=dj_path,
-            tower_control=self.tower_control
+            dj_asset_path=dj_path
         )
 
         # Phase 7: Load saved state (warm-start recovery)
@@ -67,11 +60,17 @@ class Station:
 
         # Output sink - Tower PCM socket (replaces HTTP streaming)
         tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
         
         # Initialize Tower PCM sink (connects to Tower's Unix socket)
-        self.sink = TowerPCMSink(socket_path=tower_socket_path, tower_control=self.tower_control)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path)
         logger.info(f"[STATION] Tower PCM sink initialized (socket={tower_socket_path})")
         
+        # Initialize Tower control client (for sending commands to Tower)
+        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
+        logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
+
         # Real playout engine with DJ callback and output sink (Architecture 3.2)
         self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink, tower_control=self.tower_control)
         
@@ -92,11 +91,6 @@ class Station:
         Phase 7: On warm start, don't seed a song - let DJ THINK handle it.
         On cold start, seed the first song.
         """
-        # Prevent multiple calls to start() to ensure startup event is only sent once
-        if hasattr(self, '_started') and self._started:
-            logger.warning("[STATION] Station already started, ignoring duplicate start() call")
-            return
-        
         saved = self.state_store.load()
         
         if saved:
@@ -117,9 +111,9 @@ class Station:
         # Connect to Tower (TowerPCMSink handles connection automatically on first write)
         # No explicit start() needed - sink connects on demand
         
-        # Start playout loop
-        self.engine.run()
-        
+        # SL1.3: Send lifecycle event BEFORE starting playout
+        # Per SL1.3: Lifecycle event MUST be sent before playout begins to guarantee
+        # that THINK events cannot fire before the lifecycle notification is transmitted
         # Send station_starting_up event to Tower (only once per contract SL1/SL2)
         if self.tower_control and not self._lifecycle_state["station_starting_up"]:
             if self.tower_control.send_event(
@@ -128,12 +122,17 @@ class Station:
                 metadata={}
             ):
                 self._lifecycle_state["station_starting_up"] = True
-                logger.info("[STATION] Sent station_starting_up event to Tower")
+                logger.info("Sent station_starting_up event to Tower")
         elif self._lifecycle_state["station_starting_up"]:
-            logger.debug("[STATION] station_starting_up event already sent, skipping duplicate")
+            logger.debug("station_starting_up event already sent, skipping duplicate")
         
-        # Mark as started to prevent duplicate start() calls
-        self._started = True
+        # SL1.4: Start playout loop AFTER lifecycle event is sent (non-blocking - runs in background thread)
+        # Per SL1.4: Startup MUST not block playout once initiated
+        # Per SL1.3: Playout MUST start AFTER lifecycle event to ensure proper ordering
+        # PlayoutEngine.run() starts a background thread, so startup returns immediately
+        logger.info("Starting playout engine...")
+        self.engine.run()  # This starts the playout loop in a background thread
+        logger.info("Playout engine started (startup complete, playout running in background)")
 
     def stop(self) -> None:
         """
@@ -141,18 +140,6 @@ class Station:
         
         Phase 7: Saves DJ state before shutdown.
         """
-        # Send station_shutting_down event to Tower (only once per contract SL1/SL2)
-        if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
-            if self.tower_control.send_event(
-                event_type="station_shutting_down",
-                timestamp=time.monotonic(),
-                metadata={}
-            ):
-                self._lifecycle_state["station_shutting_down"] = True
-                logger.info("[STATION] Sent station_shutting_down event to Tower")
-        elif self._lifecycle_state["station_shutting_down"]:
-            logger.debug("[STATION] station_shutting_down event already sent, skipping duplicate")
-        
         # Save DJ state before stopping
         try:
             state = self.dj.to_dict()
@@ -205,5 +192,4 @@ class Station:
                         os.environ[key] = value
         except OSError:
             pass
-
 

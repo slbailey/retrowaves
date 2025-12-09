@@ -898,9 +898,7 @@ class TestStationEventReception:
         Test T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST to /tower/events/ingest.
         
         Per contract T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST.
-        Accepted event types: segment_started, segment_progress, segment_finished, dj_think_started,
-        dj_think_completed, decode_clock_skew, station_underflow, station_overflow,
-        station_shutting_down, station_starting_up.
+        Accepted event types: station_starting_up, station_shutting_down, new_song, dj_talking.
         """
         # Start HTTP server
         import random
@@ -916,7 +914,7 @@ class TestStationEventReception:
             conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
             
             test_event = {
-                "event_type": "segment_started",
+                "event_type": "new_song",
                 "timestamp": time.monotonic(),
                 "metadata": {
                     "segment_id": "test_segment_1",
@@ -944,25 +942,19 @@ class TestStationEventReception:
             service.http_server.stop()
             server_thread.join(timeout=1.0)
     
-    def test_t_events2_event_storage_buffer(self, service):
+    def test_t_events2_event_delivery_no_storage(self, service):
         """
-        Test T-EVENTS2: TowerRuntime MUST store received events in a bounded, thread-safe event buffer.
+        Test T-EVENTS2: TowerRuntime MUST NOT store events.
         
         Per contract T-EVENTS2:
-        - Events MUST be stored with timestamps (Tower wall-clock time when received)
-        - Event buffer MUST have a maximum capacity (implementation-defined, e.g., 1000 events)
-        - When buffer is full, oldest events MUST be dropped (FIFO eviction)
-        - Event storage MUST be thread-safe
+        - Events are delivered only to currently connected WebSocket clients
+        - Events MUST be dropped immediately if no clients are connected
+        - Events MUST include tower_received_at timestamp before delivery
         """
-        # Verify: Service has event buffer capability
-        # (Implementation may have event_buffer attribute or event handling infrastructure)
-        
-        # Contract requirement: Event buffer must exist
-        # Implementation may store events in TowerService or HTTP server
-        # This test verifies the infrastructure exists (actual storage tested in integration tests)
-        
-        # Note: With current implementation, this test may verify structure exists
-        # Full storage behavior tested when endpoint is implemented
+        # Verify: Service has event broadcaster (not buffer)
+        # Event broadcaster only tracks shutdown state, does not store events
+        assert hasattr(service.http_server, 'event_buffer'), \
+            "Service must have event_buffer (EventBroadcaster) for shutdown state tracking"
     
     def test_t_events7_event_validation(self, service):
         """
@@ -988,9 +980,14 @@ class TestStationEventReception:
             
             # Test 1: Valid event should be accepted
             valid_event = {
-                "event_type": "segment_started",
+                "event_type": "new_song",
                 "timestamp": time.monotonic(),
-                "metadata": {"segment_id": "test"}
+                "metadata": {
+                    "file_path": "/path/to/file.mp3",
+                    "title": "Test Song",
+                    "artist": "Test Artist",
+                    "duration": 180.0
+                }
             }
             conn.request("POST", "/tower/events/ingest",
                         json.dumps(valid_event).encode('utf-8'),
@@ -1123,14 +1120,14 @@ class TestEventExposureEndpoints:
         """
         Test T-EXPOSE1: TowerRuntime MUST expose a WebSocket endpoint /tower/events that:
         - Accepts WebSocket upgrade requests from clients
-        - Streams heartbeat events immediately as they are stored
+        - Broadcasts heartbeat events immediately upon receipt
         - Supports multiple simultaneous WS clients
         - Broadcasts events to all connected clients without delay
         
         Per contract T-EXPOSE1:
         - WebSocket message format: Each WS message MUST contain exactly one event as a complete JSON object
         - Messages MUST be text-format JSON (not binary)
-        - Events MUST be emitted in order of reception (FIFO)
+        - Events SHOULD be delivered in arrival order, but TowerRuntime MUST NOT store events for ordering enforcement
         """
         # Start HTTP server
         import random
@@ -1178,82 +1175,18 @@ class TestEventExposureEndpoints:
             service.http_server.stop()
             server_thread.join(timeout=1.0)
     
-    def test_t_expose2_tower_events_recent_endpoint(self, service):
-        """
-        Test T-EXPOSE2: TowerRuntime MUST expose a WebSocket endpoint /tower/events/recent that:
-        - Accepts WebSocket upgrade requests from clients
-        - Sends the most recent N events immediately upon connection
-        - Each event sent as a separate WebSocket text message
-        
-        Per contract T-EXPOSE2: Each WebSocket message MUST contain exactly one event as a complete JSON object.
-        """
-        # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
-        service.http_server.port = test_port
-        
-        server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
-        server_thread.start()
-        time.sleep(0.2)
-        
-        try:
-            # Test: WebSocket upgrade to /tower/events/recent should succeed
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
-            sock.connect(("localhost", test_port))
-            
-            # Send WebSocket upgrade request
-            request, key = create_websocket_upgrade_request("/tower/events/recent", port=test_port)
-            sock.sendall(request)
-            
-            # Read upgrade response
-            status_code, headers, body = read_websocket_response(sock)
-            
-            # Verify: Endpoint exists (should not return 404)
-            assert status_code != 404, \
-                (f"Contract violation [T-EXPOSE2]: /tower/events/recent WebSocket endpoint must exist. "
-                 f"Got {status_code}. This endpoint is required by contract but not implemented.")
-            
-            # Verify: Returns HTTP 101 (Switching Protocols) on successful upgrade
-            assert status_code == 101, \
-                (f"Contract violation [T-EXPOSE2]: WebSocket upgrade must return HTTP 101. "
-                 f"Got {status_code}")
-            
-            # Verify: Response includes required WebSocket headers
-            assert headers.get('upgrade', '').lower() == 'websocket', \
-                "Contract violation [T-EXPOSE2]: Upgrade header must be 'websocket'"
-            assert headers.get('connection', '').lower() == 'upgrade', \
-                "Contract violation [T-EXPOSE2]: Connection header must be 'upgrade'"
-            assert 'sec-websocket-accept' in headers, \
-                "Contract violation [T-EXPOSE2]: Response must include Sec-WebSocket-Accept header"
-            
-            # Read WebSocket messages (events)
-            messages = read_websocket_messages(sock, timeout=1.0)
-            
-            # Verify: Messages are valid JSON objects (each event is a separate message per contract)
-            for msg in messages:
-                assert isinstance(msg, dict), \
-                    "Contract violation [T-EXPOSE2]: Each WebSocket message must be a JSON object"
-                # Verify event structure
-                assert "event_type" in msg or "events" in msg, \
-                    "Contract violation [T-EXPOSE2]: Event messages must have event structure"
-            
-            sock.close()
-            
-        finally:
-            service.http_server.stop()
-            server_thread.join(timeout=1.0)
+    # T-EXPOSE2 endpoint removed per contract - events are not stored, so /tower/events/recent is no longer needed
     
     def test_t_expose3_non_blocking_endpoints(self, service):
         """
-        Test T-EXPOSE3: Both event endpoints MUST be non-blocking.
+        Test T-EXPOSE3: The event endpoint MUST be non-blocking.
         
         Per contract T-EXPOSE3:
-        - Endpoints MUST NOT block the audio tick loop
-        - Endpoints MUST NOT block PCM processing
-        - Endpoints MUST NOT block MP3 encoding
-        - Endpoints MUST NOT block HTTP streaming
-        - Event retrieval MUST complete quickly (< 10ms typical, < 100ms maximum)
+        - Endpoint MUST NOT block the audio tick loop
+        - Endpoint MUST NOT block PCM processing
+        - Endpoint MUST NOT block MP3 encoding
+        - Endpoint MUST NOT block HTTP streaming
+        - Event delivery MUST complete quickly (< 10ms typical, < 100ms maximum)
         """
         # Start HTTP server
         import random
@@ -1280,23 +1213,6 @@ class TestEventExposureEndpoints:
                      f"Response time {elapsed_time:.2f}ms exceeds 100ms maximum")
             
             conn1.close()
-            
-            # Test: /tower/events/recent endpoint should respond quickly (non-blocking)
-            conn2 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            
-            start_time = time.perf_counter()
-            conn2.request("GET", "/tower/events/recent")
-            response2 = conn2.getresponse()
-            response2.read()  # Read response to complete request
-            elapsed_time = (time.perf_counter() - start_time) * 1000.0  # Convert to ms
-            
-            # Verify: Response completes quickly (< 100ms maximum per contract)
-            if response2.status == 200:
-                assert elapsed_time < 100.0, \
-                    (f"Contract violation [T-EXPOSE3]: /tower/events/recent endpoint must be non-blocking. "
-                     f"Response time {elapsed_time:.2f}ms exceeds 100ms maximum")
-            
-            conn2.close()
             
         finally:
             service.http_server.stop()

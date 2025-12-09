@@ -228,3 +228,4 @@ def create_close_frame(code: int = 1000, reason: str = "") -> bytes:
     payload = struct.pack('!H', code) + reason.encode('utf-8')
     return encode_websocket_frame(payload, opcode=0x8)
 
+

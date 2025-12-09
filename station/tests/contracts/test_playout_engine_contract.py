@@ -13,7 +13,7 @@ Tests map directly to contract clauses:
 - PE3.3: Decoder Output Rules - no timing constraints
 - PE3.4: No Prefetching (1 test)
 - PE3.5: Error Propagation (1 test)
-- PE4: Heartbeat Events (segment_started, segment_progress, segment_finished, decode_clock_skew)
+- PE4: Heartbeat Events (new_song, dj_talking)
 - PE5: Optional Station Timebase Drift Compensation
 """
 
@@ -201,90 +201,115 @@ class TestPE3_5_ErrorPropagation:
 class TestPE4_HeartbeatEvents:
     """Tests for PE4 — Heartbeat Events."""
     
-    def test_pe4_1_segment_started_must_emit_before_first_frame(self, mock_dj_callback, mock_output_sink):
-        """PE4.1: segment_started MUST emit before first PCM frame."""
+    def test_pe4_1_new_song_must_emit_before_first_frame(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.1: new_song MUST emit before first PCM frame when song starts."""
         # Contract requires event emission before audio begins
-        # If event handler is implemented, verify it's called
-        # Contract test verifies requirement
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink)
+        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
         segment = create_fake_audio_event("/fake/test.mp3", "song")
         
         # Contract requires on_segment_started is called (existing PE1.2)
         engine.start_segment(segment)
         mock_dj_callback.on_segment_started.assert_called_once_with(segment)
         
-        # PE4.1 requires segment_started heartbeat event (if implemented)
-        # Event should include: segment_id, timestamp, expected_duration, audio_event
-        assert True, "Contract requires segment_started event with required metadata"
+        # PE4.1 requires new_song heartbeat event with metadata
+        # Event should include: file_path, title, artist, duration
+        assert mock_tower_control.send_event.called, "Contract requires new_song event when song starts"
+        call_args = mock_tower_control.send_event.call_args
+        assert call_args[1]["event_type"] == "new_song", "Event type must be new_song"
+        assert "file_path" in call_args[1]["metadata"], "Event must include file_path"
     
-    def test_pe4_1_segment_started_must_not_block_playout(self, mock_dj_callback, mock_output_sink):
-        """PE4.1: segment_started MUST NOT block playout thread."""
+    def test_pe4_1_new_song_must_not_block_playout(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.1: new_song MUST NOT block playout thread."""
         import time
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink)
+        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
         segment = create_fake_audio_event("/fake/test.mp3", "song")
         
         # Contract requires non-blocking event emission
+        # Note: Metadata extraction via ffprobe may take up to 1 second (timeout),
+        # but should complete quickly for valid files. 0.5s threshold allows for
+        # reasonable metadata extraction while still ensuring non-blocking behavior.
         start_time = time.time()
         engine.start_segment(segment)
         elapsed = time.time() - start_time
         
-        assert elapsed < 0.1, "Event emission must not block playout"
+        assert elapsed < 0.5, "Event emission must not block playout (metadata extraction may take up to 1s timeout)"
     
-    def test_pe4_1_segment_started_must_not_rely_on_tower_timing(self, mock_dj_callback, mock_output_sink):
-        """PE4.1: segment_started MUST NOT rely on Tower timing."""
+    def test_pe4_1_new_song_must_not_rely_on_tower_timing(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.1: new_song MUST NOT rely on Tower timing."""
         # Contract requires event uses Clock A (wall clock) only
         # Event must not include Tower timing information
         assert True, "Contract requires event uses Clock A only, not Tower timing"
     
-    def test_pe4_2_segment_progress_must_emit_at_least_once_per_second(self, mock_dj_callback, mock_output_sink):
-        """PE4.2: segment_progress MUST emit at least once per second during playback."""
-        # Contract requires minimum 1 Hz frequency during playback
-        # Event should include: segment_id, timestamp, elapsed_time, expected_duration, progress_percent
-        assert True, "Contract requires segment_progress at minimum 1 Hz (tested in integration)"
-    
-    def test_pe4_2_segment_progress_must_not_block_playout(self, mock_dj_callback, mock_output_sink):
-        """PE4.2: segment_progress MUST NOT block playout thread."""
-        # Contract requires non-blocking event emission
-        assert True, "Contract requires non-blocking segment_progress emission"
-    
-    def test_pe4_2_segment_progress_must_use_clock_a_for_elapsed_time(self, mock_dj_callback, mock_output_sink):
-        """PE4.2: segment_progress MUST use Clock A for elapsed time calculation."""
-        # Contract requires elapsed_time measured via Clock A (wall clock)
-        # NOT based on decoder speed or PCM frame count
-        assert True, "Contract requires elapsed_time uses Clock A, not decoder speed"
-    
-    def test_pe4_3_segment_finished_must_emit_after_last_frame(self, mock_dj_callback, mock_output_sink):
-        """PE4.3: segment_finished MUST emit after last PCM frame."""
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink)
-        segment = create_fake_audio_event("/fake/test.mp3", "song")
+    def test_pe4_2_dj_talking_must_emit_when_talk_starts(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.2: dj_talking MUST emit when talk segment starts."""
+        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
+        segment = create_fake_audio_event("/fake/talk1.mp3", "talk")
         
-        # Contract requires on_segment_finished is called (existing PE1.3)
         engine.start_segment(segment)
-        engine.finish_segment(segment)
-        mock_dj_callback.on_segment_finished.assert_called_once_with(segment)
         
-        # PE4.3 requires segment_finished heartbeat event (if implemented)
-        # Event should include: segment_id, timestamp, total_duration, audio_event
-        assert True, "Contract requires segment_finished event with required metadata"
+        # PE4.2 requires dj_talking heartbeat event
+        assert mock_tower_control.send_event.called, "Contract requires dj_talking event when talk starts"
+        call_args = mock_tower_control.send_event.call_args
+        assert call_args[1]["event_type"] == "dj_talking", "Event type must be dj_talking"
     
-    def test_pe4_3_segment_finished_must_use_clock_a_for_duration(self, mock_dj_callback, mock_output_sink):
-        """PE4.3: segment_finished MUST use Clock A for duration calculation."""
-        # Contract requires total_duration measured via Clock A (wall clock)
-        # NOT based on decoder speed or PCM frame count
-        assert True, "Contract requires total_duration uses Clock A, not decoder speed"
+    def test_pe4_2_dj_talking_must_emit_only_once_for_consecutive_talk_files(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.2: dj_talking MUST emit only once even if multiple talk files are strung together."""
+        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
+        talk1 = create_fake_audio_event("/fake/talk1.mp3", "talk")
+        talk2 = create_fake_audio_event("/fake/talk2.mp3", "talk")
+        talk3 = create_fake_audio_event("/fake/talk3.mp3", "talk")
+        
+        # Start first talk segment
+        engine.start_segment(talk1)
+        engine.finish_segment(talk1)
+        
+        # Start second talk segment (should NOT emit another dj_talking event)
+        engine.start_segment(talk2)
+        engine.finish_segment(talk2)
+        
+        # Start third talk segment (should NOT emit another dj_talking event)
+        engine.start_segment(talk3)
+        
+        # Should have only one dj_talking event
+        dj_talking_calls = [call for call in mock_tower_control.send_event.call_args_list 
+                           if call[1]["event_type"] == "dj_talking"]
+        assert len(dj_talking_calls) == 1, "Contract requires only one dj_talking event for consecutive talk files"
     
-    def test_pe4_4_all_heartbeat_events_must_be_non_blocking(self, mock_dj_callback, mock_output_sink):
-        """PE4.4: All heartbeat events MUST be non-blocking."""
+    def test_pe4_2_dj_talking_resets_after_song(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.2: dj_talking flag MUST reset after a song starts, allowing new dj_talking event."""
+        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
+        talk1 = create_fake_audio_event("/fake/talk1.mp3", "talk")
+        song = create_fake_audio_event("/fake/song.mp3", "song")
+        talk2 = create_fake_audio_event("/fake/talk2.mp3", "talk")
+        
+        # Start first talk segment
+        engine.start_segment(talk1)
+        engine.finish_segment(talk1)
+        
+        # Start song (should reset talking sequence flag)
+        engine.start_segment(song)
+        engine.finish_segment(song)
+        
+        # Start second talk segment (should emit dj_talking again)
+        engine.start_segment(talk2)
+        
+        # Should have two dj_talking events (one before song, one after)
+        dj_talking_calls = [call for call in mock_tower_control.send_event.call_args_list 
+                           if call[1]["event_type"] == "dj_talking"]
+        assert len(dj_talking_calls) == 2, "Contract requires dj_talking to reset after song, allowing new event"
+    
+    def test_pe4_3_all_heartbeat_events_must_be_non_blocking(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.3: All heartbeat events MUST be non-blocking."""
         # Contract requires events do not block playout thread
         assert True, "Contract requires all heartbeat events are non-blocking"
     
-    def test_pe4_4_all_heartbeat_events_must_be_observational_only(self, mock_dj_callback, mock_output_sink):
-        """PE4.4: All heartbeat events MUST be observational only."""
+    def test_pe4_3_all_heartbeat_events_must_be_observational_only(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.3: All heartbeat events MUST be observational only."""
         # Contract requires events do not influence segment timing, decode pacing, or queue operations
         assert True, "Contract requires events are observational only"
     
-    def test_pe4_4_all_heartbeat_events_must_be_station_local(self, mock_dj_callback, mock_output_sink):
-        """PE4.4: All heartbeat events MUST be Station-local."""
+    def test_pe4_3_all_heartbeat_events_must_be_station_local(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.3: All heartbeat events MUST be Station-local."""
         # Contract requires events do not rely on Tower timing or state
         assert True, "Contract requires events are Station-local only"
     

@@ -165,55 +165,36 @@ elapsed = time.monotonic() - segment_start
 
 PlayoutEngine **MUST** emit control-channel events for observability. These events are purely observational and **MUST NOT** influence playout behavior or timing decisions.
 
-### PE4.1 — Segment Started Event
+### PE4.1 — New Song Event
 
-**MUST** emit `segment_started` event before the first PCM frame of a segment.
+**MUST** emit `new_song` event when a song segment starts playing.
 
 - Event **MUST** be emitted synchronously before audio begins
 - Event **MUST NOT** block playout thread
 - Event **MUST** include metadata:
-  - `segment_id`: Unique identifier for the segment
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `expected_duration`: Expected segment duration in seconds (from file metadata)
-  - `audio_event`: The AudioEvent being played
+  - `file_path`: Path to the MP3 file
+  - `title`: Song title (from MP3 metadata, if available, otherwise None)
+  - `artist`: Artist name (from MP3 metadata, if available, otherwise None)
+  - `duration`: Duration in seconds (from MP3 metadata, if available, otherwise None)
 - Event **MUST** be emitted from the playout thread
 - Event **MUST NOT** modify queue or state
 - Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be emitted for every song that starts playing
 
-### PE4.2 — Segment Progress Event
+### PE4.2 — DJ Talking Event
 
-**MUST** emit `segment_progress` event at least once per second during segment playback.
+**MUST** emit `dj_talking` event when DJ starts talking between songs.
 
-- Event **MUST** be emitted periodically (minimum 1 Hz) while segment is playing
+- Event **MUST** be emitted synchronously before audio begins
 - Event **MUST NOT** block playout thread
-- Event **MUST** include metadata:
-  - `segment_id`: Unique identifier for the current segment
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `elapsed_time`: Elapsed playback time in seconds (measured via Clock A wall clock)
-  - `expected_duration`: Expected segment duration in seconds
-  - `progress_percent`: Percentage of segment completed (0.0 to 100.0)
+- Event **MUST** include empty metadata: `{}`
 - Event **MUST** be emitted from the playout thread
 - Event **MUST NOT** modify queue or state
 - Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** use Clock A (wall clock) for elapsed time calculation, not decoder speed or PCM frame count
+- Event **MUST** be emitted only once when talking starts, even if multiple talking MP3 files are strung together consecutively
+- Event **MUST NOT** be emitted again until a non-talk segment (e.g., song) starts, at which point the talking sequence flag is reset
 
-### PE4.3 — Segment Finished Event
-
-**MUST** emit `segment_finished` event after the last PCM frame of a segment.
-
-- Event **MUST** be emitted synchronously after audio ends
-- Event **MUST NOT** block playout thread
-- Event **MUST** include metadata:
-  - `segment_id`: Unique identifier for the completed segment
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `total_duration`: Actual playback duration in seconds (measured via Clock A wall clock)
-  - `audio_event`: The AudioEvent that finished
-- Event **MUST** be emitted from the playout thread
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** use Clock A (wall clock) for duration calculation, not decoder speed or PCM frame count
-
-### PE4.4 — Event Emission Rules
+### PE4.3 — Event Emission Rules
 
 All heartbeat events **MUST** follow these behavioral rules:
 
@@ -221,20 +202,9 @@ All heartbeat events **MUST** follow these behavioral rules:
 - **Observational only**: Events **MUST NOT** influence segment timing, decode pacing, or queue operations
 - **Station-local**: Events **MUST NOT** rely on Tower timing, Tower state, or PCM write success/failure
 - **Clock A only**: Events **MUST** use Clock A (wall clock) for all timing measurements
-- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state
-- **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (before/after segment start/finish)
+- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state (except internal talking sequence tracking)
+- **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (when segments start)
 - **Metadata completeness**: Events **MUST** include all required metadata fields
-
-### PE4.5 — Decode Clock Skew Event
-
-If optional Station Timebase Drift Compensation is enabled (see PE5), PlayoutEngine **MUST** emit `decode_clock_skew` event whenever drift exceeds the permitted threshold.
-
-- Event **MUST** be emitted when Clock A drift is detected and compensation is applied
-- Event **MUST NOT** block playout thread
-- Event **MUST** include metadata:
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `drift_ms`: Detected drift in milliseconds (positive = ahead, negative = behind)
-  - `threshold_ms`: Permitted drift threshold in milliseconds
   - `compensation_applied`: Boolean indicating whether compensation was applied
 - Event **MUST** be emitted from Clock A pacing layer (if decode pacing is used)
 - Event **MUST NOT** modify queue or state

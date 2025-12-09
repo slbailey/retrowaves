@@ -1,279 +1,112 @@
 # 📘 Retrowaves — Future Enhancements & Expansion Wishlist
 
-This document is a non-binding, forward-looking companion to the canonical Unified Architecture. It defines potential future enhancements, integrations, and features that may be added to Retrowaves after the core THINK/DO system and real-time audio streaming are complete.
+## Introduction
+
+This document is a **wishlist of ideas** for potential future enhancements to the Retrowaves radio automation system. It serves as a design sandbox for features worth exploring after the core THINK/DO system and real-time audio streaming are stable.
+
+**What This Document Is:**
+- A prioritized list of potential features and enhancements
+- Ideas organized by importance (stability/performance first, then features, then nice-to-haves)
+- A reference for future development phases
+- Non-binding suggestions that can be implemented when ready
+
+**What This Document Is NOT:**
+- Implementation guidance or requirements
+- Part of the core Architecture specification
+- Binding commitments or deadlines
 
 **Note:** Retrowaves is the software platform. Appalachia Radio is the first station instance that uses this software.
 
-**This is NOT implementation guidance.** It is a design sandbox for ideas worth exploring later.
+---
+
+## Priority Overview
+
+This wishlist is organized by priority, starting with features that affect **overall stability, performance, and broadcast-grade implementation**, then moving down to less critical enhancements:
+
+1. **🎯 Next Priority** - Features ready for immediate implementation
+2. **🔧 Stability & Performance** - Core system improvements
+3. **📡 Broadcast-Grade Features** - Professional radio capabilities
+4. **⚙️ Operational Enhancements** - Tools and workflows
+5. **🎨 User Experience** - Monitoring and interfaces
+6. **🤖 AI & Advanced Features** - Experimental capabilities
+7. **🌟 Stretch Goals** - Fun/experimental ideas
+8. **✅ Completed Work** - Features that have been implemented
 
 ---
 
-## 1. NEXT TO WORK ON
+## 🎯 Next Priority
 
-### Continuous HTTP Streaming Server (24×7 Endpoint Availability)
+### MP3 Fallback Support (Looping Standby Audio)
 
 **Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
 
-#### Purpose
+#### Current State
 
-Ensure the HTTP audio endpoint is always available, even when:
+✅ **Already Implemented (90%):**
+- 24×7 HTTP endpoint (`/stream`) always accepts connections
+- Continuous streaming with automatic fallback when Station is offline
+- Grace period with silence, then 440Hz tone fallback
+- WAV file fallback support via `TOWER_SILENCE_MP3_PATH`
+- Hot-swappable audio source transitions (program ↔ fallback)
+- Independent Tower operation (streams even when Station is down)
 
-- The radio station is restarting
-- The playout engine is not currently producing audio
-- A code reload is happening
-- The DJ hasn't queued the first segment
-- The system is stopped intentionally
+#### Missing Component
 
-The goal is:
+**MP3 File Fallback Support**
 
-- Clients (like VLC) NEVER see "connection refused" or "stream unavailable."
-- Instead, the stream always connects and always outputs something.
+Currently, Tower supports WAV file fallback via `TOWER_SILENCE_MP3_PATH`, but not MP3 files. This enhancement adds MP3 decoding support to enable looping "PLEASE STAND BY" MP3 files as a fallback source.
 
-#### Behavior Goals
+#### Fallback Priority Sequence
 
-This subsystem maintains a 24×7 listener port that:
+After implementation, the fallback priority order will be:
 
-🔸 **Always accepts connections**
+1. **Program PCM** (live audio from Station)
+2. **Grace Period Silence** (1.5 seconds default)
+3. **MP3 File Fallback** (if `TOWER_SILENCE_MP3_PATH` points to an MP3 file)
+4. **440Hz Tone** (synthetic sine wave)
+5. **Silence** (last resort)
 
-Never refuses VLC, even if the engine is down.
-
-🔸 **Always streams valid audio data**
-
-Even if:
-- DJEngine is offline
-- RotationManager hasn't loaded
-- PlayoutEngine is restarting
-- Station is rebooting
-
-🔸 **Provides fallback audio when live output is unavailable**
-
-Examples:
-- Silent PCM (pure silence frames)
-- Test tone (440 Hz sine wave)
-- Looping MP3 ("Please stand by while our code updates…")
-- Static test pattern file
-
-This mimics real broadcast systems that continue transmitting a carrier signal even during outages.
-
-#### Why This Matters
-
-Professional radio/TV stations never drop carrier.
-
-If the automation crashes, you still get one of:
-- A technical difficulties loop
-- A standby slate
-- A repeating announcement
-- A continuous tone
-
-It keeps the viewer/listener connected and prevents the platform (YouTube, VLC, etc.) from dropping the stream.
-
-This becomes REALLY important when streaming to YouTube:
-
-- If the connection dies for more than 30 seconds
-- YouTube kills your live event
-- Viewers get dropped
-- You have to restart a brand-new stream
-
-A 24/7 endpoint prevents this.
-
-#### How It Integrates (Clean, Modular, Architecture-Safe)
-
-This feature must NOT contaminate the core playout engine.
-
-Instead, we introduce a new subsystem:
-
-🔧 **ContinuousStreamServer**
-
-Runs independently from the DJ/Playout pipeline.
-
-Its job:
-- Accept connections 24×7
-- Stream whatever the audio engine currently provides
-- If the engine is feeding PCM → encode → output
-- If the engine stops → switch to fallback
-- If the engine restarts → resume playout seamlessly
-
-#### Fallback Audio Modes
-
-You choose any of these modes:
-
-**Mode A — Silent PCM**
-- Easy
-- Zero dependencies
-- VLC stays connected
-- YouTube stays up
-- No artifacts
-
-**Mode B — Looping MP3 file**
-
-E.g.:
-- `/mnt/media/appalachia-radio/system/please-stand-by.mp3` (station-specific path)
-
-This gives a professional aesthetic.
-
-**Mode C — Synthetic Test Tone**
-
-440 Hz generated in real-time.
-
-Reliable for debugging.
-
-**Mode D — Custom Standby Playlist**
-
-A short rotation of standby audio:
-- promos
-- DJ liners
-- station IDs
-- "We'll be right back"
-
-#### State Transitions
-
-ContinuousStreamServer reacts to events:
-
-- **When playout is active**
-  → Stream the real PCM frames generated by the PlayoutEngine.
-
-- **When playout is inactive**
-  → Switch to fallback instantly.
-
-- **When playout starts again**
-  → Switch back to live playout.
-
-Seamless. No reconnects.
+This provides a professional "Please stand by" experience instead of a test tone when Station is offline.
 
 #### Technical Requirements
 
-- **Decoupled from DJEngine / PlayoutEngine**
-  - It should not block the THINK/DO loop.
-  - Runs in its own thread
-  - 24×7, independent of playout engine lifecycle.
+- **MP3 Decoding Support**
+  - Extend `FallbackGenerator` or create `FileSource` to decode MP3 files
+  - Decode MP3 to PCM format (48kHz, stereo, 16-bit, 1024 samples per frame)
+  - Support seamless looping when file reaches EOF
+  - Pre-decode frames to avoid blocking during fallback (zero-latency requirement per `NEW_FALLBACK_PROVIDER_CONTRACT`)
 
-- **Buffered**
-  - So slow clients don't block the station.
+- **File Format Detection**
+  - Auto-detect file format (MP3 vs WAV) from `TOWER_SILENCE_MP3_PATH`
+  - Use appropriate decoder based on file extension or content
 
-- **Hot-swappable**
-  - Audio source can change without dropping sockets.
+- **Non-Blocking Operation**
+  - Per contract FP2.2: `next_frame()` must return immediately
+  - Pre-decode MP3 file at startup or first use
+  - Buffer decoded frames in memory for instant access
 
-- **HTTP keep-alive**
-  - For VLC stability.
+#### Implementation Notes
 
-#### Why This Belongs in the Wishlist, Not the Architecture Document
-
-Because:
-- It is optional
-- It does not modify THINK/DO
-- It does not modify PlayoutEngine
-- It does not modify DJIntent
-- It is a separate Output System Enhancement
-
-Architecture 3.x remains pure:
-- DJ THINK/DO → playout → output sink
-
-This Wishlist item adds:
-- Continuous output wrapper around output sinks
-- It's an extension, not a change.
+- This extends the existing `FallbackGenerator` / `FileSource` system
+- Must maintain compatibility with existing WAV fallback
+- Should follow the same priority logic in `EncoderManager._get_fallback_frame()`
+- File decoding can happen at startup (not during tick loop)
 
 #### Future Extensions
 
-- **OBS Integration**
-  - OBS listens to metadata events and automatically swaps to "Standby Scene" when:
-    - `event: playout_engine_offline`
-
 - **HLS Compatibility**
-  - The 24×7 server could generate HLS "standby segments."
+  - Generate HLS "standby segments" for HTTP Live Streaming compatibility
+  - Useful for platforms that prefer HLS over raw MP3 streams
 
 - **Icecast Relay**
-  - Standby mode becomes a mount-fallback for Icecast.
+  - Use standby mode as a mount-fallback for Icecast servers
+  - Enables Icecast to relay Tower's stream with automatic fallback
 
 ---
 
-## 2. Purpose of This Document
+## 🔧 Stability & Performance
 
-- Capture future ideas without polluting the core Architecture spec
-- Collect expansion concepts, integrations, and potential capabilities
-- Serve as a reference for future phases
-- Keep the Architecture document clean, stable, and focused
-
----
-
-## 3. Category Index (Organized by Priority)
-
-This wishlist is organized by priority and category:
-
-**🎯 NEXT TO WORK ON:**
-- **Continuous HTTP Streaming Server** (Section 1) - 24×7 endpoint availability with fallback audio
-
-**✅ Completed:**
-- **Control Channel & Event Side-Channel** (Section 4) - ✅ FULLY IMPLEMENTED
-
-**Medium Priority:**
-- **Streaming & Broadcasting Enhancements** (Section 5)
-- **DJ Intelligence & Content Logic** (Section 6)
-- **Broadcast Features & Radio Polish** (Section 7)
-
-**Lower Priority / Nice to Have:**
-- **Operational Features & Tooling** (Section 8)
-- **User Experience & Monitoring** (Section 9)
-- **Audio Generation & AI Integration** (Section 10)
-- **Stretch Goals** (Section 11)
-
-Each category contains optional enhancements.
-
----
-
-## 4. Control Channel & Event Side-Channel
-
-**Status:** ✅ **COMPLETED** - See Section 12: Completed Enhancements
-
-This enhancement has been fully implemented and is production-ready. All contract requirements are met, all tests pass, and the system is operational.
-
-For complete documentation and implementation details, see **Section 12: Completed Enhancements** → **Control Channel & Event Side-Channel**.
-
----
-
-## 5. Streaming & Broadcasting Enhancements
-
-### 5.1 Icecast/Shoutcast Compatibility
-
-**Why:** If a Retrowaves station instance should broadcast publicly and support infinite listeners.
-
-**Features:**
-- Multiple mountpoints
-- Listener stats
-- Artist/song metadata
-- ReplayGain or normalization per Icecast spec
-- DJ metadata updates ("Now playing…")
-
-### 5.2 HLS Output (Apple HTTP Live Streaming)
-
-**Why:** If browser playback or mobile app playback is needed.
-
-**Benefits:**
-- Rewind
-- Seek
-- Buffering
-- Adaptive bitrate
-- CDN-friendly
-
-This is enterprise-grade streaming, optional.
-
-### 5.3 Redundant Output Formats
-
-Simultaneously produce:
-- MP3 stream
-- AAC stream
-- HLS segments
-
-Core engine remains unchanged; outputs become modular.
-
-### 5.4 Local Recording / "Aircheck Mode"
-
-Record a rolling 24-hour version of the station:
-- For audits
-- DJ coaching
-- Troubleshooting
-- Fun playback
-
-### 5.5 Advanced Buffer Management with PID Controller
+### Advanced Buffer Management with PID Controller
 
 **Future Goal:** Replace the current simple 3-zone buffer controller with a proper PID (Proportional-Integral-Derivative) feedback loop for smoother, more precise rate control.
 
@@ -303,7 +136,7 @@ Record a rolling 24-hour version of the station:
 - May need different tuning for different buffer capacities
 - Should maintain safety limits (min/max sleep times)
 
-### 5.6 Pre-Fill Stage for Tower Buffer
+### Pre-Fill Stage for Tower Buffer
 
 **Future Goal:** Implement a pre-fill stage that builds up the Tower ring buffer before starting normal playback to prevent dropped frames when Tower comes online.
 
@@ -339,220 +172,7 @@ Record a rolling 24-hour version of the station:
 - Should have a timeout/safety limit to prevent infinite pre-fill
 - Could be combined with PID controller for smooth transition
 
----
-
-## 6. DJ Intelligence & Content Logic
-
-### 6.1 More Advanced Cadence Logic
-
-Future DJ behaviors:
-- Mood arcs (morning energy vs late night calm)
-- Genre pairing and thematic blocks
-- "Story mode" breaks
-- Concert previews
-- "Remember this band?" trivia inserts
-
-### 6.2 Smart Legal ID System
-
-Legal ID rules:
-- must play top of hour
-- must play exactly N times per hour
-- must delay if song pushes into the top-of-hour slot
-- can merge with outros or intros
-
-### 6.3 Scheduled & Scripted Segments
-
-Examples:
-- Daily weather
-- Hourly headline
-- Artist spotlight
-- "This day in history"
-- Local events
-- Pre-scripted monologues
-
-Tickler-based generation.
-
-### 6.4 Ad Engine (Optional)
-
-Internal ad scheduler for:
-- promos
-- show liners
-- repeating ad carts
-- live reads (AI)
-- local sponsorships
-
----
-
-## 7. Broadcast Features & Radio Polish
-
-### 6.1 Song Crossfading Logic
-
-Fade-out current → fade-in next. DJ intros duck music automatically.
-
-### 6.2 ReplayGain / LUFS Normalization
-
-Normalize loudness across:
-- songs
-- intros/outros
-- DJ talk segments
-
-### 6.3 "Now Playing" Metadata
-
-Add:
-- Artist
-- Title
-- Album
-- Year
-- Artwork (if drives a UI)
-
-Push via:
-- Icecast metadata
-- Websocket
-- REST endpoint
-
-### 6.4 Emergency Alert / Override Mode
-
-Trigger an emergency mode that:
-- stops normal rotation
-- plays emergency audio sequence
-- sends alerts to clients
-
----
-
-## 8. Operational Features & Tooling
-
-### 7.1 Web-Based Control Panel
-
-For:
-- reviewing logs
-- playlist history
-- skipping songs
-- forcing a legal ID
-- DJ persona configuration
-
-### 7.2 "Debug Stream" Mode
-
-Mirror the main stream to:
-- local WAV
-- GUI visualizer
-- waveform display
-- detailed timing logs
-
-For testing timing drift and DJ behavior.
-
-### 7.3 Persistent Analytics Tracking
-
-Track:
-- songs played per hour
-- talk time per day
-- legal ID compliance
-- song recurrence windows
-
-Useful for tuning the DJ engine.
-
-### 7.4 Radio Station API (HTTP/JSON)
-
-Provide:
-- `/now_playing`
-- `/next_up`
-- `/history`
-- `/listeners`
-- `/skip`
-- `/trigger_id`
-
-Could allow remote control via phone app.
-
-### 7.5 Intelligent Media Library Self-Organization
-
-**Future Goal:** Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
-
-**Current Status:**
-- We continue using Phase A filename-driven intros/outros exactly as they are.
-
-**Desired Future Behavior:**
-- DJEngine automatically extracts base song name from intros/outros
-- Detects generic vs per-song assets
-- Creates ticklers for safe migration
-- Moves files into structured directories during THINK windows
-- Maintains backward compatibility
-- Zero downtime, zero manual labor
-
-**Implementation Notes:**
-- This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
-- Migration should happen incrementally during THINK windows (non-blocking)
-- Files should be moved atomically with fallback to original location if needed
-- DJ should maintain a mapping of old paths to new paths during transition
-
-**Outro Spelling Normalization:**
-- **Canonical name:** `_outro` (one "t")
-- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
-- **Phase 9 Asset Discovery:** Accepts both patterns:
-  - `*_outro*.mp3` (canonical)
-  - `*_outtro*.mp3` (historical typo)
-- **Internal normalization:** All `AudioEvent.type="outro"` normalize to the 1-T spelling regardless of filename
-- **Future Cleanup:** When the media library self-organization feature runs, the system will:
-  - Detect any `*_outtro*.mp3` files
-  - Rename them to the canonical form `*_outro*.mp3`
-  - Move them into the standardized directory structure
-  - Log: `Renamed Boogie_Woogie_Santa_Claus_outtro.mp3 → Boogie_Woogie_Santa_Claus_outro.mp3`
-
-### 7.6 Centralized Logging with Rotation
-
-**Future Goal:** All Retrowaves components should write logs to standardized locations with automatic log rotation.
-
-**Desired Behavior:**
-- Each component writes to `/var/log/retrowaves-<component>.log`
-  - `retrowaves-tower.log` for Tower service
-  - `retrowaves-station.log` for Station service
-  - `retrowaves-dj.log` for DJ engine (if separated)
-  - etc.
-- Use system log rotation mechanisms (e.g., `logrotate` on Linux)
-- Rotate logs based on size and/or time (e.g., daily rotation, 10MB max size)
-- Retain a configurable number of rotated log files (e.g., keep last 7 days or last 10 files)
-- Compress old log files to save disk space
-- Ensure log files have appropriate permissions (readable by `retrowaves` user/group)
-
-**Benefits:**
-- Easier debugging and troubleshooting
-- Prevents log files from growing unbounded
-- Standardized log locations across all components
-- Better integration with system monitoring tools
-
-### 7.7 Multi-Station Platform Architecture
-
-**Future Goal:** Enable running multiple radio stations simultaneously from a single Retrowaves codebase, where "Appalachia Radio" becomes one output stream instance among many.
-
-**Current Status:**
-- Retrowaves runs as a single station instance
-- All configuration, state, and media libraries are tied to one station
-
-**Desired Future Behavior:**
-- Station instances are independently configurable
-- Each station has its own:
-  - Media library (songs, intros, outros, IDs)
-  - DJ engine with independent state
-  - Rotation manager with separate history
-  - Output streams (HTTP endpoints on different ports)
-  - Configuration files and state persistence
-- Ability to start/stop individual stations without affecting others
-- Shared codebase, isolated station data
-- Station-specific environment variables or config files
-
-**Implementation Notes:**
-- This is a major architectural refactoring that would come after core stability
-- Would require:
-  - Station abstraction layer (StationManager or StationFactory)
-  - Isolated state directories per station
-  - Port/endpoint management for multiple HTTP streams
-  - Configuration management for multi-station scenarios
-  - Resource isolation (memory, CPU per station)
-- Backward compatibility: single-station mode should still work
-- Could enable scenarios like:
-  - Running multiple genre stations (Country, Jazz, Rock) simultaneously
-  - Test/production station instances
-  - Regional variations of the same station
-
-### 7.8 Graceful Shutdown with Offline Announcement
+### Graceful Shutdown with Offline Announcement
 
 **Future Goal:** When shutting down the station, allow the current song to finish playing before stopping. Optionally have the DJ announce that the station is going offline.
 
@@ -586,11 +206,223 @@ Could allow remote control via phone app.
 - Timeout safety: If current segment is very long, allow configurable max wait time
 - HTTP stream connections should remain open until announcement completes
 
+### Centralized Logging with Rotation
+
+**Future Goal:** All Retrowaves components should write logs to standardized locations with automatic log rotation.
+
+**Desired Behavior:**
+- Each component writes to `/var/log/retrowaves-<component>.log`
+  - `retrowaves-tower.log` for Tower service
+  - `retrowaves-station.log` for Station service
+  - `retrowaves-dj.log` for DJ engine (if separated)
+  - etc.
+- Use system log rotation mechanisms (e.g., `logrotate` on Linux)
+- Rotate logs based on size and/or time (e.g., daily rotation, 10MB max size)
+- Retain a configurable number of rotated log files (e.g., keep last 7 days or last 10 files)
+- Compress old log files to save disk space
+- Ensure log files have appropriate permissions (readable by `retrowaves` user/group)
+
+**Benefits:**
+- Easier debugging and troubleshooting
+- Prevents log files from growing unbounded
+- Standardized log locations across all components
+- Better integration with system monitoring tools
+
 ---
 
-## 9. User Experience & Monitoring
+## 📡 Broadcast-Grade Features
 
-### 8.1 Web Player for LAN Browsing
+### Song Crossfading Logic
+
+Fade-out current → fade-in next. DJ intros duck music automatically.
+
+### ReplayGain / LUFS Normalization
+
+Normalize loudness across:
+- songs
+- intros/outros
+- DJ talk segments
+
+### "Now Playing" Metadata
+
+Add:
+- Artist
+- Title
+- Album
+- Year
+- Artwork (if drives a UI)
+
+Push via:
+- Icecast metadata
+- Websocket
+- REST endpoint
+
+### Emergency Alert / Override Mode
+
+Trigger an emergency mode that:
+- stops normal rotation
+- plays emergency audio sequence
+- sends alerts to clients
+
+### Icecast/Shoutcast Compatibility
+
+**Why:** If a Retrowaves station instance should broadcast publicly and support infinite listeners.
+
+**Features:**
+- Multiple mountpoints
+- Listener stats
+- Artist/song metadata
+- ReplayGain or normalization per Icecast spec
+- DJ metadata updates ("Now playing…")
+
+### HLS Output (Apple HTTP Live Streaming)
+
+**Why:** If browser playback or mobile app playback is needed.
+
+**Benefits:**
+- Rewind
+- Seek
+- Buffering
+- Adaptive bitrate
+- CDN-friendly
+
+This is enterprise-grade streaming, optional.
+
+### Redundant Output Formats
+
+Simultaneously produce:
+- MP3 stream
+- AAC stream
+- HLS segments
+
+Core engine remains unchanged; outputs become modular.
+
+### Local Recording / "Aircheck Mode"
+
+Record a rolling 24-hour version of the station:
+- For audits
+- DJ coaching
+- Troubleshooting
+- Fun playback
+
+---
+
+## ⚙️ Operational Enhancements
+
+### Web-Based Control Panel
+
+For:
+- reviewing logs
+- playlist history
+- skipping songs
+- forcing a legal ID
+- DJ persona configuration
+
+### "Debug Stream" Mode
+
+Mirror the main stream to:
+- local WAV
+- GUI visualizer
+- waveform display
+- detailed timing logs
+
+For testing timing drift and DJ behavior.
+
+### Persistent Analytics Tracking
+
+Track:
+- songs played per hour
+- talk time per day
+- legal ID compliance
+- song recurrence windows
+
+Useful for tuning the DJ engine.
+
+### Radio Station API (HTTP/JSON)
+
+Provide:
+- `/now_playing`
+- `/next_up`
+- `/history`
+- `/listeners`
+- `/skip`
+- `/trigger_id`
+
+Could allow remote control via phone app.
+
+### Intelligent Media Library Self-Organization
+
+**Future Goal:** Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
+
+**Current Status:**
+- We continue using Phase A filename-driven intros/outros exactly as they are.
+
+**Desired Future Behavior:**
+- DJEngine automatically extracts base song name from intros/outros
+- Detects generic vs per-song assets
+- Creates ticklers for safe migration
+- Moves files into structured directories during THINK windows
+- Maintains backward compatibility
+- Zero downtime, zero manual labor
+
+**Implementation Notes:**
+- This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
+- Migration should happen incrementally during THINK windows (non-blocking)
+- Files should be moved atomically with fallback to original location if needed
+- DJ should maintain a mapping of old paths to new paths during transition
+
+**Outro Spelling Normalization:**
+- **Canonical name:** `_outro` (one "t")
+- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
+- **Phase 9 Asset Discovery:** Accepts both patterns:
+  - `*_outro*.mp3` (canonical)
+  - `*_outtro*.mp3` (historical typo)
+- **Internal normalization:** All `AudioEvent.type="outro"` normalize to the 1-T spelling regardless of filename
+- **Future Cleanup:** When the media library self-organization feature runs, the system will:
+  - Detect any `*_outtro*.mp3` files
+  - Rename them to the canonical form `*_outro*.mp3`
+  - Move them into the standardized directory structure
+  - Log: `Renamed Boogie_Woogie_Santa_Claus_outtro.mp3 → Boogie_Woogie_Santa_Claus_outro.mp3`
+
+### Multi-Station Platform Architecture
+
+**Future Goal:** Enable running multiple radio stations simultaneously from a single Retrowaves codebase, where "Appalachia Radio" becomes one output stream instance among many.
+
+**Current Status:**
+- Retrowaves runs as a single station instance
+- All configuration, state, and media libraries are tied to one station
+
+**Desired Future Behavior:**
+- Station instances are independently configurable
+- Each station has its own:
+  - Media library (songs, intros, outros, IDs)
+  - DJ engine with independent state
+  - Rotation manager with separate history
+  - Output streams (HTTP endpoints on different ports)
+  - Configuration files and state persistence
+- Ability to start/stop individual stations without affecting others
+- Shared codebase, isolated station data
+- Station-specific environment variables or config files
+
+**Implementation Notes:**
+- This is a major architectural refactoring that would come after core stability
+- Would require:
+  - Station abstraction layer (StationManager or StationFactory)
+  - Isolated state directories per station
+  - Port/endpoint management for multiple HTTP streams
+  - Configuration management for multi-station scenarios
+  - Resource isolation (memory, CPU per station)
+- Backward compatibility: single-station mode should still work
+- Could enable scenarios like:
+  - Running multiple genre stations (Country, Jazz, Rock) simultaneously
+  - Test/production station instances
+  - Regional variations of the same station
+
+---
+
+## 🎨 User Experience & Monitoring
+
+### Web Player for LAN Browsing
 
 Simple web interface:
 - Play button
@@ -600,7 +432,7 @@ Simple web interface:
 
 No need for Icecast or HLS unless you want to reach phones.
 
-### 8.2 Real-Time Logs Dashboard
+### Real-Time Logs Dashboard
 
 Display:
 - THINK/DO transitions
@@ -609,7 +441,7 @@ Display:
 - audio timing
 - stream throughput
 
-### 8.3 Discord or Slack Integration
+### Discord or Slack Integration
 
 Send alerts:
 - "Station restarted"
@@ -619,9 +451,9 @@ Send alerts:
 
 ---
 
-## 10. Audio Generation & AI Integration
+## 🤖 AI & Advanced Features
 
-### 9.1 ElevenLabs Integration (Full TTS)
+### ElevenLabs Integration (Full TTS)
 
 **Future Goal:** Enable the DJ to generate intros/outros/talk/break content using ElevenLabs voices.
 
@@ -637,7 +469,7 @@ Send alerts:
 - Only generated during THINK via ticklers
 - Must be cached MP3 before use
 
-### 9.2 Emotion/Mood Adaptive Voice
+### Emotion/Mood Adaptive Voice
 
 *(Not required for core operation)*
 
@@ -647,7 +479,7 @@ DJ voice tone adapts to:
 - music genre changes
 - audience vibe (if analytics are added)
 
-### 9.3 Local Voice Model / Offline TTS
+### Local Voice Model / Offline TTS
 
 Eliminate dependency on ElevenLabs entirely.
 
@@ -658,19 +490,57 @@ Use:
 
 Offline operation, zero API cost.
 
+### More Advanced Cadence Logic
+
+Future DJ behaviors:
+- Mood arcs (morning energy vs late night calm)
+- Genre pairing and thematic blocks
+- "Story mode" breaks
+- Concert previews
+- "Remember this band?" trivia inserts
+
+### Smart Legal ID System
+
+Legal ID rules:
+- must play top of hour
+- must play exactly N times per hour
+- must delay if song pushes into the top-of-hour slot
+- can merge with outros or intros
+
+### Scheduled & Scripted Segments
+
+Examples:
+- Daily weather
+- Hourly headline
+- Artist spotlight
+- "This day in history"
+- Local events
+- Pre-scripted monologues
+
+Tickler-based generation.
+
+### Ad Engine (Optional)
+
+Internal ad scheduler for:
+- promos
+- show liners
+- repeating ad carts
+- live reads (AI)
+- local sponsorships
+
 ---
 
-## 11. Stretch Goals (Fun / Experimental)
+## 🌟 Stretch Goals (Fun / Experimental)
 
-### 10.1 AI "Call-In" Show
+### AI "Call-In" Show
 
 Simulated callers and DJ responses.
 
-### 10.2 AI Song Facts Generator
+### AI Song Facts Generator
 
 Pulls facts and band trivia automatically.
 
-### 10.3 Multi-DJ Personalities
+### Multi-DJ Personalities
 
 - Morning DJ
 - Afternoon DJ
@@ -678,7 +548,7 @@ Pulls facts and band trivia automatically.
 
 Each with different intros/outros.
 
-### 10.4 "Retro Mode" (1980s Radio Filter)
+### "Retro Mode" (1980s Radio Filter)
 
 Vinyl crackle, tape hiss, jingles, station power-up sequence.
 
@@ -686,183 +556,7 @@ Just for fun.
 
 ---
 
-## 12. Continuous HTTP Streaming Server (24×7 Endpoint Availability)
-
-**Note:** This section is duplicated from Section 1 (NEXT TO WORK ON) for reference. See Section 1 for the current priority implementation details.
-
-### 12.1 Purpose
-
-Ensure the HTTP audio endpoint is always available, even when:
-
-- The radio station is restarting
-- The playout engine is not currently producing audio
-- A code reload is happening
-- The DJ hasn't queued the first segment
-- The system is stopped intentionally
-
-The goal is:
-
-- Clients (like VLC) NEVER see "connection refused" or "stream unavailable."
-- Instead, the stream always connects and always outputs something.
-
-### 12.2 Behavior Goals
-
-This subsystem maintains a 24×7 listener port that:
-
-🔸 **Always accepts connections**
-
-Never refuses VLC, even if the engine is down.
-
-🔸 **Always streams valid audio data**
-
-Even if:
-- DJEngine is offline
-- RotationManager hasn't loaded
-- PlayoutEngine is restarting
-- Station is rebooting
-
-🔸 **Provides fallback audio when live output is unavailable**
-
-Examples:
-- Silent PCM (pure silence frames)
-- Test tone (440 Hz sine wave)
-- Looping MP3 ("Please stand by while our code updates…")
-- Static test pattern file
-
-This mimics real broadcast systems that continue transmitting a carrier signal even during outages.
-
-### 12.3 Why This Matters
-
-Professional radio/TV stations never drop carrier.
-
-If the automation crashes, you still get one of:
-- A technical difficulties loop
-- A standby slate
-- A repeating announcement
-- A continuous tone
-
-It keeps the viewer/listener connected and prevents the platform (YouTube, VLC, etc.) from dropping the stream.
-
-This becomes REALLY important when streaming to YouTube:
-
-- If the connection dies for more than 30 seconds
-- YouTube kills your live event
-- Viewers get dropped
-- You have to restart a brand-new stream
-
-A 24/7 endpoint prevents this.
-
-### 12.4 How It Integrates (Clean, Modular, Architecture-Safe)
-
-This feature must NOT contaminate the core playout engine.
-
-Instead, we introduce a new subsystem:
-
-🔧 **ContinuousStreamServer**
-
-Runs independently from the DJ/Playout pipeline.
-
-Its job:
-- Accept connections 24×7
-- Stream whatever the audio engine currently provides
-- If the engine is feeding PCM → encode → output
-- If the engine stops → switch to fallback
-- If the engine restarts → resume playout seamlessly
-
-### 12.5 Fallback Audio Modes
-
-You choose any of these modes:
-
-**Mode A — Silent PCM**
-- Easy
-- Zero dependencies
-- VLC stays connected
-- YouTube stays up
-- No artifacts
-
-**Mode B — Looping MP3 file**
-
-E.g.:
-- `/mnt/media/appalachia-radio/system/please-stand-by.mp3` (station-specific path)
-
-This gives a professional aesthetic.
-
-**Mode C — Synthetic Test Tone**
-
-440 Hz generated in real-time.
-
-Reliable for debugging.
-
-**Mode D — Custom Standby Playlist**
-
-A short rotation of standby audio:
-- promos
-- DJ liners
-- station IDs
-- "We'll be right back"
-
-### 12.6 State Transitions
-
-ContinuousStreamServer reacts to events:
-
-- **When playout is active**
-  → Stream the real PCM frames generated by the PlayoutEngine.
-
-- **When playout is inactive**
-  → Switch to fallback instantly.
-
-- **When playout starts again**
-  → Switch back to live playout.
-
-Seamless. No reconnects.
-
-### 12.7 Technical Requirements
-
-- **Decoupled from DJEngine / PlayoutEngine**
-  - It should not block the THINK/DO loop.
-  - Runs in its own thread
-  - 24×7, independent of playout engine lifecycle.
-
-- **Buffered**
-  - So slow clients don't block the station.
-
-- **Hot-swappable**
-  - Audio source can change without dropping sockets.
-
-- **HTTP keep-alive**
-  - For VLC stability.
-
-### 12.8 Why This Belongs in the Wishlist, Not the Architecture Document
-
-Because:
-- It is optional
-- It does not modify THINK/DO
-- It does not modify PlayoutEngine
-- It does not modify DJIntent
-- It is a separate Output System Enhancement
-
-Architecture 3.x remains pure:
-- DJ THINK/DO → playout → output sink
-
-This Wishlist item adds:
-- Continuous output wrapper around output sinks
-- It's an extension, not a change.
-
-### 12.9 Future Extensions
-
-- **OBS Integration**
-  - OBS listens to metadata events and automatically swaps to "Standby Scene" when:
-    - `event: playout_engine_offline`
-
-- **HLS Compatibility**
-  - The 24×7 server could generate HLS "standby segments."
-
-- **Icecast Relay**
-  - Standby mode becomes a mount-fallback for Icecast.
-
----
-
-## 13. Completed Enhancements
+## ✅ Completed Work
 
 ### Control Channel & Event Side-Channel
 
@@ -1005,7 +699,7 @@ This is **EXACTLY** how professional broadcast systems (Zetta, ENCO, WideOrbit) 
 
 ---
 
-## 14. Summary
+## Document Notes
 
 This document is a sandbox of ideas — future enhancements that can extend Retrowaves beyond its core architecture.
 

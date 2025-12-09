@@ -119,6 +119,14 @@ def mock_output_sink():
     return sink
 
 
+@pytest.fixture
+def mock_tower_control():
+    """Create a mock Tower control client for testing."""
+    control = Mock()
+    control.send_event = Mock(return_value=True)
+    return control
+
+
 @pytest.fixture(autouse=False)
 def thread_leak_guard():
     """

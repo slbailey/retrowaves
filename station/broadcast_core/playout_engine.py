@@ -10,6 +10,7 @@ Architecture 3.1 Reference:
 - Section 5: Updated Playout Engine Flow (Event-Driven, Intent-Aware)
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -52,6 +53,67 @@ def _get_audio_duration(file_path: str) -> Optional[float]:
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
         pass
     return None
+
+
+def _get_mp3_metadata(file_path: str) -> dict:
+    """
+    Get MP3 metadata (title, artist, duration) using ffprobe.
+    
+    Returns a dictionary with keys: title, artist, duration.
+    Missing values will be None.
+    
+    Uses a single ffprobe call to get both format duration and tags for efficiency.
+    
+    Args:
+        file_path: Path to MP3 file
+        
+    Returns:
+        Dictionary with metadata fields
+    """
+    metadata = {
+        "title": None,
+        "artist": None,
+        "duration": None
+    }
+    
+    try:
+        # Get both duration and tags in a single ffprobe call for efficiency
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration:format_tags=title:format_tags=artist",
+            "-of", "json",
+            file_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1.0  # Reduced timeout for faster failure
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                data = json.loads(result.stdout)
+                format_info = data.get("format", {})
+                
+                # Extract duration
+                if "duration" in format_info:
+                    duration_str = format_info["duration"]
+                    if duration_str:
+                        metadata["duration"] = float(duration_str)
+                
+                # Extract tags
+                tags = format_info.get("tags", {})
+                if "title" in tags:
+                    metadata["title"] = tags["title"]
+                if "artist" in tags:
+                    metadata["artist"] = tags["artist"]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        pass
+    
+    return metadata
 
 
 class DJCallback(Protocol):
@@ -128,6 +190,9 @@ class PlayoutEngine:
         self._mixer = Mixer()
         self._shutdown_requested = False  # Per contract SL2.2: Prevent THINK/DO after shutdown
         
+        # Track talking state to avoid multiple dj_talking events for consecutive talk files
+        self._is_in_talking_sequence = False
+        
         # Monitoring: track queue stats for debugging
         self._last_queue_log_time = time.time()
         self._queue_log_interval = 5.0  # Log queue stats every 5 seconds
@@ -198,28 +263,47 @@ class PlayoutEngine:
         
         logger.info(f"Starting segment: {segment.type} - {segment.path}")
         
-        # Emit segment_started heartbeat event to Tower (per contract PE4.1)
-        # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
-        # (Not required by contract - heartbeat events are transport-level and observational)
+        # Emit appropriate event based on segment type
         if self._tower_control and not self._shutdown_requested:
             try:
-                expected_duration = self._get_segment_duration(segment)
-                segment_id = f"{segment.type}_{os.path.basename(segment.path)}_{int(time.monotonic() * 1000)}"
-                self._tower_control.send_event(
-                    event_type="segment_started",
-                    timestamp=time.monotonic(),
-                    metadata={
-                        "segment_id": segment_id,
-                        "expected_duration": expected_duration,
-                        "audio_event": {
-                            "type": segment.type,
-                            "path": segment.path,
-                            "gain": segment.gain
+                if segment.type == "song":
+                    # Emit new_song event with MP3 metadata
+                    # Metadata should have been extracted during THINK phase and stored in AudioEvent
+                    # If not available, fall back to extracting it now (shouldn't happen in normal flow)
+                    if segment.metadata:
+                        metadata = segment.metadata
+                    else:
+                        logger.warning(f"Metadata not found for {segment.path}, extracting during DO phase (should be done in THINK)")
+                        metadata = _get_mp3_metadata(segment.path)
+                    
+                    self._tower_control.send_event(
+                        event_type="new_song",
+                        timestamp=time.monotonic(),
+                        metadata={
+                            "file_path": segment.path,
+                            "title": metadata.get("title") if metadata else None,
+                            "artist": metadata.get("artist") if metadata else None,
+                            "duration": metadata.get("duration") if metadata else None
                         }
-                    }
-                )
+                    )
+                    # Reset talking sequence flag when a song starts
+                    self._is_in_talking_sequence = False
+                elif segment.type == "talk":
+                    # Emit dj_talking event only if not already in a talking sequence
+                    # This ensures only one event is sent even if multiple talk files are strung together
+                    if not self._is_in_talking_sequence:
+                        self._tower_control.send_event(
+                            event_type="dj_talking",
+                            timestamp=time.monotonic(),
+                            metadata={}
+                        )
+                        self._is_in_talking_sequence = True
+                else:
+                    # Reset talking sequence flag when any non-talk, non-song segment starts
+                    # (e.g., intro, outro, id) so that if talk comes after, we emit dj_talking again
+                    self._is_in_talking_sequence = False
             except Exception as e:
-                logger.debug(f"Error sending segment_started event: {e}")
+                logger.debug(f"Error sending event: {e}")
         
         # Emit on_segment_started callback (THINK phase)
         # Per contract SL2.2: No THINK events MAY fire after shutdown begins
@@ -246,29 +330,6 @@ class PlayoutEngine:
             return
         
         logger.info(f"Finishing segment: {segment.type} - {segment.path}")
-        
-        # Emit segment_finished heartbeat event to Tower (per contract PE4.3)
-        # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
-        # (Not required by contract - heartbeat events are transport-level and observational)
-        if self._tower_control and not self._shutdown_requested:
-            try:
-                total_duration = time.monotonic() - getattr(self, '_segment_start_time', time.monotonic())
-                segment_id = getattr(self, '_current_segment_id', f"{segment.type}_{os.path.basename(segment.path)}")
-                self._tower_control.send_event(
-                    event_type="segment_finished",
-                    timestamp=time.monotonic(),
-                    metadata={
-                        "segment_id": segment_id,
-                        "total_duration": total_duration,
-                        "audio_event": {
-                            "type": segment.type,
-                            "path": segment.path,
-                            "gain": segment.gain
-                        }
-                    }
-                )
-            except Exception as e:
-                logger.debug(f"Error sending segment_finished event: {e}")
         
         # Emit on_segment_finished callback (DO phase)
         # Per contract SL2.2: No DO events MAY fire after shutdown begins
@@ -371,8 +432,8 @@ class PlayoutEngine:
             
             # Finish the segment (triggers on_segment_finished - DO phase)
             # finish_segment() internally checks shutdown_requested before firing callback
-            if self._is_playing and self._current_segment == segment:
-                self.finish_segment(segment)
+            # Note: finish_segment() will verify the segment is still current, so we can call it directly
+            self.finish_segment(segment)
         
         logger.info("Playout loop stopped")
     
@@ -445,30 +506,6 @@ class PlayoutEngine:
                 self._output_sink.write(processed_frame)
                 frame_count += 1
                 
-                # Emit segment_progress heartbeat event at least once per second (per contract PE4.2)
-                # Optional: Suppress heartbeat events during shutdown for strict "no events after shutdown" semantics
-                # (Not required by contract - heartbeat events are transport-level and observational)
-                now = time.monotonic()
-                if now - getattr(self, '_last_progress_event_time', now) >= 1.0:
-                    if self._tower_control and self._current_segment and not self._shutdown_requested:
-                        try:
-                            elapsed_time = now - getattr(self, '_segment_start_time', now)
-                            expected_duration = self._get_segment_duration(self._current_segment)
-                            progress_percent = (elapsed_time / expected_duration * 100.0) if expected_duration > 0 else 0.0
-                            segment_id = getattr(self, '_current_segment_id', f"{self._current_segment.type}_{os.path.basename(self._current_segment.path)}")
-                            self._tower_control.send_event(
-                                event_type="segment_progress",
-                                timestamp=now,
-                                metadata={
-                                    "segment_id": segment_id,
-                                    "elapsed_time": elapsed_time,
-                                    "expected_duration": expected_duration,
-                                    "progress_percent": progress_percent
-                                }
-                            )
-                            self._last_progress_event_time = now
-                        except Exception as e:
-                            logger.debug(f"Error sending segment_progress event: {e}")
                 
                 # Log progress every 1000 frames
                 if frame_count % 1000 == 0:
