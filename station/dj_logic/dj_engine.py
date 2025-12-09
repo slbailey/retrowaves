@@ -43,7 +43,7 @@ class DJEngine:
     Architecture 3.1 Reference: Section 4.1 (DJ State Includes)
     """
     
-    def __init__(self, playout_engine: Optional[PlayoutEngine] = None, rotation_manager: Optional[RotationManager] = None, dj_asset_path: Optional[str] = None):
+    def __init__(self, playout_engine: Optional[PlayoutEngine] = None, rotation_manager: Optional[RotationManager] = None, dj_asset_path: Optional[str] = None, tower_control=None):
         """
         Initialize the DJ Engine with all required components.
         
@@ -51,9 +51,11 @@ class DJEngine:
             playout_engine: PlayoutEngine instance to queue audio events
             rotation_manager: RotationManager instance for song selection
             dj_asset_path: Path to DJ assets directory (default: from DJ_PATH env var or cache/)
+            tower_control: Optional TowerControlClient for sending heartbeat events
         """
         self.playout_engine = playout_engine
         self.rotation_manager: Optional[RotationManager] = rotation_manager
+        self._tower_control = tower_control
         
         # DJ asset paths
         if dj_asset_path:
@@ -158,6 +160,18 @@ class DJEngine:
             return  # skip THINK/DO
         
         logger.info(f"[DJ] THINK Phase: Segment started - {segment.type} - {segment.path}")
+        
+        # Emit dj_think_started heartbeat event to Tower (per contract DJ4.1)
+        think_start_time = time.monotonic()
+        if self._tower_control:
+            try:
+                self._tower_control.send_event(
+                    event_type="dj_think_started",
+                    timestamp=think_start_time,
+                    metadata={}
+                )
+            except Exception as e:
+                logger.debug(f"Error sending dj_think_started event: {e}")
         
         # Phase 9: Maybe rescan assets (only once per hour, non-blocking)
         self.asset_manager.maybe_rescan()
@@ -264,6 +278,29 @@ class DJEngine:
         logger.info(f"[DJ] THINK: DJIntent committed - "
                    f"outro={outro is not None}, ids={len(station_ids) if station_ids else 0}, "
                    f"intro={intro is not None}, song={next_song.path}")
+        
+        # Emit dj_think_completed heartbeat event to Tower (per contract DJ4.2)
+        think_end_time = time.monotonic()
+        think_duration_ms = (think_end_time - think_start_time) * 1000.0
+        if self._tower_control:
+            try:
+                # Create a read-only representation of DJIntent for metadata
+                intent_dict = {
+                    "next_song": next_song.path if next_song else None,
+                    "has_outro": outro is not None,
+                    "has_station_ids": station_ids is not None and len(station_ids) > 0,
+                    "has_intro": intro is not None
+                }
+                self._tower_control.send_event(
+                    event_type="dj_think_completed",
+                    timestamp=think_end_time,
+                    metadata={
+                        "dj_intent": intent_dict,
+                        "think_duration_ms": think_duration_ms
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error sending dj_think_completed event: {e}")
     
     def on_segment_finished(self, segment: AudioEvent) -> None:
         """

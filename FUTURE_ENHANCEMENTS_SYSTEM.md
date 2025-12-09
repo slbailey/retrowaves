@@ -17,60 +17,36 @@ This document is a non-binding, forward-looking companion to the canonical Unifi
 
 ---
 
-## 2. Category Index
+## 2. Category Index (Organized by Priority)
 
-This wishlist is organized into these broad categories:
+This wishlist is organized by priority and category:
 
-- **Audio Generation & AI Integration**
-- **Streaming & Broadcasting Enhancements**
-- **DJ Intelligence & Content Logic**
-- **Broadcast Features & Radio Polish**
-- **Operational Features & Tooling** (including media library self-organization)
-- **User Experience & Monitoring**
-- **Metadata & Event Side-Channel**
+**✅ Completed:**
+- **Control Channel & Event Side-Channel** (Section 3) - ✅ FULLY IMPLEMENTED
+
+**Medium Priority:**
+- **Streaming & Broadcasting Enhancements** (Section 4)
+- **DJ Intelligence & Content Logic** (Section 5)
+- **Broadcast Features & Radio Polish** (Section 6)
+- **Continuous HTTP Streaming Server** (Section 11)
+
+**Lower Priority / Nice to Have:**
+- **Operational Features & Tooling** (Section 7)
+- **User Experience & Monitoring** (Section 8)
+- **Audio Generation & AI Integration** (Section 9)
+- **Stretch Goals** (Section 10)
 
 Each category contains optional enhancements.
 
 ---
 
-## 3. Audio Generation & AI Integration
+## 3. Control Channel & Event Side-Channel
 
-### 3.1 ElevenLabs Integration (Full TTS)
+**Status:** ✅ **COMPLETED** - See Section 12: Completed Enhancements
 
-**Future Goal:** Enable the DJ to generate intros/outros/talk/break content using ElevenLabs voices.
+This enhancement has been fully implemented and is production-ready. All contract requirements are met, all tests pass, and the system is operational.
 
-**Possible Features:**
-- Generate dynamic talk segments ("That was Fleetwood Mac… here's the weather")
-- Personalized intros/outros for specific songs
-- Time-based greetings ("Good morning Appalachia")
-- Emergency or breaking-news announcements
-- On-demand filler content via ticklers
-
-**Constraints:**
-- NEVER generated during DO
-- Only generated during THINK via ticklers
-- Must be cached MP3 before use
-
-### 3.2 Emotion/Mood Adaptive Voice
-
-*(Not required for core operation)*
-
-DJ voice tone adapts to:
-- time of day
-- schedule blocks
-- music genre changes
-- audience vibe (if analytics are added)
-
-### 3.3 Local Voice Model / Offline TTS
-
-Eliminate dependency on ElevenLabs entirely.
-
-Use:
-- Coqui TTS
-- Piper
-- VITS
-
-Offline operation, zero API cost.
+For complete documentation and implementation details, see **Section 12: Completed Enhancements** → **Control Channel & Event Side-Channel**.
 
 ---
 
@@ -323,6 +299,22 @@ Could allow remote control via phone app.
 
 **Implementation Notes:**
 - This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
+- Migration should happen incrementally during THINK windows (non-blocking)
+- Files should be moved atomically with fallback to original location if needed
+- DJ should maintain a mapping of old paths to new paths during transition
+
+**Outro Spelling Normalization:**
+- **Canonical name:** `_outro` (one "t")
+- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
+- **Phase 9 Asset Discovery:** Accepts both patterns:
+  - `*_outro*.mp3` (canonical)
+  - `*_outtro*.mp3` (historical typo)
+- **Internal normalization:** All `AudioEvent.type="outro"` normalize to the 1-T spelling regardless of filename
+- **Future Cleanup:** When the media library self-organization feature runs, the system will:
+  - Detect any `*_outtro*.mp3` files
+  - Rename them to the canonical form `*_outro*.mp3`
+  - Move them into the standardized directory structure
+  - Log: `Renamed Boogie_Woogie_Santa_Claus_outtro.mp3 → Boogie_Woogie_Santa_Claus_outro.mp3`
 
 ### 7.6 Centralized Logging with Rotation
 
@@ -345,24 +337,8 @@ Could allow remote control via phone app.
 - Prevents log files from growing unbounded
 - Standardized log locations across all components
 - Better integration with system monitoring tools
-- Migration should happen incrementally during THINK windows (non-blocking)
-- Files should be moved atomically with fallback to original location if needed
-- DJ should maintain a mapping of old paths to new paths during transition
 
-**Outro Spelling Normalization:**
-- **Canonical name:** `_outro` (one "t")
-- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
-- **Phase 9 Asset Discovery:** Accepts both patterns:
-  - `*_outro*.mp3` (canonical)
-  - `*_outtro*.mp3` (historical typo)
-- **Internal normalization:** All `AudioEvent.type="outro"` normalize to the 1-T spelling regardless of filename
-- **Future Cleanup:** When the media library self-organization feature runs, the system will:
-  - Detect any `*_outtro*.mp3` files
-  - Rename them to the canonical form `*_outro*.mp3`
-  - Move them into the standardized directory structure
-  - Log: `Renamed Boogie_Woogie_Santa_Claus_outtro.mp3 → Boogie_Woogie_Santa_Claus_outro.mp3`
-
-### 7.6 Multi-Station Platform Architecture
+### 7.7 Multi-Station Platform Architecture
 
 **Future Goal:** Enable running multiple radio stations simultaneously from a single Retrowaves codebase, where "Appalachia Radio" becomes one output stream instance among many.
 
@@ -396,7 +372,7 @@ Could allow remote control via phone app.
   - Test/production station instances
   - Regional variations of the same station
 
-### 7.7 Graceful Shutdown with Offline Announcement
+### 7.8 Graceful Shutdown with Offline Announcement
 
 **Future Goal:** When shutting down the station, allow the current song to finish playing before stopping. Optionally have the DJ announce that the station is going offline.
 
@@ -463,17 +439,58 @@ Send alerts:
 
 ---
 
-## 9. Stretch Goals (Fun / Experimental)
+## 9. Audio Generation & AI Integration
 
-### 9.1 AI "Call-In" Show
+### 9.1 ElevenLabs Integration (Full TTS)
+
+**Future Goal:** Enable the DJ to generate intros/outros/talk/break content using ElevenLabs voices.
+
+**Possible Features:**
+- Generate dynamic talk segments ("That was Fleetwood Mac… here's the weather")
+- Personalized intros/outros for specific songs
+- Time-based greetings ("Good morning Appalachia")
+- Emergency or breaking-news announcements
+- On-demand filler content via ticklers
+
+**Constraints:**
+- NEVER generated during DO
+- Only generated during THINK via ticklers
+- Must be cached MP3 before use
+
+### 9.2 Emotion/Mood Adaptive Voice
+
+*(Not required for core operation)*
+
+DJ voice tone adapts to:
+- time of day
+- schedule blocks
+- music genre changes
+- audience vibe (if analytics are added)
+
+### 9.3 Local Voice Model / Offline TTS
+
+Eliminate dependency on ElevenLabs entirely.
+
+Use:
+- Coqui TTS
+- Piper
+- VITS
+
+Offline operation, zero API cost.
+
+---
+
+## 10. Stretch Goals (Fun / Experimental)
+
+### 10.1 AI "Call-In" Show
 
 Simulated callers and DJ responses.
 
-### 9.2 AI Song Facts Generator
+### 10.2 AI Song Facts Generator
 
 Pulls facts and band trivia automatically.
 
-### 9.3 Multi-DJ Personalities
+### 10.3 Multi-DJ Personalities
 
 - Morning DJ
 - Afternoon DJ
@@ -481,143 +498,11 @@ Pulls facts and band trivia automatically.
 
 Each with different intros/outros.
 
-### 9.4 "Retro Mode" (1980s Radio Filter)
+### 10.4 "Retro Mode" (1980s Radio Filter)
 
 Vinyl crackle, tape hiss, jingles, station power-up sequence.
 
 Just for fun.
-
----
-
-## 10. Metadata + Event Side-Channel (Client-Agnostic Signaling Layer)
-
-### 10.1 Purpose
-
-Create a second output stream (parallel to audio) delivering real-time events and metadata about what the station is doing.
-
-This channel would allow **ANY intelligent client** — OBS, a web UI, a Discord bot, a mobile app, a dashboard, etc. — to react to the station without Retrowaves being tied to any one platform.
-
-**No assumptions. No coupling. Pure abstraction.**
-
-### 10.2 What This Side-Channel Emits
-
-The event stream might deliver messages like:
-
-#### Playback Lifecycle
-
-- `segment_started`: `{ type: "song", path: "...", title: "...", artist: "..." }`
-- `segment_finished`: `{ type: "intro", duration: 2.5 }`
-- `up_next`: `song_003.mp3`
-- `dj_intent_committed`: `{ outro: true, ids: 1, intro: true, song: ... }`
-
-#### Station Lifecycle
-
-- `station_starting`
-- `station_running`
-- `station_stopping`
-- `station_idle`
-- `restarting`
-
-Great for telling OBS: *"Switch to the standby scene until audio resumes."*
-
-#### DJ Behavior Events
-
-- `dj_talk_planned`
-- `dj_id_triggered`
-- `dj_outro_selected`
-- `dj_intro_selected`
-- `dj_ticklers_consumed`
-
-#### Rotation & Music Metadata
-
-- Song metadata (artist, album, year, length)
-- Rotation weight info
-- Recent plays
-- Holiday weighting sample
-
-OBS could show "Now Playing" from this data.
-
-### 10.3 How Clients Subscribe (Client-Agnostic)
-
-**Potential transport options (choose 1 or several):**
-
-#### 1. WebSocket feed
-
-- Continuous JSON events
-- Perfect for OBS, web UIs, dashboards
-- Bi-directional if needed (but not required)
-
-#### 2. Server-Sent Events (SSE)
-
-- One-way event stream
-- Super lightweight
-- Perfect for LAN dashboards/Web UIs
-- No external deps
-
-#### 3. JSON-over-HTTP polling endpoint
-
-- Simple fallback
-- `/now_playing`
-- `/dj_intent`
-- `/state`
-
-#### 4. Optional Icecast Metadata Integration
-
-- If you choose Icecast later, we can push "Now Playing" updates
-- That's optional and separate from the audio playout
-
-### 10.4 What This Enables for OBS Without Hard Dependencies
-
-OBS would simply:
-
-1. Listen to the side-channel (WebSocket or SSE)
-2. When it sees:
-   - `{ "event": "station_stopping" }` → Switch to "Please Stand By"
-   - `{ "event": "segment_started", "type": "song" }` → Switch to your main scene
-
-This keeps Retrowaves:
-- **pure**
-- **platform-independent**
-- **deterministic**
-- **not tied to OBS's web socket API**
-- **safe from breaking changes in OBS**
-
-### 10.5 Technical Benefits
-
-- **Zero client assumptions:** Station doesn't need to know anything about OBS.
-- **Non-blocking:** THINK/DO logic remains untouched.
-- **Scalable:** Many clients can listen — OBS, web dashboards, scripts, plugins.
-- **Future-proof:** Works with:
-  - OBS
-  - Streamlabs
-  - Mobile apps
-  - Smart home dashboards
-  - Web UIs
-  - Discord bots
-- **Extremely easy to test:** You can watch the event stream with:
-  ```bash
-  curl http://localhost:8000/events
-  ```
-
-### 10.6 Future Extensions (Optional)
-
-- Add "timeline markers" so clients can visually align audio and events
-- Add animated avatars reacting to intros/outros
-- Build a full HTML5 "Radio Control Room" UI
-- Add analytics on event stream consumption
-- Add "DJ heartbeats" for health monitoring
-- Build a REST API for controlling low-level station features
-- Add a "visualizer plugin" that reacts to PCM amplitude values coming from the mixer
-
-### 10.7 Architectural Direction
-
-**This is the correct architectural direction.**
-
-You maintain:
-- **pure audio stream** → radio's core
-- **stateless metadata/event feed** → everything else
-
-This is **EXACTLY** how professional broadcast systems (Zetta, ENCO, WideOrbit) operate when interfacing with companion systems.
 
 ---
 
@@ -795,7 +680,150 @@ This Wishlist item adds:
 
 ---
 
-## 12. Summary
+## 12. Completed Enhancements
+
+### Control Channel & Event Side-Channel
+
+**Status:** ✅ **COMPLETED** - Production-ready implementation
+
+**Implementation Date:** 2024-12-08
+
+#### Purpose
+
+Create a second output stream (parallel to audio) delivering real-time events and metadata about what the station is doing.
+
+This channel allows **ANY intelligent client** — OBS, a web UI, a Discord bot, a mobile app, a dashboard, etc. — to react to the station without Retrowaves being tied to any one platform.
+
+**No assumptions. No coupling. Pure abstraction.**
+
+#### What This Side-Channel Emits
+
+The event stream delivers messages like:
+
+**Playback Lifecycle:**
+- `segment_started`: `{ type: "song", path: "...", title: "...", artist: "..." }`
+- `segment_progress`: `{ segment_id: "...", elapsed_time: 123.45, expected_duration: 180.0, progress_percent: 68.6 }` (emitted at least once per second)
+- `segment_finished`: `{ type: "intro", duration: 2.5 }`
+
+**DJ Behavior Events:**
+- `dj_think_started`: `{ timestamp: 1234567890.0 }`
+- `dj_think_completed`: `{ timestamp: 1234567891.5, think_duration_ms: 1500.0, dj_intent: {...} }`
+
+**Buffer Health Events:**
+- `station_underflow`: `{ timestamp: 1234567890.0, buffer_depth: 0 }`
+- `station_overflow`: `{ timestamp: 1234567890.0, frames_dropped: 42 }`
+
+**Clock Drift Events:**
+- `decode_clock_skew`: `{ timestamp: 1234567890.0, drift_ms: 45.2 }` (if drift compensation enabled)
+
+#### How Clients Subscribe
+
+**Current Implementation:**
+- **WebSocket feed** - Primary transport for real-time event streaming
+  - `/tower/events` - Continuous WebSocket stream of events as they occur
+  - `/tower/events/recent` - WebSocket connection that sends recent events then closes
+  - Continuous JSON events
+  - Perfect for OBS, web UIs, dashboards
+  - Tower sends only; clients may send ping frames
+  - Each message contains exactly one event as a complete JSON object
+  - Messages are text-format JSON (not binary)
+
+#### What This Enables for OBS Without Hard Dependencies
+
+OBS would simply:
+
+1. Connect to WebSocket endpoint `ws://tower:8005/tower/events`
+2. When it sees:
+   - `{ "event_type": "station_stopping" }` → Switch to "Please Stand By"
+   - `{ "event_type": "segment_started", "type": "song" }` → Switch to your main scene
+
+This keeps Retrowaves:
+- **pure**
+- **platform-independent**
+- **deterministic**
+- **not tied to OBS's web socket API**
+- **safe from breaking changes in OBS**
+
+#### Technical Benefits
+
+- **Zero client assumptions:** Station doesn't need to know anything about OBS.
+- **Non-blocking:** THINK/DO logic remains untouched.
+- **Scalable:** Many clients can listen — OBS, web dashboards, scripts, plugins.
+- **Future-proof:** Works with:
+  - OBS
+  - Streamlabs
+  - Mobile apps
+  - Smart home dashboards
+  - Web UIs
+  - Discord bots
+- **Extremely easy to test:** You can connect to the event stream with:
+  ```bash
+  # Connect to WebSocket endpoint
+  wscat -c ws://localhost:8005/tower/events
+  ```
+
+#### Event Ingestion (Station → Tower)
+
+Station sends heartbeat events to Tower via HTTP POST to `/tower/events/ingest`:
+
+- Events are one-way (Station→Tower)
+- Tower validates and stores events in a bounded buffer
+- Events are immediately broadcast to all connected WebSocket clients
+- Tower never sends timing information back to Station
+- Events are purely observational
+
+**Accepted Event Types:**
+- `segment_started`
+- `segment_progress`
+- `segment_finished`
+- `dj_think_started`
+- `dj_think_completed`
+- `decode_clock_skew` (if drift compensation enabled)
+- `station_underflow`
+- `station_overflow`
+
+#### Implementation Summary
+
+**What Was Implemented:**
+- Tower event ingestion endpoint (`/tower/events/ingest`) via HTTP POST
+- Tower event buffer with bounded, thread-safe storage (1000 event capacity)
+- WebSocket event streaming endpoint (`/tower/events`) for real-time event delivery
+- WebSocket recent events endpoint (`/tower/events/recent`) for initial event catch-up
+- Station event emission: All required event types from contracts (PE4, DJ4, OS3)
+- Non-blocking, purely observational event system
+- Full contract compliance with all tests passing
+
+**Event Types Implemented:**
+- Segment lifecycle: `segment_started`, `segment_progress`, `segment_finished`
+- DJ lifecycle: `dj_think_started`, `dj_think_completed`
+- Buffer health: `station_underflow`, `station_overflow`
+- Optional: `decode_clock_skew` (only if drift compensation enabled)
+
+**Contract Compliance:**
+- ✅ Tower: T-EVENTS (reception, storage, validation)
+- ✅ Tower: T-EXPOSE (WebSocket endpoints, fanout, immediate flush)
+- ✅ Station: PE4 (PlayoutEngine heartbeat events)
+- ✅ Station: DJ4 (DJEngine THINK lifecycle events)
+- ✅ Station: OS3 (OutputSink buffer health events)
+
+**Documentation:**
+- Contract: `tower/docs/contracts/NEW_TOWER_RUNTIME_CONTRACT.md` (Sections Y & Z)
+- Implementation: `tower/http/server.py`, `tower/http/websocket.py`, `tower/http/event_buffer.py`
+- Station Integration: `station/outputs/tower_control.py`, `station/broadcast_core/playout_engine.py`, `station/dj_logic/dj_engine.py`, `station/outputs/tower_pcm_sink.py`
+
+**Architectural Note:**
+
+This is the correct architectural direction.
+
+You maintain:
+- **pure audio stream** → radio's core
+- **stateless metadata/event feed** → everything else
+
+This is **EXACTLY** how professional broadcast systems (Zetta, ENCO, WideOrbit) operate when interfacing with companion systems.
+
+---
+
+## 13. Summary
 
 This document is a sandbox of ideas — future enhancements that can extend Retrowaves beyond its core architecture.
 

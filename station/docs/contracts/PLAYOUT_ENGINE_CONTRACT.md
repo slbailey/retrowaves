@@ -161,6 +161,163 @@ elapsed = time.monotonic() - segment_start
 
 ---
 
+## PE4 — Heartbeat Events
+
+PlayoutEngine **MUST** emit control-channel events for observability. These events are purely observational and **MUST NOT** influence playout behavior or timing decisions.
+
+### PE4.1 — Segment Started Event
+
+**MUST** emit `segment_started` event before the first PCM frame of a segment.
+
+- Event **MUST** be emitted synchronously before audio begins
+- Event **MUST NOT** block playout thread
+- Event **MUST** include metadata:
+  - `segment_id`: Unique identifier for the segment
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `expected_duration`: Expected segment duration in seconds (from file metadata)
+  - `audio_event`: The AudioEvent being played
+- Event **MUST** be emitted from the playout thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+
+### PE4.2 — Segment Progress Event
+
+**MUST** emit `segment_progress` event at least once per second during segment playback.
+
+- Event **MUST** be emitted periodically (minimum 1 Hz) while segment is playing
+- Event **MUST NOT** block playout thread
+- Event **MUST** include metadata:
+  - `segment_id`: Unique identifier for the current segment
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `elapsed_time`: Elapsed playback time in seconds (measured via Clock A wall clock)
+  - `expected_duration`: Expected segment duration in seconds
+  - `progress_percent`: Percentage of segment completed (0.0 to 100.0)
+- Event **MUST** be emitted from the playout thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** use Clock A (wall clock) for elapsed time calculation, not decoder speed or PCM frame count
+
+### PE4.3 — Segment Finished Event
+
+**MUST** emit `segment_finished` event after the last PCM frame of a segment.
+
+- Event **MUST** be emitted synchronously after audio ends
+- Event **MUST NOT** block playout thread
+- Event **MUST** include metadata:
+  - `segment_id`: Unique identifier for the completed segment
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `total_duration`: Actual playback duration in seconds (measured via Clock A wall clock)
+  - `audio_event`: The AudioEvent that finished
+- Event **MUST** be emitted from the playout thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** use Clock A (wall clock) for duration calculation, not decoder speed or PCM frame count
+
+### PE4.4 — Event Emission Rules
+
+All heartbeat events **MUST** follow these behavioral rules:
+
+- **Non-blocking**: Events **MUST NOT** block the playout thread or delay PCM frame processing
+- **Observational only**: Events **MUST NOT** influence segment timing, decode pacing, or queue operations
+- **Station-local**: Events **MUST NOT** rely on Tower timing, Tower state, or PCM write success/failure
+- **Clock A only**: Events **MUST** use Clock A (wall clock) for all timing measurements
+- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state
+- **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (before/after segment start/finish)
+- **Metadata completeness**: Events **MUST** include all required metadata fields
+
+### PE4.5 — Decode Clock Skew Event
+
+If optional Station Timebase Drift Compensation is enabled (see PE5), PlayoutEngine **MUST** emit `decode_clock_skew` event whenever drift exceeds the permitted threshold.
+
+- Event **MUST** be emitted when Clock A drift is detected and compensation is applied
+- Event **MUST NOT** block playout thread
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `drift_ms`: Detected drift in milliseconds (positive = ahead, negative = behind)
+  - `threshold_ms`: Permitted drift threshold in milliseconds
+  - `compensation_applied`: Boolean indicating whether compensation was applied
+- Event **MUST** be emitted from Clock A pacing layer (if decode pacing is used)
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be purely observational
+
+---
+
+## PE5 — Optional Station Timebase Drift Compensation
+
+Station **MAY** implement optional timebase drift compensation within Clock A. This compensation operates purely within Station's local clock domain and **MUST NOT** attempt to match or synchronize with Tower's Clock B.
+
+### PE5.1 — Drift Definition
+
+**Drift** is defined as the difference between:
+- Expected decode time (based on Clock A metronome pacing)
+- Actual decode time (based on wall clock measurement)
+
+Drift is measured in milliseconds and represents how far ahead or behind the decode metronome is relative to wall clock.
+
+### PE5.2 — Drift Detection
+
+If drift compensation is enabled, Station **MUST** detect drift by comparing:
+- Clock A decode metronome time (expected frame time)
+- Wall clock time (`time.monotonic()`)
+
+Drift **MUST** be calculated using only Station-local monotonic time. Station **MUST NOT** use Tower timing, PCM write success/failure, or any Tower state to detect drift.
+
+### PE5.3 — Permitted Compensation
+
+If drift compensation is enabled, Station **MAY** adjust Clock A decode metronome pacing within very small allowed bounds.
+
+**Permitted adjustments:**
+- Station **MAY** adjust decode metronome pacing to correct small drift (< threshold)
+- Station **MAY** use proportional correction within bounds (e.g., ±1% of frame duration)
+- Station **MAY** apply correction gradually over multiple frames
+
+**Forbidden adjustments:**
+- Station **MUST NOT** attempt to match Tower PCM clock (Clock B)
+- Station **MUST NOT** apply adaptive pacing based on PCM ingestion feedback
+- Station **MUST NOT** use Tower state to influence compensation
+- Station **MUST NOT** exceed permitted compensation bounds (implementation-defined threshold)
+- Station **MUST NOT** affect segment duration logic (segments still wall clock driven)
+
+### PE5.4 — Segment Duration Invariant
+
+Drift compensation **MUST NOT** affect segment duration logic.
+
+- Segment duration **MUST** remain wall clock driven
+- Segment ends when: `elapsed_time >= expected_duration_seconds` (measured via wall clock)
+- Drift compensation **MUST NOT** alter segment timing or THINK/DO cadence
+- Segment duration **MUST** reflect actual MP3 duration, independent of decode pacing adjustments
+
+### PE5.5 — Drift Reporting
+
+If drift compensation is enabled, Station **MUST** emit `decode_clock_skew` event (per PE4.5) whenever drift exceeds the permitted threshold.
+
+- Event **MUST** be emitted when drift is detected and compensation is applied
+- Event **MUST** include drift magnitude and compensation details
+- Event **MUST** be purely observational (does not influence playout)
+
+### PE5.6 — Optional Implementation
+
+Drift compensation is **OPTIONAL** and implementation-defined.
+
+- Station **MAY** implement drift compensation
+- Station **MAY** choose not to implement drift compensation
+- If not implemented, Station **MUST NOT** emit `decode_clock_skew` events
+- Implementation details (thresholds, correction algorithms) are implementation-defined
+- Behavioral restrictions (PE5.1 through PE5.5) **MUST** be followed if compensation is implemented
+
+### PE5.7 — Tower Independence
+
+Drift compensation **MUST** operate independently of Tower.
+
+- Station **MUST NOT** use Tower timing to detect or correct drift
+- Station **MUST NOT** use PCM write success/failure to influence compensation
+- Station **MUST NOT** attempt to synchronize with Tower's Clock B
+- Station **MUST NOT** apply adaptive pacing based on Tower ingestion behavior
+- All drift detection and compensation **MUST** use only Station-local monotonic time
+
+---
+
 ## Implementation Notes
 
 - PlayoutEngine reads from playout queue (DO phase enqueues)

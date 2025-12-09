@@ -57,6 +57,9 @@ class StationService:
         # Runtime state
         self.running = False
         self._shutdown_initiated = False
+        # Track lifecycle events to ensure they're only sent once
+        self._startup_event_sent = False
+        self._shutdown_event_sent = False
     
     def start(self):
         """
@@ -67,6 +70,11 @@ class StationService:
         Per SL1.3: No THINK event MAY occur before first segment.
         Per SL1.4: Startup MUST not block playout once initiated.
         """
+        # Prevent multiple calls to start()
+        if self.running:
+            logger.warning("Station already started, ignoring duplicate start() call")
+            return
+        
         logger.info("=== Station starting ===")
         
         # SL1.1: Load MediaLibrary first
@@ -97,10 +105,17 @@ class StationService:
         
         # Initialize DJEngine (needs RotationManager, AssetDiscoveryManager)
         logger.info("Initializing DJEngine...")
+        # Initialize Tower control client first (needed for DJEngine events)
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
+        tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
+        logger.info(f"Tower control client initialized (url=http://{tower_host}:{tower_port})")
+        
         self.dj = DJEngine(
             playout_engine=None,  # Will be set after engine creation
             rotation_manager=self.rotation,
-            dj_asset_path=dj_path
+            dj_asset_path=dj_path,
+            tower_control=tower_control
         )
         # Replace asset_manager with our initialized one (DJEngine creates its own, but we want to use ours)
         self.dj.asset_manager = self.asset_manager
@@ -117,14 +132,11 @@ class StationService:
         # Initialize output sink (Tower PCM socket)
         logger.info("Initializing Tower PCM sink...")
         tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
-        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
-        tower_port = int(os.getenv("TOWER_PORT", "8005"))
-        self.sink = TowerPCMSink(socket_path=tower_socket_path)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path, tower_control=tower_control)
         logger.info(f"Tower PCM sink initialized (socket={tower_socket_path})")
         
-        # Initialize Tower control client
-        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
-        logger.info(f"Tower control client initialized (url=http://{tower_host}:{tower_port})")
+        # Store tower_control for PlayoutEngine
+        self.tower_control = tower_control
         
         # Initialize PlayoutEngine (needs DJ callback and output sink)
         logger.info("Initializing PlayoutEngine...")
@@ -163,6 +175,21 @@ class StationService:
         self.engine.run()  # This starts the playout loop in a background thread
         logger.info("Playout engine started (startup complete, playout running in background)")
         
+        # Send station_starting_up event to Tower (only once per contract)
+        if self.tower_control and not self._startup_event_sent:
+            try:
+                self.tower_control.send_event(
+                    event_type="station_starting_up",
+                    timestamp=time.monotonic(),
+                    metadata={}
+                )
+                self._startup_event_sent = True
+                logger.info("Sent station_starting_up event to Tower")
+            except Exception as e:
+                logger.warning(f"Failed to send station_starting_up event: {e}")
+        elif self._startup_event_sent:
+            logger.debug("station_starting_up event already sent, skipping duplicate")
+        
         self.running = True
         logger.info("=== Station started successfully ===")
     
@@ -194,6 +221,21 @@ class StationService:
         logger.info("=== Station shutting down ===")
         self._shutdown_initiated = True
         self.running = False
+        
+        # Send station_shutting_down event to Tower (only once per contract)
+        if self.tower_control and not self._shutdown_event_sent:
+            try:
+                self.tower_control.send_event(
+                    event_type="station_shutting_down",
+                    timestamp=time.monotonic(),
+                    metadata={}
+                )
+                self._shutdown_event_sent = True
+                logger.info("Sent station_shutting_down event to Tower")
+            except Exception as e:
+                logger.warning(f"Failed to send station_shutting_down event: {e}")
+        elif self._shutdown_event_sent:
+            logger.debug("station_shutting_down event already sent, skipping duplicate")
         
         # SL2.2: Prevent new THINK/DO cycles by disabling DJ callbacks
         # Per SL2.2: No THINK or DO events MAY fire after shutdown begins

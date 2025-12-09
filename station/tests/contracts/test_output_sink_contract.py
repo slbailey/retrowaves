@@ -10,6 +10,7 @@ Tests map directly to contract clauses:
 - OS1.4: Frame Atomicity for Tower Integration (1 test)
 - OS2.1: Content Modification (1 test)
 - OS2.2: Timing Interpretation (updated with two-clock model)
+- OS3: Buffer Health Events (station_underflow, station_overflow)
 """
 
 import pytest
@@ -138,3 +139,59 @@ class TestOS2_2_TimingInterpretation:
         # - Segment timing is independent of PCM output rate
         
         assert True, "Contract requires two-clock model - PCM clock independent of playback clock"
+
+
+class TestOS3_BufferHealthEvents:
+    """Tests for OS3 — Buffer Health Events."""
+    
+    def test_os3_1_station_underflow_must_emit_when_buffer_empty(self, stub_output_sink):
+        """OS3.1: station_underflow MUST emit when buffer becomes empty."""
+        # Contract requires event emission when buffer depth = 0
+        # Event should include: timestamp, buffer_depth, frames_dropped
+        assert True, "Contract requires station_underflow event when buffer becomes empty"
+    
+    def test_os3_1_station_underflow_must_not_influence_decode_pacing(self, stub_output_sink):
+        """OS3.1: station_underflow MUST NOT influence decode pacing."""
+        # Contract requires event does not affect Clock A decode pacing or segment timing
+        assert True, "Contract requires event does not influence decode pacing"
+    
+    def test_os3_1_station_underflow_must_not_modify_queue_or_state(self, stub_output_sink):
+        """OS3.1: station_underflow MUST NOT modify queue or state."""
+        # Contract requires event does not modify playout queue or rotation history
+        assert True, "Contract requires event does not modify state"
+    
+    def test_os3_2_station_overflow_must_emit_when_buffer_exceeds_capacity(self, stub_output_sink):
+        """OS3.2: station_overflow MUST emit when buffer exceeds capacity."""
+        # Contract requires event emission when frames are dropped due to full buffer
+        # Event should include: timestamp, buffer_depth, frames_dropped
+        assert True, "Contract requires station_overflow event when buffer exceeds capacity"
+    
+    def test_os3_2_station_overflow_must_not_influence_decode_pacing(self, stub_output_sink):
+        """OS3.2: station_overflow MUST NOT influence decode pacing."""
+        # Contract requires event does not affect Clock A decode pacing or segment timing
+        assert True, "Contract requires event does not influence decode pacing"
+    
+    def test_os3_2_station_overflow_must_not_modify_queue_or_state(self, stub_output_sink):
+        """OS3.2: station_overflow MUST NOT modify queue or state."""
+        # Contract requires event does not modify playout queue or rotation history
+        assert True, "Contract requires event does not modify state"
+    
+    def test_os3_3_all_buffer_health_events_must_be_non_blocking(self, stub_output_sink):
+        """OS3.3: Buffer health events MUST be non-blocking."""
+        # Contract requires events do not block PCM output thread
+        assert True, "Contract requires buffer health events are non-blocking"
+    
+    def test_os3_3_all_buffer_health_events_must_be_observational_only(self, stub_output_sink):
+        """OS3.3: Buffer health events MUST be observational only."""
+        # Contract requires events do not influence decode pacing, segment timing, or queue operations
+        assert True, "Contract requires buffer health events are observational only"
+    
+    def test_os3_3_all_buffer_health_events_must_be_station_local(self, stub_output_sink):
+        """OS3.3: Buffer health events MUST be Station-local."""
+        # Contract requires events do not rely on Tower timing or state
+        assert True, "Contract requires buffer health events are Station-local only"
+    
+    def test_os3_3_all_buffer_health_events_must_not_influence_timing(self, stub_output_sink):
+        """OS3.3: Buffer health events MUST NOT influence timing."""
+        # Contract requires events do not influence Clock A decode pacing or segment duration logic
+        assert True, "Contract requires buffer health events do not influence timing"

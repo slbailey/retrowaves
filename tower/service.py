@@ -37,6 +37,7 @@ class TowerService:
         self.mp3_buffer = FrameRingBuffer(capacity=mp3_buffer_capacity)
         # Pass MP3 buffer to EncoderManager with encoder_enabled flag per [I19]
         # In production, allow_ffmpeg=True per [I25] (tests must explicitly disable)
+        # Note: station_shutdown_check will be set after http_server is created
         self.encoder = EncoderManager(
             pcm_buffer=self.pcm_buffer,
             mp3_buffer=self.mp3_buffer,
@@ -77,6 +78,10 @@ class TowerService:
             frame_source=self.encoder,
             buffer_stats_provider=self.pcm_buffer  # PCM buffer has .stats() method
         )
+        
+        # Set station shutdown check callback in encoder_manager per contract T-EVENTS5 exception
+        # This allows encoder_manager to suppress PCM loss warnings when station is shutting down
+        self.encoder._station_shutdown_check = lambda: self.http_server.event_buffer.is_station_shutting_down()
         
         # Create PCM Ingestion subsystem
         # Per contract I43: Deliver to same upstream buffer AudioPump reads from

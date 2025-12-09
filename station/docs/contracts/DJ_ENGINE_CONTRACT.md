@@ -87,6 +87,53 @@ Selection **MUST** follow pacing rules:
 
 ---
 
+## DJ4 — THINK Lifecycle Events
+
+DJEngine **MUST** emit control-channel events for THINK phase observability. These events are purely observational and **MUST NOT** influence THINK execution or decision-making.
+
+### DJ4.1 — THINK Started Event
+
+**MUST** emit `dj_think_started` event before THINK logic begins.
+
+- Event **MUST** be emitted synchronously before any THINK operations
+- Event **MUST NOT** block THINK execution
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `current_segment`: The AudioEvent currently playing (that triggered this THINK phase)
+- Event **MUST** be emitted from the THINK thread (typically during `on_segment_started()` callback)
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+
+### DJ4.2 — THINK Completed Event
+
+**MUST** emit `dj_think_completed` event after THINK logic completes (before DO phase begins).
+
+- Event **MUST** be emitted synchronously after all THINK operations complete
+- Event **MUST NOT** block DO phase execution
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `dj_intent`: The DJIntent produced by THINK (read-only reference)
+  - `think_duration_ms`: Duration of THINK phase in milliseconds
+- Event **MUST** be emitted from the THINK thread (typically during `on_segment_started()` callback)
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be emitted after DJIntent is complete and immutable
+
+### DJ4.3 — Event Emission Rules
+
+All THINK lifecycle events **MUST** follow these behavioral rules:
+
+- **Non-blocking**: Events **MUST NOT** block THINK execution or delay decision-making
+- **Observational only**: Events **MUST NOT** influence song selection, ID selection, or any THINK decisions
+- **Station-local**: Events **MUST NOT** rely on Tower timing, Tower state, or PCM write success/failure
+- **Clock A only**: Events **MUST** use Clock A (wall clock) for all timing measurements
+- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state
+- **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (before/after THINK logic)
+- **Metadata completeness**: Events **MUST** include all required metadata fields
+- **THINK/DO separation**: Events **MUST** respect THINK/DO boundaries (events emitted during THINK, not DO)
+
+---
+
 ## Implementation Notes
 
 - DJEngine is called during `on_segment_started()` callback (THINK phase)

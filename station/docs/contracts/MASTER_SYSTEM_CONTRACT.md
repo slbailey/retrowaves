@@ -55,6 +55,36 @@ No component **MAY** modify the playout queue except **DO**.
 - PlayoutEngine reads from the queue but does not modify it
 - Only DO operations may enqueue, dequeue, or reorder segments
 
+### E0.7 — Heartbeat Observability
+
+The system **MUST** emit control-channel heartbeat events for observability. These events are purely observational and **MUST NOT** influence THINK/DO decisions or playout behavior.
+
+**Heartbeat events MUST:**
+- Be observable but not influence decisions
+- Respect THINK/DO boundaries (events emitted from appropriate lifecycle phases)
+- Not modify queue or state
+- Be emitted from appropriate components (PlayoutEngine, DJEngine, OutputSink)
+- Use Clock A (wall clock) for all timing measurements
+- Not rely on Tower timing or state
+
+**Heartbeat events include:**
+- Segment lifecycle events (`segment_started`, `segment_progress`, `segment_finished`) — emitted by PlayoutEngine
+- THINK lifecycle events (`dj_think_started`, `dj_think_completed`) — emitted by DJEngine
+- Buffer health events (`station_underflow`, `station_overflow`) — emitted by OutputSink
+- Clock drift events (`decode_clock_skew`) — emitted by PlayoutEngine (if drift compensation enabled)
+
+**Event emission rules:**
+- Events **MUST** be emitted at correct lifecycle boundaries
+- Events **MUST NOT** block THINK or DO operations
+- Events **MUST NOT** modify queue, rotation history, or any system state
+- Events **MUST** be purely observational (no control logic)
+- Events **MUST** include required metadata (timestamps, segment_id, etc.)
+
+**THINK/DO separation:**
+- THINK events (`dj_think_started`, `dj_think_completed`) are emitted during THINK phase
+- DO events (`segment_started`, `segment_progress`, `segment_finished`) are emitted during DO phase
+- Events **MUST NOT** cross THINK/DO boundaries (THINK events don't influence DO, DO events don't influence THINK)
+
 ---
 
 ## Contract Dependencies

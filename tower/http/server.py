@@ -11,6 +11,16 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
+from tower.http.event_buffer import EventBuffer
+from tower.http.websocket import (
+    parse_upgrade_request,
+    create_upgrade_response,
+    encode_websocket_frame,
+    decode_websocket_frame,
+    create_close_frame,
+    WebSocketError
+)
+
 logger = logging.getLogger(__name__)
 
 # Client timeout per contract T-CLIENTS2
@@ -64,7 +74,7 @@ class HTTPServer:
     - Maintains thread-safe client registry (T-CLIENTS3)
     - Validates socket send return values (T-CLIENTS4)
     """
-    def __init__(self, host, port, frame_source, buffer_stats_provider=None):
+    def __init__(self, host, port, frame_source, buffer_stats_provider=None, event_buffer_capacity=1000):
         """
         Initialize HTTPServer.
         
@@ -73,6 +83,7 @@ class HTTPServer:
             port: Port to listen on
             frame_source: Must implement .pop() returning bytes (for /stream endpoint)
             buffer_stats_provider: Optional object with .stats() method returning buffer stats (for /tower/buffer endpoint)
+            event_buffer_capacity: Maximum number of events to store (default: 1000)
         """
         self.host = host
         self.port = port
@@ -83,6 +94,17 @@ class HTTPServer:
         # Store clients as dict: {client_id: _ClientState}
         self._connected_clients: dict[str, _ClientState] = {}
         self._clients_lock = threading.Lock()
+        
+        # Event buffer per contract T-EVENTS2
+        self.event_buffer = EventBuffer(capacity=event_buffer_capacity)
+        
+        # Track last broadcasted event ID to prevent duplicate broadcasts
+        self._last_broadcasted_event_id: Optional[str] = None
+        self._last_broadcasted_lock = threading.Lock()
+        
+        # Event streaming clients (for /tower/events WebSocket endpoint) per contract T-EXPOSE1
+        self._event_clients: dict[str, socket.socket] = {}
+        self._event_clients_lock = threading.Lock()
         
         # Backwards compatibility: connection_manager proxy for tests
         # Per NEW_TOWER_RUNTIME_CONTRACT, HTTPServer replaced HTTPConnectionManager
@@ -162,6 +184,45 @@ class HTTPServer:
                 self._handle_stream_endpoint(client, client_id)
             elif path == "/tower/buffer":
                 self._handle_buffer_endpoint(client)
+            elif path == "/tower/events/ingest":
+                self._handle_events_ingest_endpoint(client, method, request)
+            elif path.startswith("/tower/events"):
+                # Check if this is a WebSocket upgrade request
+                request_str = request.decode('utf-8', errors='ignore')
+                ws_info = parse_upgrade_request(request_str)
+                
+                if ws_info:
+                    # WebSocket upgrade request
+                    path_parts = ws_info['path'].split("?")
+                    base_path = path_parts[0]
+                    query_params = {}
+                    if len(path_parts) > 1:
+                        # Parse query string
+                        for param in path_parts[1].split("&"):
+                            if "=" in param:
+                                key, value = param.split("=", 1)
+                                query_params[key] = value
+                    
+                    if base_path == "/tower/events/recent":
+                        self._handle_websocket_events_recent(client, client_id, ws_info['sec-websocket-key'], query_params)
+                    elif base_path == "/tower/events":
+                        self._handle_websocket_events(client, client_id, ws_info['sec-websocket-key'], query_params)
+                    else:
+                        self._handle_404(client, path)
+                else:
+                    # Not a WebSocket upgrade - return 400 (WebSocket required)
+                    response = (
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "WebSocket upgrade required\r\n"
+                    )
+                    try:
+                        client.sendall(response.encode("ascii"))
+                    except Exception:
+                        pass
+                    client.close()
             else:
                 # Return 404 for unknown endpoints
                 self._handle_404(client, path)
@@ -299,6 +360,702 @@ class HTTPServer:
         except Exception:
             pass
         client.close()
+    
+    def _handle_events_ingest_endpoint(self, client, method, request):
+        """
+        Handle POST /tower/events/ingest endpoint for event ingestion.
+        
+        Per contract T-EVENTS1: Accepts Station heartbeat events via HTTP POST.
+        Per contract T-EVENTS6: Non-blocking reception.
+        Per contract T-EVENTS7: Validates events.
+        """
+        if method != "POST":
+            response = (
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                '{"error": "Method not allowed. Use POST."}\n'
+            )
+            try:
+                client.sendall(response.encode("ascii"))
+            except Exception:
+                pass
+            client.close()
+            return
+        
+        try:
+            # ====================================================================
+            # Byte-precise HTTP POST body parsing
+            # Per contract T-EVENTS6: Non-blocking, complete body retrieval
+            # ====================================================================
+            
+            # Step 1: Operate on bytes, not decoded strings
+            data = request  # data is already bytes from client.recv()
+            
+            # Step 2: Handle header fragmentation - find header/body separator
+            header_end = data.find(b"\r\n\r\n")
+            max_header_reads = 50  # Allow for slow network chunking (was 10, too low)
+            max_header_size = 65536  # 64 KB max header size to prevent DoS
+            header_reads = 0
+            
+            # Save original timeout to restore later (if socket supports it)
+            try:
+                original_timeout = client.gettimeout()
+            except Exception:
+                original_timeout = None
+            
+            # Set timeout once for header reading section (not per iteration)
+            try:
+                client.settimeout(1.0)  # 1 second timeout (was 0.1s, too short for network/load)
+            except Exception:
+                pass  # Ignore if settimeout fails
+            
+            # If headers are incomplete, continue reading until \r\n\r\n is found
+            while header_end < 0 and header_reads < max_header_reads:
+                try:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        # Connection closed before headers complete
+                        response = (
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            '{"error": "Incomplete headers"}\n'
+                        )
+                        try:
+                            client.sendall(response.encode("ascii"))
+                        except Exception:
+                            pass
+                        client.close()
+                        return
+                    data += chunk
+                    
+                    # Problem 3: Enforce max header size to prevent DoS
+                    if len(data) > max_header_size:
+                        # Header too large, reject to prevent memory exhaustion
+                        response = (
+                            "HTTP/1.1 413 Payload Too Large\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                        )
+                        try:
+                            client.sendall(response.encode("ascii"))
+                        except Exception:
+                            pass
+                        client.close()
+                        return
+                    
+                    header_end = data.find(b"\r\n\r\n")
+                    header_reads += 1
+                except socket.timeout:
+                    # Timeout reading headers - reject request
+                    response = (
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        '{"error": "Header read timeout"}\n'
+                    )
+                    try:
+                        client.sendall(response.encode("ascii"))
+                    except Exception:
+                        pass
+                    client.close()
+                    return
+                except Exception:
+                    break
+            
+            if header_end < 0:
+                # Headers never completed - restore timeout before closing
+                try:
+                    if original_timeout is not None:
+                        client.settimeout(original_timeout)
+                except Exception:
+                    pass
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Incomplete headers"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Step 3: Parse Content-Length from header bytes
+            header_bytes = data[:header_end]
+            content_length = None
+            
+            # Extract Content-Length header
+            for line in header_bytes.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        # Extract value after colon
+                        value = line.split(b":", 1)[1].strip()
+                        content_length = int(value)
+                        if content_length < 0:
+                            content_length = None  # Invalid negative value
+                        logger.debug(f"[EVENTS_INGEST] Parsed Content-Length: {content_length}")
+                        break
+                    except (ValueError, IndexError):
+                        # Invalid Content-Length format
+                        content_length = None
+                        logger.debug(f"[EVENTS_INGEST] Invalid Content-Length format: {line}")
+                        break
+            
+            if content_length is None:
+                # No Content-Length header - restore timeout and reject request
+                try:
+                    if original_timeout is not None:
+                        client.settimeout(original_timeout)
+                except Exception:
+                    pass
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Content-Length header required"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Step 4 & 5: Read body until exactly Content-Length bytes have been received
+            # Extract any body bytes already in the first recv()
+            body_start = header_end + 4  # Skip \r\n\r\n
+            body_bytes = data[body_start:]
+            
+            logger.debug(f"[EVENTS_INGEST] Initial body bytes from first recv: {len(body_bytes)}/{content_length}")
+            
+            # Set timeout once for body reading section (not per iteration)
+            try:
+                client.settimeout(0.5)  # 0.5 second timeout (was 0.1s, too short under load)
+            except Exception:
+                pass  # Ignore if settimeout fails
+            
+            # Read remaining body bytes if needed
+            max_body_reads = 100  # Prevent infinite loop
+            body_reads = 0
+            
+            while len(body_bytes) < content_length and body_reads < max_body_reads:
+                try:
+                    remaining = content_length - len(body_bytes)
+                    chunk = client.recv(min(remaining, 4096))  # Don't read more than needed
+                    if not chunk:
+                        # Connection closed before body complete
+                        response = (
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            '{"error": "Incomplete request body"}\n'
+                        )
+                        try:
+                            client.sendall(response.encode("ascii"))
+                        except Exception:
+                            pass
+                        client.close()
+                        return
+                    body_bytes += chunk
+                    body_reads += 1
+                except socket.timeout:
+                    # Timeout reading body - reject request
+                    response = (
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        '{"error": "Body read timeout"}\n'
+                    )
+                    try:
+                        client.sendall(response.encode("ascii"))
+                    except Exception:
+                        pass
+                    client.close()
+                    return
+                except Exception as e:
+                    logger.warning(f"Error reading request body: {e}")
+                    response = (
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        '{"error": "Error reading request body"}\n'
+                    )
+                    try:
+                        client.sendall(response.encode("ascii"))
+                    except Exception:
+                        pass
+                    client.close()
+                    return
+            
+            # Step 6: Verify we have exactly Content-Length bytes
+            if len(body_bytes) != content_length:
+                # Body length mismatch - restore timeout before closing
+                try:
+                    if original_timeout is not None:
+                        client.settimeout(original_timeout)
+                except Exception:
+                    pass
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    f'{{"error": "Body length mismatch: expected {content_length}, got {len(body_bytes)}"}}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Restore original socket timeout before processing
+            try:
+                if original_timeout is not None:
+                    client.settimeout(original_timeout)
+            except Exception:
+                pass  # Ignore errors restoring timeout
+            
+            # Step 7: Only after full body is received, decode as UTF-8 and JSON-parse
+            logger.debug(f"[EVENTS_INGEST] Body complete: {len(body_bytes)} bytes, decoding UTF-8")
+            try:
+                body_str = body_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as e:
+                # Invalid UTF-8 encoding
+                logger.warning(f"[EVENTS_INGEST] Invalid UTF-8 in request body: {e}")
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Invalid UTF-8 encoding"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            logger.debug(f"[EVENTS_INGEST] UTF-8 decoded, parsing JSON: {len(body_str)} chars")
+            try:
+                event_data = json.loads(body_str)
+                logger.debug(f"[EVENTS_INGEST] JSON parsed successfully: {event_data.get('event_type', 'unknown')}")
+            except json.JSONDecodeError as e:
+                # Invalid JSON - per contract T-EVENTS7: reject invalid events
+                logger.warning(f"[EVENTS_INGEST] Invalid JSON in request body: {e}, body: {body_str[:100]}")
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Invalid JSON"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Extract event fields
+            event_type = event_data.get("event_type")
+            timestamp = event_data.get("timestamp")
+            metadata = event_data.get("metadata", {})
+            
+            # Validate and store event per contract T-EVENTS7
+            success = self.event_buffer.add_event(event_type, timestamp, metadata)
+            
+            if success:
+                response = (
+                    "HTTP/1.1 204 No Content\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                )
+                # Broadcast to streaming clients per contract T-EXPOSE1.7 (immediate flush)
+                self._broadcast_event_to_streaming_clients()
+            else:
+                # Invalid event - silently dropped per contract T-EVENTS7
+                response = (
+                    "HTTP/1.1 204 No Content\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                )
+            
+            client.sendall(response.encode("ascii"))
+            client.close()
+            
+        except Exception as e:
+            logger.warning(f"Error handling /tower/events/ingest: {e}")
+            response = (
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                '{"error": "Internal server error"}\n'
+            )
+            try:
+                client.sendall(response.encode("ascii"))
+            except Exception:
+                pass
+            client.close()
+    
+    def _handle_websocket_events(self, client, client_id, sec_websocket_key, query_params):
+        """
+        Handle WebSocket upgrade and streaming for /tower/events endpoint.
+        
+        Per contract T-EXPOSE1:
+        - Accepts WebSocket upgrade requests from clients
+        - Streams heartbeat events immediately as they are stored
+        - Supports multiple simultaneous WS clients
+        - Broadcasts events to all connected clients without delay
+        """
+        # Parse query parameters
+        event_type_filter = query_params.get("event_type")
+        since = query_params.get("since")
+        since_timestamp = None
+        if since:
+            try:
+                since_timestamp = float(since)
+            except ValueError:
+                # Reject upgrade with 400
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Invalid since parameter"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+        
+        # Perform WebSocket upgrade
+        try:
+            upgrade_response = create_upgrade_response(sec_websocket_key)
+            client.sendall(upgrade_response)
+        except Exception as e:
+            logger.warning(f"Error sending WebSocket upgrade response: {e}")
+            client.close()
+            return
+        
+        # Get the timestamp of the most recent event BEFORE adding client to prevent race condition
+        # This ensures we don't receive events via broadcast that we'll also get from the stream
+        with self._event_clients_lock:
+            # Get the most recent event timestamp to use as a cutoff
+            recent_result = self.event_buffer.get_recent_events(limit=1)
+            cutoff_timestamp = None
+            cutoff_event_id = None
+            if recent_result["events"]:
+                # Use a timestamp slightly after the most recent event to ensure we don't duplicate it
+                cutoff_timestamp = recent_result["events"][0].get("tower_received_at", 0) + 0.001
+                cutoff_event_id = recent_result["events"][0].get("event_id")
+        
+        # Track which events we've sent to this client to prevent duplicates
+        sent_event_ids = set()
+        
+        # Send existing events that match filters (BEFORE adding client to avoid race condition)
+        # Send all events up to (but not including) the cutoff timestamp
+        try:
+            for event in self.event_buffer.get_events_stream(
+                event_type=event_type_filter,
+                since=since_timestamp
+            ):
+                # Stop before events that will be sent via broadcast
+                if cutoff_timestamp is not None and event.tower_received_at >= cutoff_timestamp:
+                    break
+                if not self.running:
+                    break
+                
+                # Skip if we've already sent this event (defensive check)
+                if event.event_id in sent_event_ids:
+                    continue
+                sent_event_ids.add(event.event_id)
+                
+                # Format as JSON message per contract T-EXPOSE1
+                event_json = json.dumps({
+                    "event_type": event.event_type,
+                    "timestamp": event.timestamp,
+                    "tower_received_at": event.tower_received_at,
+                    "event_id": event.event_id,
+                    "metadata": event.metadata
+                })
+                
+                # Send WebSocket text frame
+                try:
+                    frame = encode_websocket_frame(event_json.encode('utf-8'), opcode=0x1)  # Text frame
+                    client.sendall(frame)
+                except (OSError, BrokenPipeError, ConnectionError):
+                    # Client disconnected
+                    break
+        except Exception as e:
+            logger.warning(f"Error sending initial events to client {client_id}: {e}")
+        
+        # Add client to event streaming clients per contract T-EXPOSE1.2
+        # Do this AFTER sending initial events to avoid race condition with broadcasts
+        with self._event_clients_lock:
+            self._event_clients[client_id] = {
+                'socket': client,
+                'event_type_filter': event_type_filter,
+                'since_timestamp': since_timestamp,
+                'last_send_time': time.time(),
+                'cutoff_timestamp': cutoff_timestamp,  # Track events received before connection
+                'cutoff_event_id': cutoff_event_id,  # Track the specific event at cutoff
+                'sent_event_ids': sent_event_ids  # Track which events we've already sent
+            }
+        
+        # Keep connection alive and handle incoming frames (ping/pong, close)
+        buffer = b''
+        try:
+            while self.running:
+                try:
+                    client.settimeout(1.0)
+                    data = client.recv(4096)
+                    if not data:
+                        break
+                    
+                    buffer += data
+                    
+                    # Process WebSocket frames
+                    while len(buffer) >= 2:
+                        opcode, payload, consumed = decode_websocket_frame(buffer)
+                        if opcode is None:
+                            # Incomplete frame, wait for more data
+                            break
+                        
+                        buffer = buffer[consumed:]
+                        
+                        if opcode == 0x8:  # Close frame
+                            # Send close frame response
+                            try:
+                                close_frame = create_close_frame()
+                                client.sendall(close_frame)
+                            except Exception:
+                                pass
+                            break
+                        elif opcode == 0x9:  # Ping frame
+                            # Respond with pong
+                            try:
+                                pong_frame = encode_websocket_frame(payload, opcode=0xA)  # Pong
+                                client.sendall(pong_frame)
+                            except Exception:
+                                pass
+                        # Ignore other opcodes (text/binary from client)
+                    
+                    # Check for slow client (per T-CLIENTS2)
+                    with self._event_clients_lock:
+                        if client_id in self._event_clients:
+                            last_send = self._event_clients[client_id]['last_send_time']
+                            if time.time() - last_send > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
+                                # Client is slow, disconnect
+                                break
+                    
+                except socket.timeout:
+                    # Timeout is fine - check if we should disconnect slow client
+                    continue
+                except (OSError, BrokenPipeError, ConnectionError):
+                    break
+                    
+        except Exception as e:
+            logger.warning(f"Error in WebSocket connection to client {client_id}: {e}")
+        finally:
+            # Remove client
+            with self._event_clients_lock:
+                self._event_clients.pop(client_id, None)
+            try:
+                client.close()
+            except Exception:
+                pass
+    
+    def _handle_websocket_events_recent(self, client, client_id, sec_websocket_key, query_params):
+        """
+        Handle WebSocket upgrade and send recent events for /tower/events/recent endpoint.
+        
+        Per contract T-EXPOSE2:
+        - Accepts WebSocket upgrade requests from clients
+        - Sends the most recent N events immediately upon connection
+        - Each event sent as a separate WebSocket text message
+        """
+        try:
+            # Parse query parameters
+            limit = 100  # Default per contract
+            if "limit" in query_params:
+                try:
+                    limit = int(query_params["limit"])
+                    if limit < 1:
+                        limit = 100
+                    if limit > 1000:
+                        limit = 1000
+                except ValueError:
+                    limit = 100
+            
+            event_type_filter = query_params.get("event_type")
+            since = query_params.get("since")
+            since_timestamp = None
+            if since:
+                try:
+                    since_timestamp = float(since)
+                except ValueError:
+                    # Reject upgrade with 400
+                    response = (
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        '{"error": "Invalid since parameter"}\n'
+                    )
+                    try:
+                        client.sendall(response.encode("ascii"))
+                    except Exception:
+                        pass
+                    client.close()
+                    return
+            
+            # Perform WebSocket upgrade
+            try:
+                upgrade_response = create_upgrade_response(sec_websocket_key)
+                client.sendall(upgrade_response)
+            except Exception as e:
+                logger.warning(f"Error sending WebSocket upgrade response: {e}")
+                client.close()
+                return
+            
+            # Get recent events per contract T-EXPOSE2
+            result = self.event_buffer.get_recent_events(
+                limit=limit,
+                event_type=event_type_filter,
+                since=since_timestamp
+            )
+            
+            # Send each event as a separate WebSocket text message
+            for event_dict in result.get("events", []):
+                try:
+                    event_json = json.dumps(event_dict)
+                    frame = encode_websocket_frame(event_json.encode('utf-8'), opcode=0x1)  # Text frame
+                    client.sendall(frame)
+                except (OSError, BrokenPipeError, ConnectionError):
+                    # Client disconnected
+                    client.close()
+                    return
+            
+            # Close WebSocket connection after sending events
+            # Per contract: "MAY close after sending the initial batch"
+            try:
+                close_frame = create_close_frame()
+                client.sendall(close_frame)
+            except Exception:
+                pass
+            client.close()
+            
+        except Exception as e:
+            logger.warning(f"Error handling /tower/events/recent WebSocket: {e}")
+            try:
+                client.close()
+            except Exception:
+                pass
+    
+    def _broadcast_event_to_streaming_clients(self):
+        """
+        Broadcast most recent event to all connected WebSocket clients.
+        
+        Per contract T-EXPOSE1.7: Immediate flush requirement.
+        Events MUST be pushed to clients as soon as they are stored.
+        """
+        # Get the most recent event (just added)
+        result = self.event_buffer.get_recent_events(limit=1)
+        if not result["events"]:
+            return
+        
+        event_dict = result["events"][0]
+        event_id = event_dict.get("event_id")
+        
+        # Prevent duplicate broadcasts of the same event
+        with self._last_broadcasted_lock:
+            if event_id == self._last_broadcasted_event_id:
+                # This event was already broadcasted, skip
+                return
+            self._last_broadcasted_event_id = event_id
+        
+        event_json = json.dumps(event_dict)
+        
+        # Create WebSocket text frame
+        ws_frame = encode_websocket_frame(event_json.encode('utf-8'), opcode=0x1)
+        
+        # Broadcast to all streaming clients
+        dead_clients = []
+        event_received_at = event_dict.get('tower_received_at', 0)
+        
+        with self._event_clients_lock:
+            clients_copy = dict(self._event_clients)
+        
+        for client_id, client_info in clients_copy.items():
+            # Skip if this client is for /tower/events/recent (one-shot)
+            if isinstance(client_info, dict) and 'socket' in client_info:
+                client_sock = client_info['socket']
+                
+                # Skip if this event was received before the client connected
+                # (it will be sent via get_events_stream instead)
+                cutoff_timestamp = client_info.get('cutoff_timestamp')
+                cutoff_event_id = client_info.get('cutoff_event_id')
+                if cutoff_timestamp is not None and event_received_at <= cutoff_timestamp:
+                    continue
+                # Also skip if this is the exact event at the cutoff (defensive check)
+                if cutoff_event_id and event_id == cutoff_event_id:
+                    continue
+                
+                # Skip if we've already sent this event to this client (defensive check)
+                sent_event_ids = client_info.get('sent_event_ids')
+                if sent_event_ids and event_id in sent_event_ids:
+                    continue
+                
+                # Check filters
+                event_type_filter = client_info.get('event_type_filter')
+                since_timestamp = client_info.get('since_timestamp')
+                
+                # Apply filters
+                if event_type_filter and event_dict.get('event_type') != event_type_filter:
+                    continue
+                if since_timestamp and event_received_at < since_timestamp:
+                    continue
+                
+                # Mark this event as sent to this client
+                if sent_event_ids is not None:
+                    sent_event_ids.add(event_id)
+                
+                try:
+                    client_sock.sendall(ws_frame)
+                    client_info['last_send_time'] = time.time()
+                except (OSError, BrokenPipeError, ConnectionError):
+                    dead_clients.append(client_id)
+            else:
+                # Old format (socket directly) - backward compatibility
+                try:
+                    client_sock = client_info if isinstance(client_info, socket.socket) else None
+                    if client_sock:
+                        client_sock.sendall(ws_frame)
+                except (OSError, BrokenPipeError, ConnectionError):
+                    dead_clients.append(client_id)
+        
+        # Remove dead clients
+        if dead_clients:
+            with self._event_clients_lock:
+                for client_id in dead_clients:
+                    self._event_clients.pop(client_id, None)
 
     def broadcast(self, frame: bytes):
         """
@@ -463,6 +1220,18 @@ class HTTPServer:
             client_ids = list(self._connected_clients.keys())
             for client_id in client_ids:
                 self._drop_client_locked(client_id, "shutdown")
+        
+        # Close event streaming clients
+        with self._event_clients_lock:
+            event_client_ids = list(self._event_clients.keys())
+            for client_id in event_client_ids:
+                client_sock = self._event_clients.pop(client_id, None)
+                if client_sock:
+                    try:
+                        client_sock.close()
+                    except Exception:
+                        pass
+        
         logger.info("All client connections closed")
     
     def _flush_client_queue_locked(self, state: _ClientState, now_monotonic: float) -> tuple[bool, bool]:

@@ -222,6 +222,7 @@ class EncoderManager:
         sample_rate: int = 48000,
         encoder_enabled: Optional[bool] = None,
         allow_ffmpeg: bool = False,
+        station_shutdown_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         """
         Initialize encoder manager.
@@ -243,9 +244,13 @@ class EncoderManager:
                             If False or TOWER_ENCODER_ENABLED=0, operates in OFFLINE_TEST_MODE [O6]
             allow_ffmpeg: Whether FFmpeg startup is allowed (default: False for test safety per [I25])
                          In production, set to True. In tests, set to False unless explicitly testing FFmpeg.
+            station_shutdown_check: Optional callback to check if station is shutting down (default: None)
+                                   If provided, PCM loss warnings will be suppressed when station is shutting down
+                                   per contract T-EVENTS5 exception
         """
         self._allow_ffmpeg = allow_ffmpeg
         self.pcm_buffer = pcm_buffer
+        self._station_shutdown_check = station_shutdown_check
         # Per FINDING 001: EncoderManager reads from downstream_buffer and forwards to supervisor
         # AudioPump pushes frames to downstream_buffer per contract A8
         self._downstream_buffer = downstream_buffer
@@ -1422,6 +1427,8 @@ class EncoderManager:
         for LOSS_WINDOW_MS, system MUST treat this as "loss of program audio".
         
         Per contract [BG12]: On program loss, enter SILENCE_GRACE again.
+        
+        Per contract T-EVENTS5 exception: Suppress warnings when station is shutting down.
         """
         if self._supervisor is None:
             return
@@ -1439,8 +1446,13 @@ class EncoderManager:
         elapsed_sec = now - self._pcm_last_frame_time
         
         if elapsed_sec >= self._pcm_loss_window_sec:
-            # PCM loss detected
-            logger.warning(f"PCM loss detected: no frames for {elapsed_sec * 1000:.0f}ms (threshold: {self._pcm_loss_window_ms}ms)")
+            # Per contract T-EVENTS5 exception: Suppress warning if station is shutting down
+            if self._station_shutdown_check and self._station_shutdown_check():
+                # Station is shutting down - suppress warning but still handle state transition
+                logger.debug(f"PCM loss detected during station shutdown: no frames for {elapsed_sec * 1000:.0f}ms (suppressing warning per T-EVENTS5)")
+            else:
+                # PCM loss detected
+                logger.warning(f"PCM loss detected: no frames for {elapsed_sec * 1000:.0f}ms (threshold: {self._pcm_loss_window_ms}ms)")
             
             # Enter SILENCE_GRACE again
             self._pcm_consecutive_frames = 0

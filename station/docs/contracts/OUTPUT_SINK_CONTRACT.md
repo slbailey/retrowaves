@@ -97,6 +97,56 @@ The choice of padding vs. dropping is an implementation decision, but in all cas
 
 ---
 
+## OS3 — Buffer Health Events
+
+OutputSink **MUST** emit control-channel events for buffer health observability. These events are purely observational and **MUST NOT** influence PCM output, decode pacing, or segment timing.
+
+### OS3.1 — Station Underflow Event
+
+**MUST** emit `station_underflow` event when buffer becomes empty (no frames available for output).
+
+- Event **MUST** be emitted when buffer condition is detected (buffer depth = 0)
+- Event **MUST NOT** block PCM output thread
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `buffer_depth`: Current buffer depth in frames (0 for underflow)
+  - `frames_dropped`: Number of frames dropped due to underflow (typically 0, but may be non-zero if silence is inserted)
+- Event **MUST** be emitted from the output thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** influence decode pacing or segment timing
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be purely observational
+
+### OS3.2 — Station Overflow Event
+
+**MUST** emit `station_overflow` event when buffer exceeds capacity (frames dropped due to buffer full condition).
+
+- Event **MUST** be emitted when buffer overflow condition is detected (frames dropped due to full buffer)
+- Event **MUST NOT** block PCM output thread
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `buffer_depth`: Current buffer depth in frames (at capacity)
+  - `frames_dropped`: Number of frames dropped due to overflow
+- Event **MUST** be emitted from the output thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** influence decode pacing or segment timing
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be purely observational
+
+### OS3.3 — Event Emission Rules
+
+All buffer health events **MUST** follow these behavioral rules:
+
+- **Non-blocking**: Events **MUST NOT** block PCM output or delay frame writes
+- **Observational only**: Events **MUST NOT** influence decode pacing, segment timing, or queue operations
+- **Station-local**: Events **MUST NOT** rely on Tower timing, Tower state, or PCM write success/failure
+- **Clock A only**: Events **MUST** use Clock A (wall clock) for all timing measurements
+- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state
+- **No timing influence**: Events **MUST NOT** influence Clock A decode pacing or segment duration logic
+- **Metadata completeness**: Events **MUST** include all required metadata fields
+
+---
+
 ## Implementation Notes
 
 - OutputSink implementations: TowerPCMSink, FileSink, IcecastSink, etc.

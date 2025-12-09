@@ -11,6 +11,7 @@ Architecture 3.1 Reference:
 """
 
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -181,8 +182,32 @@ class PlayoutEngine:
         
         self._current_segment = segment
         self._is_playing = True
+        self._segment_start_time = time.monotonic()
+        self._current_segment_id = f"{segment.type}_{os.path.basename(segment.path)}_{int(time.monotonic() * 1000)}"
+        self._last_progress_event_time = time.monotonic()
         
         logger.info(f"Starting segment: {segment.type} - {segment.path}")
+        
+        # Emit segment_started heartbeat event to Tower (per contract PE4.1)
+        if self._tower_control:
+            try:
+                expected_duration = self._get_segment_duration(segment)
+                segment_id = f"{segment.type}_{os.path.basename(segment.path)}_{int(time.monotonic() * 1000)}"
+                self._tower_control.send_event(
+                    event_type="segment_started",
+                    timestamp=time.monotonic(),
+                    metadata={
+                        "segment_id": segment_id,
+                        "expected_duration": expected_duration,
+                        "audio_event": {
+                            "type": segment.type,
+                            "path": segment.path,
+                            "gain": segment.gain
+                        }
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error sending segment_started event: {e}")
         
         # Emit on_segment_started callback
         if self._dj_callback:
@@ -207,6 +232,27 @@ class PlayoutEngine:
             return
         
         logger.info(f"Finishing segment: {segment.type} - {segment.path}")
+        
+        # Emit segment_finished heartbeat event to Tower (per contract PE4.3)
+        if self._tower_control:
+            try:
+                total_duration = time.monotonic() - getattr(self, '_segment_start_time', time.monotonic())
+                segment_id = getattr(self, '_current_segment_id', f"{segment.type}_{os.path.basename(segment.path)}")
+                self._tower_control.send_event(
+                    event_type="segment_finished",
+                    timestamp=time.monotonic(),
+                    metadata={
+                        "segment_id": segment_id,
+                        "total_duration": total_duration,
+                        "audio_event": {
+                            "type": segment.type,
+                            "path": segment.path,
+                            "gain": segment.gain
+                        }
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error sending segment_finished event: {e}")
         
         # Emit on_segment_finished callback
         if self._dj_callback:
@@ -350,6 +396,29 @@ class PlayoutEngine:
                 # Clock A only paces decode consumption, NOT socket writes
                 self._output_sink.write(processed_frame)
                 frame_count += 1
+                
+                # Emit segment_progress heartbeat event at least once per second (per contract PE4.2)
+                now = time.monotonic()
+                if now - getattr(self, '_last_progress_event_time', now) >= 1.0:
+                    if self._tower_control and self._current_segment:
+                        try:
+                            elapsed_time = now - getattr(self, '_segment_start_time', now)
+                            expected_duration = self._get_segment_duration(self._current_segment)
+                            progress_percent = (elapsed_time / expected_duration * 100.0) if expected_duration > 0 else 0.0
+                            segment_id = getattr(self, '_current_segment_id', f"{self._current_segment.type}_{os.path.basename(self._current_segment.path)}")
+                            self._tower_control.send_event(
+                                event_type="segment_progress",
+                                timestamp=now,
+                                metadata={
+                                    "segment_id": segment_id,
+                                    "elapsed_time": elapsed_time,
+                                    "expected_duration": expected_duration,
+                                    "progress_percent": progress_percent
+                                }
+                            )
+                            self._last_progress_event_time = now
+                        except Exception as e:
+                            logger.debug(f"Error sending segment_progress event: {e}")
                 
                 # Log progress every 1000 frames
                 if frame_count % 1000 == 0:

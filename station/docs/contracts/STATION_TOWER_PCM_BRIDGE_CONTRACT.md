@@ -198,6 +198,48 @@ Tower is the ONLY owner of PCM timing.
   - Modify frame boundaries or negotiate format at runtime
   - Use segment duration or content logic from Station
 
+### C7. Explicit Forbidding of Tower Feedback
+
+**Station MUST NOT receive or use any timing information from Tower.**
+
+This section explicitly codifies the boundary invariant that Station operates independently of Tower timing and state.
+
+**Station MUST NOT:**
+- Receive timing information from Tower (no timing feedback channel)
+- Use Tower state to influence Clock A (Station playback clock)
+- Use Tower state to influence decode pacing metronome
+- Use Tower state to influence drift compensation (if enabled)
+- Use PCM write success/failure to influence segment timing
+- Use PCM write success/failure to influence decode pacing
+- Use PCM buffer depth to influence segment timing
+- Use PCM buffer depth to influence decode pacing
+- Attempt to synchronize with Tower's Clock B
+- Apply adaptive pacing based on Tower ingestion behavior
+
+**Tower MUST NOT:**
+- Send timing information to Station (no timing feedback channel)
+- Provide timing signals or synchronization hints
+- Communicate buffer state or consumption rate to Station
+- Request timing adjustments from Station
+
+**Heartbeat Events MUST:**
+- Be Station-local only (no Tower timing in event metadata)
+- Use Clock A (wall clock) for all timing measurements
+- Not rely on Tower state or PCM write success/failure
+- Be purely observational (not influenced by Tower)
+
+**Drift Compensation (if enabled) MUST:**
+- Operate independently of Tower timing
+- Use only Station-local monotonic time for drift detection
+- Not attempt to match or synchronize with Tower's Clock B
+- Not use Tower state to influence compensation
+
+**Boundary Invariant:**
+- Station→Tower: PCM frames only (no timing metadata)
+- Tower→Station: Nothing (no feedback channel)
+- Station timing: Clock A only (wall clock, independent of Tower)
+- Tower timing: Clock B only (AudioPump, independent of Station)
+
 ---
 
 ## D. Responsibilities

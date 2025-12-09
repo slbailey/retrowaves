@@ -43,11 +43,18 @@ class Station:
         state_path = os.getenv("DJ_STATE_PATH", "/tmp/appalachia_dj_state.json")
         self.state_store = DJStateStore(path=state_path)
 
+        # Initialize Tower control client first (needed for DJEngine events)
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
+        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
+        logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
+        
         # Initialize DJ engine
         self.dj = DJEngine(
             playout_engine=None,  # Will be set after engine creation
             rotation_manager=self.rotation,
-            dj_asset_path=dj_path
+            dj_asset_path=dj_path,
+            tower_control=self.tower_control
         )
 
         # Phase 7: Load saved state (warm-start recovery)
@@ -60,22 +67,20 @@ class Station:
 
         # Output sink - Tower PCM socket (replaces HTTP streaming)
         tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
-        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
-        tower_port = int(os.getenv("TOWER_PORT", "8005"))
         
         # Initialize Tower PCM sink (connects to Tower's Unix socket)
-        self.sink = TowerPCMSink(socket_path=tower_socket_path)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path, tower_control=self.tower_control)
         logger.info(f"[STATION] Tower PCM sink initialized (socket={tower_socket_path})")
         
-        # Initialize Tower control client (for sending commands to Tower)
-        self.tower_control = TowerControlClient(tower_host=tower_host, tower_port=tower_port)
-        logger.info(f"[STATION] Tower control client initialized (url=http://{tower_host}:{tower_port})")
-
         # Real playout engine with DJ callback and output sink (Architecture 3.2)
         self.engine = PlayoutEngine(dj_callback=self.dj, output_sink=self.sink, tower_control=self.tower_control)
         
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)
+        
+        # Track lifecycle events to ensure they're only sent once per contract
+        self._startup_event_sent = False
+        self._shutdown_event_sent = False
 
     def start(self) -> None:
         """
@@ -84,6 +89,11 @@ class Station:
         Phase 7: On warm start, don't seed a song - let DJ THINK handle it.
         On cold start, seed the first song.
         """
+        # Prevent multiple calls to start() to ensure startup event is only sent once
+        if hasattr(self, '_started') and self._started:
+            logger.warning("[STATION] Station already started, ignoring duplicate start() call")
+            return
+        
         saved = self.state_store.load()
         
         if saved:
@@ -106,6 +116,24 @@ class Station:
         
         # Start playout loop
         self.engine.run()
+        
+        # Send station_starting_up event to Tower (only once per contract)
+        if self.tower_control and not self._startup_event_sent:
+            try:
+                self.tower_control.send_event(
+                    event_type="station_starting_up",
+                    timestamp=time.monotonic(),
+                    metadata={}
+                )
+                self._startup_event_sent = True
+                logger.info("[STATION] Sent station_starting_up event to Tower")
+            except Exception as e:
+                logger.warning(f"[STATION] Failed to send station_starting_up event: {e}")
+        elif self._startup_event_sent:
+            logger.debug("[STATION] station_starting_up event already sent, skipping duplicate")
+        
+        # Mark as started to prevent duplicate start() calls
+        self._started = True
 
     def stop(self) -> None:
         """
@@ -113,6 +141,21 @@ class Station:
         
         Phase 7: Saves DJ state before shutdown.
         """
+        # Send station_shutting_down event to Tower (only once per contract)
+        if self.tower_control and not self._shutdown_event_sent:
+            try:
+                self.tower_control.send_event(
+                    event_type="station_shutting_down",
+                    timestamp=time.monotonic(),
+                    metadata={}
+                )
+                self._shutdown_event_sent = True
+                logger.info("[STATION] Sent station_shutting_down event to Tower")
+            except Exception as e:
+                logger.warning(f"[STATION] Failed to send station_shutting_down event: {e}")
+        elif self._shutdown_event_sent:
+            logger.debug("[STATION] station_shutting_down event already sent, skipping duplicate")
+        
         # Save DJ state before stopping
         try:
             state = self.dj.to_dict()
