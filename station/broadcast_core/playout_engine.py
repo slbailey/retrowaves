@@ -288,9 +288,10 @@ class PlayoutEngine:
                     )
                     # Reset talking sequence flag when a song starts
                     self._is_in_talking_sequence = False
-                elif segment.type == "talk":
-                    # Emit dj_talking event only if not already in a talking sequence
-                    # This ensures only one event is sent even if multiple talk files are strung together
+                elif segment.type in ("intro", "outro", "talk"):
+                    # Emit dj_talking event when DJ talking segments start
+                    # DJ talking encompasses: intro, outro, and talk segment types
+                    # Only emit once even if multiple talking files are strung together
                     if not self._is_in_talking_sequence:
                         self._tower_control.send_event(
                             event_type="dj_talking",
@@ -299,8 +300,8 @@ class PlayoutEngine:
                         )
                         self._is_in_talking_sequence = True
                 else:
-                    # Reset talking sequence flag when any non-talk, non-song segment starts
-                    # (e.g., intro, outro, id) so that if talk comes after, we emit dj_talking again
+                    # Reset talking sequence flag when any non-talking, non-song segment starts
+                    # (e.g., id) so that if talking segments come after, we emit dj_talking again
                     self._is_in_talking_sequence = False
             except Exception as e:
                 logger.debug(f"Error sending event: {e}")
