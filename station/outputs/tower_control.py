@@ -25,7 +25,7 @@ class TowerControlClient:
     
     This client is stateless and transport-only. It makes no decisions about
     when to send events - it simply sends whatever it's asked to send.
-    Lifecycle state management is handled by StationService, not this client.
+    Lifecycle state management is handled by Station, not this client.
     """
     
     def __init__(self, tower_host: str = "127.0.0.1", tower_port: int = 8005):
@@ -139,7 +139,7 @@ class TowerControlClient:
         Per contract T-EVENTS6: Event sending MUST be non-blocking (< 1ms typical, < 10ms maximum).
         
         This method is stateless and transport-only. It always attempts to send the event
-        if called. Lifecycle event de-duplication is handled by StationService, not this client.
+        if called. Lifecycle event de-duplication is handled by Station, not this client.
         
         Args:
             event_type: Event type (e.g., "segment_started", "dj_think_started", "station_starting_up")

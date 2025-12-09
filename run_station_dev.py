@@ -20,11 +20,11 @@ logging.basicConfig(
 # These generate too much noise during normal operation
 # Add station-specific loggers here if needed
 
-from station.service import StationService
+from station.app.station import Station
 
 if __name__ == "__main__":
     try:
-        station = StationService()
+        station = Station()
         station.start()
         station.run_forever()
     except KeyboardInterrupt:
