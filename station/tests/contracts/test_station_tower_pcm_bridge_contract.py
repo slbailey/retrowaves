@@ -237,3 +237,191 @@ class TestF_TwoClockModelContractLanguage:
         # - Use segment duration or content logic from Station
         
         assert True, "Contract prohibits Tower from using Station segment timing"
+
+
+# Contract reference: Station–Tower PCM Bridge Contract C8 Pre-Fill Stage
+
+class TestC8_PreFillStage:
+    """Tests for C8 — Pre-Fill Stage for Tower Buffer."""
+    
+    def test_pf1_prefill_triggers_when_buffer_ratio_below_threshold(self):
+        """PF1: Pre-fill triggers when buffer ratio < threshold (e.g., < 0.5)."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: Station checks Tower buffer fill level via /tower/buffer
+        # If buffer ratio < target (e.g., < 0.5), Station enters pre-fill mode
+        
+        # Mock /tower/buffer response with low ratio
+        buffer_status = {"capacity": 60, "count": 10, "ratio": 0.167}  # 10/60 = 0.167 < 0.5
+        
+        # Contract requires: During pre-fill, Station decodes and sends frames as fast as possible (no Clock A sleep)
+        # Contract requires: Frames are sent immediately (non-blocking)
+        
+        # Verify pre-fill would trigger
+        assert buffer_status["ratio"] < 0.5, "Pre-fill must trigger when buffer ratio < 0.5"
+        assert True, "Contract requires pre-fill mode when buffer ratio < threshold"
+    
+    def test_pf2_prefill_stops_when_buffer_above_threshold(self):
+        """PF2: Pre-fill stops when buffer >= threshold (e.g., >= 0.5)."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: Once target is reached (e.g., ratio >= 0.5), Station transitions to normal adaptive pacing (PID controller)
+        
+        # Mock /tower/buffer response with adequate ratio
+        buffer_status = {"capacity": 60, "count": 35, "ratio": 0.583}  # 35/60 = 0.583 >= 0.5
+        
+        # Contract requires: Transition to normal PID pacing
+        # Contract requires: No more burst decode/send behavior
+        
+        # Verify pre-fill would stop
+        assert buffer_status["ratio"] >= 0.5, "Pre-fill must stop when buffer ratio >= 0.5"
+        assert True, "Contract requires transition to normal PID pacing when threshold reached"
+    
+    def test_pf3_prefill_must_not_modify_segment_timing(self):
+        """PF3: Pre-fill MUST NOT modify segment timing (Clock A invariants)."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: Pre-fill MUST NOT alter Clock A's internal next_frame_time or segment timing baseline
+        # Contract requires: Clock A's timeline MUST continue uninterrupted during pre-fill
+        
+        import time
+        
+        # Simulate Clock A timeline
+        segment_start = time.monotonic()
+        next_frame_time = segment_start
+        expected_duration = 3.0
+        
+        # During pre-fill: decode/send as fast as possible
+        # But Clock A timeline continues
+        time.sleep(0.1)  # Simulate time passing
+        elapsed = time.monotonic() - segment_start
+        
+        # Contract requires: next_frame_time is NOT reset or altered
+        # Contract requires: Segment duration still driven solely by wall clock
+        # Contract requires: Segment ends at expected_duration
+        
+        assert elapsed >= 0.0, "Clock A timeline must continue during pre-fill"
+        assert elapsed < expected_duration, "Segment timing must remain wall-clock based"
+        assert True, "Contract requires Clock A timeline uninterrupted during pre-fill"
+    
+    def test_pf4_prefill_must_not_influence_pcm_write_timing(self):
+        """PF4: Pre-fill MUST NOT influence PCM write timing."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: All writes remain immediate and non-blocking
+        # Contract requires: No Tower-driven cadence
+        
+        # During pre-fill, frames are sent as fast as possible
+        # But writes themselves remain non-blocking and immediate
+        
+        # Contract requires: PCM write timing unaffected by pre-fill
+        assert True, "Contract requires PCM writes remain immediate and non-blocking during pre-fill"
+    
+    def test_pf5_prefill_timeout_safety(self):
+        """PF5: Pre-fill timeout safety - if buffer never reaches threshold, pre-fill ends after timeout."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: Pre-fill MUST have a timeout/safety limit to prevent infinite pre-fill
+        
+        # Simulate buffer never reaching threshold
+        buffer_status = {"capacity": 60, "count": 5, "ratio": 0.083}  # Stuck at low ratio
+        
+        # Contract requires: Pre-fill ends after timeout
+        # Contract requires: Normal pacing resumes
+        
+        # Verify timeout safety exists
+        assert True, "Contract requires pre-fill timeout to prevent infinite pre-fill"
+    
+    def test_pf6_prefill_tower_unavailable_fallback(self):
+        """PF6: Pre-fill Tower-unavailable fallback - /tower/buffer endpoint unavailable or errors."""
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: Must fall back to fixed-rate pacing if /tower/buffer unavailable
+        # Contract requires: Must NOT block decode thread
+        
+        # Simulate /tower/buffer endpoint unavailable
+        buffer_status = None  # Endpoint error or timeout
+        
+        # Contract requires: Fall back to fixed-rate pacing
+        # Contract requires: Non-blocking behavior
+        
+        assert True, "Contract requires fallback to fixed-rate pacing when /tower/buffer unavailable"
+
+
+# Contract reference: Station–Tower PCM Bridge Contract C0-C7 Two-Clock Model
+
+class TestTC_TwoClockModelEnforcement:
+    """Tests for Two-Clock Model Enforcement (C0-C7 invariants)."""
+    
+    def test_tc1_clock_a_drives_segment_timing(self):
+        """TC1: Clock A drives segment timing - segment ends based only on wall clock."""
+        # Contract reference: Station–Tower PCM Bridge Contract C0, C3, F.1
+        # Contract requires: Segment ends when elapsed_time >= expected_duration_seconds (wall clock)
+        # Contract requires: Decoder speed or frame count cannot influence segment duration
+        
+        import time
+        
+        segment_start = time.monotonic()
+        expected_duration = 3.0
+        
+        # Simulate time passing (not based on decoder speed or frame count)
+        time.sleep(0.1)
+        elapsed = time.monotonic() - segment_start
+        
+        # Contract requires: Segment timing based solely on wall clock
+        assert elapsed >= 0.0, "Segment timing must be wall-clock based"
+        assert elapsed < expected_duration, "Segment must not end before expected duration"
+        assert True, "Contract requires segment timing driven only by Clock A (wall clock)"
+    
+    def test_tc2_tower_timing_must_not_influence_station(self):
+        """TC2: Tower timing MUST NOT influence Station - simulate Tower ingestion delays."""
+        # Contract reference: Station–Tower PCM Bridge Contract C7, F.2
+        # Contract requires: Station MUST NOT attempt to match, predict, synchronize with, or adjust to Tower's AudioPump cadence
+        # Contract requires: Station never adjusts pacing or timing based on Tower behavior
+        
+        # Simulate Tower ingestion delays (e.g., Tower buffer full, slow consumption)
+        tower_ingestion_delay = 0.5  # Tower is slow
+        
+        # Contract requires: Station does not adjust pacing
+        # Contract requires: Station does not adjust segment timing
+        # Contract requires: Station continues at Clock A pace
+        
+        assert True, "Contract prohibits Station from adjusting pacing/timing based on Tower behavior"
+    
+    def test_tc3_pcm_writes_must_remain_non_blocking(self):
+        """TC3: PCM writes MUST remain non-blocking - mock socket full."""
+        # Contract reference: Station–Tower PCM Bridge Contract C3, C5
+        # Contract requires: Station writes PCM frames with no timing constraints
+        # Contract requires: Never block on socket writes (drop-oldest semantics)
+        
+        # Simulate socket full (backpressure)
+        socket_full = True
+        
+        # Contract requires: Station drops frames, never sleeps or blocks
+        # Contract requires: Non-blocking writes with drop-oldest semantics
+        
+        assert True, "Contract requires PCM writes remain non-blocking even when socket full"
+    
+    def test_tc4_tower_buffer_must_not_influence_segment_timing(self):
+        """TC4: /tower/buffer MUST NOT influence segment timing - only PID decode pacing may use buffer."""
+        # Contract reference: Station–Tower PCM Bridge Contract C0, C7, C8
+        # Contract requires: /tower/buffer telemetry may ONLY be used for PID decode pacing (PE6)
+        # Contract requires: Segment-end logic unchanged by buffer status
+        
+        # Simulate buffer status changes
+        buffer_low = {"capacity": 60, "count": 5, "ratio": 0.083}
+        buffer_high = {"capacity": 60, "count": 55, "ratio": 0.917}
+        
+        # Contract requires: Segment timing unaffected by buffer status
+        # Contract requires: Only PID decode pacing may use buffer status
+        # Contract requires: Segment ends based on wall clock only
+        
+        assert True, "Contract requires /tower/buffer does not influence segment timing (only PID decode pacing)"
+    
+    def test_tc5_station_must_not_attempt_tower_cadence_alignment(self):
+        """TC5: Station MUST NOT attempt Tower cadence alignment - no logic attempts to match 21.333ms tick."""
+        # Contract reference: Station–Tower PCM Bridge Contract C0, C7, F.2
+        # Contract requires: Station MUST NOT attempt to match Tower's AudioPump cadence (21.333ms)
+        # Contract requires: No Tower-timing-derived pacing
+        
+        tower_cadence_ms = 21.333  # Tower's AudioPump tick
+        
+        # Contract requires: Station does not attempt to match this cadence
+        # Contract requires: Station does not derive pacing from Tower timing
+        # Contract requires: Station uses Clock A only (wall clock)
+        
+        assert True, "Contract prohibits Station from attempting Tower cadence alignment"

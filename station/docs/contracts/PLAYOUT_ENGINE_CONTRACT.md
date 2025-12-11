@@ -589,6 +589,7 @@ PID controller is **OPTIONAL** and implementation-defined.
 - **PCM output:** Socket writes remain non-blocking and fire immediately (no pacing on writes)
 - **Two clocks:** Clock A (Station decode metronome) for local playback correctness; Clock B (Tower AudioPump) for broadcast timing
 - **PID Controller:** Create `BufferPIDController` class in `station/broadcast_core/buffer_pid_controller.py` if implementing PE6
+- **Pre-Fill Stage:** Optional pre-fill stage may be implemented in `PlayoutEngine._play_audio_segment()` to build up Tower buffer before normal pacing. See Station-Tower Bridge Contract C8 for requirements.
 
 
 

@@ -161,6 +161,17 @@ Endpoint **MUST** be non-blocking (no locks that block the PCM path).
 #### T-BUF5
 Stats **MUST** originate from `AudioInputRouter.get_stats()`.
 
+#### T-BUF6 (Pre-Fill Support)
+The `/tower/buffer` endpoint **MUST** support high-frequency polling during Station pre-fill operations.
+
+- Endpoint **MUST** remain non-blocking and performant even when polled at high frequency (e.g., every 50-100ms)
+- Response time requirements (T-BUF3) apply during pre-fill: <10ms typical, <100ms maximum
+- Tower **MUST NOT** signal Station to start or stop pre-fill (Station decides autonomously)
+- Tower **MUST** accept frames at any rate during pre-fill (non-blocking ingestion per I4)
+- Buffer overflow during pre-fill **MUST** be handled gracefully (drop-oldest semantics per TR-AIR3)
+
+**Note:** Pre-fill is a Station-internal optimization. Tower is unaware of pre-fill mode and simply provides buffer status and accepts frames.
+
 ---
 
 ## TR-AIR — Audio Input Router Interface Requirements

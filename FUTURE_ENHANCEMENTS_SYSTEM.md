@@ -36,51 +36,9 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🎯 Next Priority
 
-### Pre-Fill Stage for Tower Buffer
-
-**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
-
-**Current Status:**
-- Station starts sending frames immediately when playback begins
-- If Tower buffer is empty (0/50), frames are sent at normal rate
-- This can cause stuttering and dropped frames (e.g., 7940 dropped frames observed)
-- No pre-fill phase exists
-- PID controller is now available for smooth transition from pre-fill to normal pacing
-
-**Desired Future Behavior:**
-- Before starting normal playback, check Tower buffer fill level
-- If buffer is below target (e.g., < 50% capacity), enter pre-fill mode
-- During pre-fill:
-  - Decode and send frames as fast as possible (no sleep)
-  - Monitor buffer fill level periodically
-  - Continue until buffer reaches target fill (e.g., 50% = 25/50 frames)
-- Once target is reached, transition to normal adaptive pacing (PID controller)
-- Pre-fill should happen automatically when:
-  - Station starts up
-  - Tower restarts/reconnects
-  - Buffer drops below threshold during playback
-
-**Benefits:**
-- Prevents initial stuttering when Tower comes online
-- Eliminates dropped frames during startup
-- Ensures smooth playback from the first frame
-- Better user experience with no audio gaps
-- Works seamlessly with PID controller for smooth transition
-
-**Implementation Notes:**
-- Pre-fill should be integrated into `PlayoutEngine._play_audio_segment()`
-- Should work seamlessly with the PID adaptive pacing system
-- Coordinate with Tower's `/tower/buffer` endpoint (already available via PID controller)
-- Should have a timeout/safety limit to prevent infinite pre-fill
-- PID controller will handle smooth transition from pre-fill to normal pacing
-
----
-
-## 🔧 Stability & Performance
-
 ### Graceful Shutdown with Offline Announcement
 
-**Future Goal:** When shutting down the station, allow the current song to finish playing before stopping. Optionally have the DJ announce that the station is going offline.
+**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
 
 **Current Status:**
 - Station shutdown is immediate when stop() is called
@@ -97,6 +55,12 @@ This wishlist is organized by priority, starting with features that affect **ove
 - Listeners hear a clean end to the stream, not an abrupt cut
 - State is saved after current segment finishes (warm restart possible)
 
+**Benefits:**
+- Professional shutdown experience for listeners
+- Clean state persistence for warm restarts
+- Configurable offline announcements
+- Respects THINK/DO separation
+
 **Implementation Notes:**
 - Shutdown should be a two-phase process:
   1. **Soft shutdown**: Stop accepting new segments, finish current playback
@@ -111,6 +75,11 @@ This wishlist is organized by priority, starting with features that affect **ove
   - Plays during DO phase
 - Timeout safety: If current segment is very long, allow configurable max wait time
 - HTTP stream connections should remain open until announcement completes
+
+---
+
+## 🔧 Stability & Performance
+
 
 ### Centralized Logging with Rotation
 
@@ -463,6 +432,69 @@ Just for fun.
 ---
 
 ## ✅ Completed Work
+
+### Pre-Fill Stage for Tower Buffer
+
+**Status:** ✅ **COMPLETED** - Production-ready implementation
+
+**Implementation Date:** 2024-12-11
+
+#### Purpose
+
+Implement a pre-fill stage that builds up Tower's PCM buffer before starting normal adaptive pacing to prevent dropped frames and stuttering when Tower comes online or buffer is empty.
+
+#### What Was Implemented
+
+✅ **Pre-Fill Stage in PlayoutEngine** (`station/broadcast_core/playout_engine.py`):
+- `_get_tower_buffer_status()`: Queries `/tower/buffer` endpoint via TowerControlClient or HTTP client
+- `_get_buffer_ratio()`: Calculates buffer fill ratio (0.0-1.0) from buffer status
+- `_run_prefill_if_needed()`: Implements pre-fill per Contract C8:
+  - Checks buffer ratio via `/tower/buffer` endpoint
+  - Enters pre-fill if ratio < target (default 0.5)
+  - Decodes and sends frames as fast as possible (no Clock A sleep)
+  - Monitors buffer fill level periodically (default every 100ms)
+  - Exits when buffer reaches target or timeout (default 5s)
+  - Frame limit safety (~470 frames ≈ 10 seconds) to prevent consuming entire segment
+  - Does NOT modify Clock A timeline or segment timing
+  - Respects shutdown flags and error handling
+
+✅ **Pre-Fill Integration**:
+- Called in `_play_audio_segment()` before normal decode loop
+- If pre-fill consumes decoder, it is recreated for normal loop
+- Smooth transition to PID controller pacing after pre-fill
+- Configurable via environment variables:
+  - `PREFILL_ENABLED` (default: `true`)
+  - `PREFILL_TARGET_RATIO` (default: `0.5`, clamped to 0.1-0.9)
+  - `PREFILL_TIMEOUT_SEC` (default: `5.0`, clamped to 1-30s)
+  - `PREFILL_POLL_INTERVAL_SEC` (default: `0.1`, clamped to 50ms-1s)
+
+✅ **Safety Features**:
+- Frame limit prevents consuming entire segment in pre-fill
+- Timeout prevents infinite pre-fill
+- Error logging with spam prevention (10% sampling)
+- Config parameter validation with bounds checking
+
+✅ **Contract Compliance**:
+- C8 Pre-Fill Stage: All contract requirements met
+- All 6 Pre-Fill contract tests passing
+- All 5 Two-Clock Model enforcement tests passing
+- All 4 PID + Pre-Fill transition tests passing
+- Architectural invariants preserved:
+  - Clock A timeline uninterrupted
+  - Segment timing wall-clock based
+  - PCM writes remain non-blocking
+
+**Files Modified:**
+- `station/broadcast_core/playout_engine.py` - Pre-fill implementation (+172 lines)
+- `station/tests/contracts/test_station_tower_pcm_bridge_contract.py` - Pre-fill tests (11 new tests)
+- `station/tests/contracts/test_playout_engine_contract.py` - PID + Pre-fill transition tests (4 new tests)
+
+**Documentation:**
+- Contract: `station/docs/contracts/STATION_TOWER_PCM_BRIDGE_CONTRACT.md` (C8)
+- Contract: `tower/docs/contracts/NEW_TOWER_RUNTIME_CONTRACT.md` (T-BUF6)
+- All contract tests passing
+
+---
 
 ### Advanced Buffer Management with PID Controller
 

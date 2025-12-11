@@ -17,7 +17,9 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Dict, Any
+
+import httpx
 
 from station.broadcast_core.audio_event import AudioEvent
 from station.broadcast_core.playout_queue import PlayoutQueue
@@ -461,6 +463,189 @@ class PlayoutEngine:
         
         logger.info("Playout loop stopped")
     
+    def _get_tower_buffer_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Get Tower buffer status from /tower/buffer endpoint.
+        
+        Contract reference: Tower Runtime Contract T-BUF
+        
+        Returns:
+            Buffer status dict with 'capacity', 'count', 'ratio' keys, or None if unavailable
+        """
+        # Use TowerControlClient if available, otherwise create temporary HTTP client
+        if self._tower_control:
+            return self._tower_control.get_buffer()
+        
+        # Fallback: create temporary HTTP client
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
+        url = f"http://{tower_host}:{tower_port}/tower/buffer"
+        
+        try:
+            with httpx.Client(timeout=0.1) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as e:
+            # Log HTTP errors at warning level (but don't spam if Tower is down)
+            # Only log periodically to avoid log spam
+            import random
+            if random.random() < 0.1:  # Log ~10% of errors to avoid spam
+                logger.warning(f"[PREFILL] Failed to get buffer status from Tower: {e}")
+            return None
+        except Exception as e:
+            # Log unexpected errors at warning level (but don't spam)
+            import random
+            if random.random() < 0.1:  # Log ~10% of errors to avoid spam
+                logger.warning(f"[PREFILL] Unexpected error getting buffer status: {e}")
+            return None
+    
+    def _get_buffer_ratio(self, buffer_status: Dict[str, Any]) -> float:
+        """
+        Calculate buffer fill ratio from buffer status.
+        
+        Args:
+            buffer_status: Buffer status dict from /tower/buffer
+        
+        Returns:
+            Buffer fill ratio (0.0-1.0)
+        """
+        if "ratio" in buffer_status:
+            return max(0.0, min(1.0, float(buffer_status["ratio"])))
+        
+        # Calculate from fill/capacity if ratio not provided
+        fill = buffer_status.get("fill", 0)
+        capacity = buffer_status.get("capacity", 1)
+        if capacity > 0:
+            return max(0.0, min(1.0, float(fill) / float(capacity)))
+        
+        return 0.0
+    
+    def _run_prefill_if_needed(
+        self,
+        decoder: FFmpegDecoder,
+        segment: AudioEvent,
+        start_time: float,
+        next_frame_time: float,
+    ) -> bool:
+        """
+        Run pre-fill stage if Tower buffer is below target threshold.
+        
+        Contract reference: Station–Tower PCM Bridge Contract C8 Pre-Fill Stage
+        
+        Pre-fill behavior:
+        - Checks Tower buffer status via /tower/buffer endpoint
+        - If buffer ratio < target (e.g., < 0.5), enters pre-fill mode
+        - Decodes and sends frames as fast as possible (no Clock A sleep)
+        - Monitors buffer fill level periodically
+        - Exits when buffer reaches target or timeout elapses
+        
+        Pre-fill MUST NOT:
+        - Change segment timing logic (elapsed = time.monotonic() - segment_start)
+        - Reset or manipulate Clock A's internal next_frame_time
+        - Introduce any pacing on socket writes (writes remain immediate + non-blocking)
+        
+        Args:
+            decoder: FFmpegDecoder instance for decoding frames
+            segment: AudioEvent being played
+            start_time: Segment start time (Clock A baseline, MUST NOT be modified)
+            next_frame_time: Clock A's next_frame_time (MUST NOT be modified)
+        
+        Returns:
+            True if pre-fill was executed (decoder consumed), False if skipped
+        """
+        # C8: Pre-fill is optional and implementation-defined
+        # Check if pre-fill should run
+        prefill_enabled = os.getenv("PREFILL_ENABLED", "true").lower() == "true"
+        if not prefill_enabled:
+            return False
+        
+        # C8: Check Tower buffer status via /tower/buffer endpoint
+        buffer_status = self._get_tower_buffer_status()
+        if buffer_status is None:
+            # C8: If endpoint unavailable, skip pre-fill and fall back to normal pacing
+            logger.debug("[PREFILL] Tower buffer endpoint unavailable, skipping pre-fill")
+            return False
+        
+        # Calculate buffer ratio
+        ratio = self._get_buffer_ratio(buffer_status)
+        
+        # C8: Configurable pre-fill parameters with validation
+        target_ratio = float(os.getenv("PREFILL_TARGET_RATIO", "0.5"))
+        target_ratio = max(0.1, min(0.9, target_ratio))  # Enforce sane bounds (0.1-0.9)
+        
+        prefill_timeout = float(os.getenv("PREFILL_TIMEOUT_SEC", "5.0"))
+        prefill_timeout = max(1.0, min(30.0, prefill_timeout))  # Enforce sane bounds (1-30s)
+        
+        prefill_poll_interval = float(os.getenv("PREFILL_POLL_INTERVAL_SEC", "0.1"))
+        prefill_poll_interval = max(0.05, min(1.0, prefill_poll_interval))  # Enforce sane bounds (50ms-1s)
+        
+        # C8: If ratio >= target, skip pre-fill
+        if ratio >= target_ratio:
+            logger.debug(f"[PREFILL] Buffer ratio {ratio:.3f} >= target {target_ratio}, skipping pre-fill")
+            return False
+        
+        # C8: Enter pre-fill mode - decode and send frames as fast as possible
+        # Pre-fill is "front-load the first chunk(s) of the current segment"
+        # NOT "decode the whole thing" - we want to leave most of the segment for normal playback
+        logger.info(f"[PREFILL] Starting pre-fill (buffer ratio {ratio:.3f} < target {target_ratio})")
+        prefill_start_time = time.monotonic()
+        frame_count = 0
+        last_poll_time = prefill_start_time
+        
+        # C8: Safety limit - don't pre-fill more than a reasonable chunk of the segment
+        # Pre-fill should be a "front-load" operation, not consume the entire segment
+        # Limit to ~10 seconds of audio (approximately 470 frames at 48kHz)
+        max_prefill_frames = int(10.0 * 48000.0 / 1024.0)  # ~470 frames = ~10 seconds
+        
+        try:
+            for frame in decoder.read_frames():
+                # Check shutdown
+                if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
+                    logger.info("[PREFILL] Stopping pre-fill early (shutdown requested)")
+                    break
+                
+                # C8: Safety check - don't consume entire segment in pre-fill
+                if frame_count >= max_prefill_frames:
+                    logger.info(f"[PREFILL] Pre-fill frame limit ({max_prefill_frames} frames) reached, exiting pre-fill")
+                    break
+                
+                # C8: Check timeout
+                elapsed = time.monotonic() - prefill_start_time
+                if elapsed >= prefill_timeout:
+                    logger.warning(f"[PREFILL] Pre-fill timeout ({prefill_timeout}s) reached, exiting pre-fill")
+                    break
+                
+                # C8: Poll buffer status periodically (every ~50-100ms)
+                now = time.monotonic()
+                if now - last_poll_time >= prefill_poll_interval:
+                    buffer_status = self._get_tower_buffer_status()
+                    if buffer_status is not None:
+                        ratio = self._get_buffer_ratio(buffer_status)
+                        # C8: Exit pre-fill when buffer reaches target
+                        if ratio >= target_ratio:
+                            logger.info(f"[PREFILL] Buffer ratio {ratio:.3f} >= target {target_ratio}, pre-fill complete ({frame_count} frames)")
+                            break
+                    last_poll_time = now
+                
+                # C8: Apply gain and write frame immediately (no sleep, no pacing)
+                # Pre-fill MUST NOT affect segment timing or Clock A timeline
+                processed_frame = self._mixer.mix(frame, gain=segment.gain)
+                try:
+                    self._output_sink.write(processed_frame)
+                    frame_count += 1
+                except Exception as e:
+                    logger.error(f"[PREFILL] Error writing frame: {e}", exc_info=True)
+                    # Continue even if write fails (non-blocking behavior)
+            
+            prefill_duration = time.monotonic() - prefill_start_time
+            logger.info(f"[PREFILL] Pre-fill complete ({frame_count} frames in {prefill_duration:.2f}s)")
+            return True  # Decoder was consumed
+            
+        except Exception as e:
+            logger.error(f"[PREFILL] Error during pre-fill: {e}", exc_info=True)
+            return True  # Decoder may have been partially consumed
+    
     def _play_audio_segment(self, segment: AudioEvent) -> None:
         """
         Decode and play an audio segment.
@@ -502,6 +687,18 @@ class PlayoutEngine:
             decoder = FFmpegDecoder(segment.path, frame_size=1024)
             logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
             
+            # C8: Pre-Fill Stage - build up Tower buffer before normal pacing
+            # Pre-fill MUST NOT affect Clock A timeline or segment timing
+            # Pre-fill decodes and sends frames as fast as possible (no sleep)
+            # After pre-fill, normal decode loop continues with Clock A + PID pacing
+            prefill_consumed_decoder = self._run_prefill_if_needed(decoder, segment, start_time, next_frame_time)
+            
+            # If pre-fill consumed the decoder, recreate it for normal decode loop
+            # (decoder.read_frames() is an iterator that can only be consumed once)
+            if prefill_consumed_decoder:
+                decoder = FFmpegDecoder(segment.path, frame_size=1024)
+                logger.debug(f"[PLAYOUT] Recreated FFmpegDecoder after pre-fill for normal decode loop")
+            
             # Decode and write frames with Clock A pacing
             # Clock A paces consumption to ensure real-time playback duration
             # Socket writes fire immediately (non-blocking, no pacing on writes)
@@ -524,13 +721,15 @@ class PlayoutEngine:
                 # Base Clock A pacing (always used for real-time decode pacing)
                 clock_a_sleep = next_frame_time - now
                 
-                if self._pid_controller:
+                if self._pid_controller and self._pid_controller.enabled:
                     # PE6.5: PID controller provides sleep adjustment (not absolute duration)
                     # PID adjusts Clock A's base sleep duration
                     # When buffer is low: positive adjustment (slow decode) so Tower catches up
                     # When buffer is high: negative adjustment (fast decode) so Tower drains
                     pid_adjustment = self._pid_controller.get_sleep_adjustment(now)
                     sleep_duration = clock_a_sleep + pid_adjustment
+                    # PE6.3: Clamp sleep duration to (min_sleep, max_sleep) bounds
+                    sleep_duration = max(self._pid_controller.min_sleep, min(sleep_duration, self._pid_controller.max_sleep))
                     # Ensure sleep is non-negative
                     sleep_duration = max(0, sleep_duration)
                 else:

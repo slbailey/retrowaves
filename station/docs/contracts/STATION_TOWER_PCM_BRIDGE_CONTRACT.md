@@ -267,6 +267,62 @@ Tower is the ONLY owner of PCM timing.
 
 ---
 
+### C8. Pre-Fill Stage for Tower Buffer
+
+**Purpose:**
+Station MAY implement a pre-fill stage that builds up Tower's PCM buffer before starting normal adaptive pacing to prevent dropped frames and stuttering when Tower comes online or buffer is empty.
+
+**When Pre-Fill Occurs:**
+- Station startup (before first segment playback)
+- Tower reconnection (when socket becomes available after disconnection)
+- Buffer drops below target threshold during normal playback (e.g., < 50% capacity)
+
+**Pre-Fill Behavior:**
+- Station checks Tower buffer fill level via `/tower/buffer` endpoint
+- If buffer ratio is below target (e.g., < 0.5), Station enters pre-fill mode
+- During pre-fill:
+  - Station decodes and sends frames as fast as possible (no Clock A sleep)
+  - Station monitors buffer fill level periodically (via `/tower/buffer`)
+  - Station continues until buffer reaches target fill (e.g., ratio ≥ 0.5)
+- Once target is reached, Station transitions to normal adaptive pacing (PID controller)
+- Pre-fill MUST have a timeout/safety limit to prevent infinite pre-fill
+
+**Pre-Fill Requirements:**
+- Pre-fill MUST use `/tower/buffer` endpoint to monitor buffer status
+- Pre-fill MUST NOT affect segment timing (Clock A timeline still advances)
+- Pre-fill MUST NOT alter Clock A's internal `next_frame_time` or segment timing baseline. Clock A's timeline MUST continue uninterrupted during pre-fill.
+- Pre-fill MUST NOT affect PCM write timing (writes remain non-blocking and immediate)
+- Pre-fill MUST transition smoothly to normal PID pacing when target is reached
+- Pre-fill MUST respect safety limits (timeout, maximum pre-fill duration)
+
+**Tower Responsibilities:**
+- Tower MUST provide accurate buffer status via `/tower/buffer` endpoint
+- Tower MUST accept frames at any rate during pre-fill (non-blocking ingestion)
+- Tower MUST handle buffer overflow gracefully (drop-oldest semantics)
+- Tower MUST NOT signal Station to start/stop pre-fill (Station decides autonomously)
+
+**Transition to Normal Pacing:**
+- When buffer reaches target fill, Station transitions to normal Clock A + PID pacing
+- PID controller takes over adaptive pacing based on buffer status
+- Transition MUST be smooth (no abrupt sleep changes)
+- Clock A timeline MUST continue advancing during and after pre-fill
+
+**Architectural Invariants:**
+- Pre-fill is a Station-internal optimization
+- Tower is unaware of pre-fill mode (Tower just accepts frames)
+- Pre-fill does NOT affect Tower's Clock B (AudioPump timing)
+- Pre-fill does NOT affect segment timing (wall-clock based)
+- Pre-fill does NOT affect PCM write timing (non-blocking, immediate)
+
+**Optional Implementation:**
+- Pre-fill is OPTIONAL and implementation-defined
+- Station MAY implement pre-fill
+- Station MAY choose not to implement pre-fill
+- If not implemented, Station uses normal adaptive pacing from startup
+- Configuration allows enabling/disabling pre-fill
+
+---
+
 ## D. Responsibilities
 
 ### D1. Station Guarantees
@@ -390,5 +446,21 @@ This contract **DOES NOT** define or govern:
 - Subsystem-internal file handling or decoder behaviors
 
 (Refer to the appropriate subsystem contract for those aspects.)
+
+---
+
+## H. Cross-Contract References
+
+**Related Contracts:**
+- **PlayoutEngine Contract (PE6):** Optional PID controller for adaptive Clock A pacing
+- **Tower Runtime Contract (T-BUF):** Buffer status endpoint specification
+- **OutputSink Contract:** Non-blocking PCM frame delivery
+- **PCM Ingestion Contract:** Tower's frame acceptance and validation
+
+**Pre-Fill Stage:**
+- Pre-fill behavior is defined in this contract (C8)
+- Pre-fill uses Tower's `/tower/buffer` endpoint (T-BUF)
+- Pre-fill transitions to PID controller pacing (PE6)
+- Pre-fill does not affect OutputSink behavior (non-blocking writes)
 
 ---

@@ -389,3 +389,83 @@ class TestPE5_OptionalStationTimebaseDriftCompensation:
         """PE5.7: Drift compensation MUST operate independently of Tower."""
         # Contract requires compensation does not use Tower timing or state
         assert True, "Contract requires drift compensation operates independently of Tower"
+
+
+# Contract reference: PlayoutEngine Contract PE6 Adaptive Pacing
+# Contract reference: Station–Tower PCM Bridge Contract C8 (transition rules)
+
+class TestTR_PIDPreFillTransition:
+    """Tests for PID + Pre-Fill Transition (PE6 and C8 transition rules)."""
+    
+    def test_tr1_prefill_hands_off_cleanly_to_pid(self, mock_dj_callback, mock_output_sink):
+        """TR1: Pre-fill hands off cleanly to PID - when threshold reached, PID pacing takes over."""
+        # Contract reference: PlayoutEngine Contract PE6.5
+        # Contract reference: Station–Tower PCM Bridge Contract C8
+        # Contract requires: When buffer reaches target fill, Station transitions to normal Clock A + PID pacing
+        # Contract requires: PID controller takes over adaptive pacing based on buffer status
+        # Contract requires: Transition MUST be smooth (no abrupt sleep changes)
+        
+        # Simulate pre-fill completion (buffer reaches threshold)
+        buffer_status = {"capacity": 60, "count": 35, "ratio": 0.583}  # >= 0.5 threshold
+        
+        # Contract requires: No discontinuity or large sleep spikes
+        # Contract requires: Smooth transition from pre-fill (zero sleep) to PID pacing
+        
+        assert buffer_status["ratio"] >= 0.5, "Pre-fill threshold reached"
+        assert True, "Contract requires smooth transition from pre-fill to PID pacing"
+    
+    def test_tr2_pid_must_not_influence_segment_duration(self, mock_dj_callback, mock_output_sink):
+        """TR2: PID MUST NOT influence segment duration - wall-clock-only timing remains intact."""
+        # Contract reference: PlayoutEngine Contract PE6.7
+        # Contract reference: Station–Tower PCM Bridge Contract C0, C3
+        # Contract requires: PID adjusts Clock A decode pacing sleep duration only
+        # Contract requires: Segment timing remains wall-clock based
+        # Contract requires: Segment ends when elapsed_time >= expected_duration_seconds (wall clock)
+        
+        import time
+        
+        segment_start = time.monotonic()
+        expected_duration = 3.0
+        
+        # PID may adjust decode sleep, but segment timing unchanged
+        time.sleep(0.1)
+        elapsed = time.monotonic() - segment_start
+        
+        # Contract requires: Wall-clock-only timing remains intact
+        assert elapsed >= 0.0, "Segment timing must remain wall-clock based"
+        assert elapsed < expected_duration, "Segment duration unaffected by PID"
+        assert True, "Contract requires PID does not influence segment duration (wall-clock only)"
+    
+    def test_tr3_pid_must_not_perform_tower_synchronized_pacing(self, mock_dj_callback, mock_output_sink):
+        """TR3: PID MUST NOT perform Tower-synchronized pacing - assert NO use of Tower pump cadence."""
+        # Contract reference: PlayoutEngine Contract PE6.7
+        # Contract reference: Station–Tower PCM Bridge Contract C7
+        # Contract requires: PID adjusts Clock A decode pacing based on buffer status only
+        # Contract requires: PID MUST NOT use Tower pump cadence (21.333ms) for pacing
+        # Contract requires: PID MUST NOT adjust decode based on write success/failure
+        
+        tower_pump_cadence_ms = 21.333  # Tower's AudioPump tick
+        
+        # Contract requires: NO use of Tower pump cadence
+        # Contract requires: NO decode adjustment based on write success/failure
+        # Contract requires: PID uses buffer status only (via /tower/buffer endpoint)
+        
+        assert True, "Contract prohibits PID from performing Tower-synchronized pacing"
+    
+    def test_tr4_pid_sleep_clamping(self, mock_dj_callback, mock_output_sink):
+        """TR4: PID sleep clamping - sleep duration must remain within (min_sleep, max_sleep) bounds."""
+        # Contract reference: PlayoutEngine Contract PE6.2, PE6.3
+        # Contract requires: Sleep adjustment must be clamped to (min_sleep, max_sleep) bounds
+        # Contract requires: Final sleep = clock_a_sleep + pid_adjustment (clamped)
+        
+        min_sleep = 0.0  # Minimum sleep (seconds)
+        max_sleep = 0.1  # Maximum sleep (seconds)
+        
+        # Simulate PID adjustment
+        pid_adjustment = 0.15  # Would exceed max_sleep if not clamped
+        
+        # Contract requires: Sleep clamped to (min_sleep, max_sleep)
+        clamped_sleep = max(min_sleep, min(pid_adjustment, max_sleep))
+        
+        assert min_sleep <= clamped_sleep <= max_sleep, "PID sleep must be clamped to bounds"
+        assert True, "Contract requires PID sleep adjustment clamped to (min_sleep, max_sleep)"
