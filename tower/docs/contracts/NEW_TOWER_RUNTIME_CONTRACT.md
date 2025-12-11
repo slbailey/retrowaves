@@ -295,6 +295,9 @@ TowerRuntime **MUST** accept Station heartbeat events via HTTP POST to `/tower/e
 - `station_starting_up` **MUST** be sent exactly once when Station starts up
 - `station_shutting_down` **MUST** be sent exactly once when Station shuts down
 - `new_song` **MUST** be sent every time a new song MP3 starts playing
+  - `new_song` events **MUST** include MP3 metadata (title, artist, duration) in the event content
+  - This metadata **MUST** be collected during the DJ THINK phase and stored with the intent
+  - Metadata is retrieved from the intent when the event is created during DO phase
 - `dj_talking` **MUST** be sent when DJ starts talking, but only once even if multiple talking MP3 files are strung together
 - Station **MUST NOT** send multiple `station_starting_up` or `station_shutting_down` events
 - Station **MUST** track whether lifecycle events have been sent to prevent duplicates
@@ -338,9 +341,10 @@ Received events **MUST** conform to Station heartbeat event format:
     // Event-specific metadata (varies by event type)
     // For "new_song" events:
     //   "file_path": "<string>",  // Path to MP3 file
-    //   "title": "<string>",      // Song title (from MP3 metadata, if available)
-    //   "artist": "<string>",      // Artist name (from MP3 metadata, if available)
-    //   "duration": <float>,       // Duration in seconds (from MP3 metadata, if available)
+    //   "title": "<string>",      // Song title (from MP3 metadata, collected during THINK phase, if available)
+    //   "artist": "<string>",      // Artist name (from MP3 metadata, collected during THINK phase, if available)
+    //   "album": "<string>",       // Album name (from MP3 metadata, collected during THINK phase, if available)
+    //   "duration": <float>,       // Duration in seconds (from MP3 metadata, collected during THINK phase, if available)
     // For "dj_talking" events:
     //   (no metadata required)
     // For lifecycle events ("station_starting_up", "station_shutting_down"):

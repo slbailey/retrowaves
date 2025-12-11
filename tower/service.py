@@ -273,6 +273,13 @@ class TowerService:
         # Per contract [I27] #2: Stop EncoderManager (which stops Supervisor)
         self.encoder.stop()
         
+        # Clean up fallback generator (closes file source if used)
+        if hasattr(self, 'fallback') and self.fallback:
+            try:
+                self.fallback.close()
+            except Exception as e:
+                logger.warning(f"Error closing fallback generator: {e}")
+        
         # Per contract I53: Stop PCM Ingestion gracefully
         self.pcm_ingestor.stop()
         

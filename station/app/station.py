@@ -233,15 +233,23 @@ class Station:
         
         # Per T-EVENTS1: Send station_shutting_down event to Tower (only once)
         if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
-            if self.tower_control.send_event(
-                event_type="station_shutting_down",
-                timestamp=time.monotonic(),
-                metadata={}
-            ):
-                self._lifecycle_state["station_shutting_down"] = True
-                logger.info("Sent station_shutting_down event to Tower")
+            try:
+                success = self.tower_control.send_event(
+                    event_type="station_shutting_down",
+                    timestamp=time.monotonic(),
+                    metadata={}
+                )
+                if success:
+                    self._lifecycle_state["station_shutting_down"] = True
+                    logger.info("Sent station_shutting_down event to Tower")
+                else:
+                    logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+            except Exception as e:
+                logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
         elif self._lifecycle_state["station_shutting_down"]:
             logger.debug("station_shutting_down event already sent, skipping duplicate")
+        elif not self.tower_control:
+            logger.warning("Tower control client not available, cannot send station_shutting_down event")
         
         # SL2.2: Prevent new THINK/DO cycles
         # Per SL2.2: No THINK or DO events MAY fire after shutdown begins

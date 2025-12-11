@@ -36,79 +36,9 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🎯 Next Priority
 
-### MP3 Fallback Support (Looping Standby Audio)
-
-**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
-
-#### Current State
-
-✅ **Already Implemented (90%):**
-- 24×7 HTTP endpoint (`/stream`) always accepts connections
-- Continuous streaming with automatic fallback when Station is offline
-- Grace period with silence, then 440Hz tone fallback
-- WAV file fallback support via `TOWER_SILENCE_MP3_PATH`
-- Hot-swappable audio source transitions (program ↔ fallback)
-- Independent Tower operation (streams even when Station is down)
-
-#### Missing Component
-
-**MP3 File Fallback Support**
-
-Currently, Tower supports WAV file fallback via `TOWER_SILENCE_MP3_PATH`, but not MP3 files. This enhancement adds MP3 decoding support to enable looping "PLEASE STAND BY" MP3 files as a fallback source.
-
-#### Fallback Priority Sequence
-
-After implementation, the fallback priority order will be:
-
-1. **Program PCM** (live audio from Station)
-2. **Grace Period Silence** (1.5 seconds default)
-3. **MP3 File Fallback** (if `TOWER_SILENCE_MP3_PATH` points to an MP3 file)
-4. **440Hz Tone** (synthetic sine wave)
-5. **Silence** (last resort)
-
-This provides a professional "Please stand by" experience instead of a test tone when Station is offline.
-
-#### Technical Requirements
-
-- **MP3 Decoding Support**
-  - Extend `FallbackGenerator` or create `FileSource` to decode MP3 files
-  - Decode MP3 to PCM format (48kHz, stereo, 16-bit, 1024 samples per frame)
-  - Support seamless looping when file reaches EOF
-  - Pre-decode frames to avoid blocking during fallback (zero-latency requirement per `NEW_FALLBACK_PROVIDER_CONTRACT`)
-
-- **File Format Detection**
-  - Auto-detect file format (MP3 vs WAV) from `TOWER_SILENCE_MP3_PATH`
-  - Use appropriate decoder based on file extension or content
-
-- **Non-Blocking Operation**
-  - Per contract FP2.2: `next_frame()` must return immediately
-  - Pre-decode MP3 file at startup or first use
-  - Buffer decoded frames in memory for instant access
-
-#### Implementation Notes
-
-- This extends the existing `FallbackGenerator` / `FileSource` system
-- Must maintain compatibility with existing WAV fallback
-- Should follow the same priority logic in `EncoderManager._get_fallback_frame()`
-- File decoding can happen at startup (not during tick loop)
-
-#### Future Extensions
-
-- **HLS Compatibility**
-  - Generate HLS "standby segments" for HTTP Live Streaming compatibility
-  - Useful for platforms that prefer HLS over raw MP3 streams
-
-- **Icecast Relay**
-  - Use standby mode as a mount-fallback for Icecast servers
-  - Enables Icecast to relay Tower's stream with automatic fallback
-
----
-
-## 🔧 Stability & Performance
-
 ### Advanced Buffer Management with PID Controller
 
-**Future Goal:** Replace the current simple 3-zone buffer controller with a proper PID (Proportional-Integral-Derivative) feedback loop for smoother, more precise rate control.
+**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
 
 **Current Status:**
 - Station uses a simple 3-zone controller (low/normal/high) with fixed sleep times
@@ -135,6 +65,10 @@ This provides a professional "Please stand by" experience instead of a test tone
 - Coefficients (Kp, Ki, Kd) should be configurable
 - May need different tuning for different buffer capacities
 - Should maintain safety limits (min/max sleep times)
+
+---
+
+## 🔧 Stability & Performance
 
 ### Pre-Fill Stage for Tower Buffer
 
@@ -558,6 +492,67 @@ Just for fun.
 
 ## ✅ Completed Work
 
+### MP3 Fallback Support (Looping Standby Audio)
+
+**Status:** ✅ **COMPLETED** - Production-ready implementation
+
+**Implementation Date:** 2024-12-11
+
+#### Purpose
+
+Enable Tower to play a looping MP3/WAV file (e.g., "Please Stand By") as fallback audio when Station is offline, providing a professional standby experience instead of a test tone.
+
+#### What Was Implemented
+
+✅ **FileSource Class** (`tower/fallback/file_source.py`):
+- Pre-decodes entire MP3/WAV file to PCM at startup (contract-compliant)
+- Zero-latency `next_frame()` - pure array indexing, no I/O, no locks
+- Seamless looping with startup crossfade to eliminate pops/clicks
+- Supports files up to 10 minutes (configurable via `max_duration_sec`)
+- Automatic format detection (MP3, WAV, etc.) via FFmpeg
+- Memory-efficient: pre-decoded frames stored in memory
+
+✅ **Fallback Priority Sequence:**
+1. **Program PCM** (live audio from Station)
+2. **Grace Period Silence** (1.5 seconds default)
+3. **MP3 File Fallback** (if `TOWER_SILENCE_MP3_PATH` is configured)
+4. **440Hz Tone** (synthetic sine wave)
+5. **Silence** (last resort)
+
+✅ **Environment Variable Support:**
+- `TOWER_SILENCE_MP3_PATH` - Path to MP3/WAV file for fallback
+- Automatically loaded from `tower/tower.env` or `.env` file
+- Falls back to tone if path is unset or file is invalid
+
+✅ **Seamless Looping:**
+- Startup crossfade (default 2048 samples ≈ 42.6ms) blends end with beginning
+- Eliminates audible pops/clicks at loop boundaries
+- Zero-latency looping via simple array index wrapping
+
+✅ **Contract Compliance:**
+- FP2.2: Zero-latency `next_frame()` (no I/O, no locks, no subprocess calls)
+- FP3.1: File-based fallback with seamless looping
+- FP6.2: Continuous looping without audible seams
+- All tests passing
+
+✅ **Integration:**
+- `FallbackGenerator` automatically uses FileSource when `TOWER_SILENCE_MP3_PATH` is set
+- Graceful fallback to tone if file decoding fails
+- No mixing of sources - clean priority-based selection
+
+**Files Created/Modified:**
+- `tower/fallback/file_source.py` - FileSource implementation
+- `tower/fallback/generator.py` - Integration with FallbackGenerator
+- `tower/tests/contracts/test_new_fallback_provider_contract.py` - Comprehensive tests
+- `run_tower_dev.py` - Added environment variable loading
+- `tower/tower.env.example` - Added `TOWER_SILENCE_MP3_PATH` example
+
+**Documentation:**
+- Contract: `tower/docs/contracts/NEW_FALLBACK_PROVIDER_CONTRACT.md` (FP3.1, FP6.2)
+- All contract tests passing
+
+---
+
 ### Control Channel & Event Side-Channel
 
 **Status:** ✅ **COMPLETED** - Production-ready implementation
@@ -597,12 +592,12 @@ The event stream delivers messages like:
 **Current Implementation:**
 - **WebSocket feed** - Primary transport for real-time event streaming
   - `/tower/events` - Continuous WebSocket stream of events as they occur
-  - `/tower/events/recent` - WebSocket connection that sends recent events then closes
   - Continuous JSON events
   - Perfect for OBS, web UIs, dashboards
   - Tower sends only; clients may send ping frames
   - Each message contains exactly one event as a complete JSON object
   - Messages are text-format JSON (not binary)
+  - **Note:** `/tower/events/recent` endpoint was removed per contract - events are not stored, so recent event catch-up is not available
 
 #### What This Enables for OBS Without Hard Dependencies
 
@@ -664,10 +659,10 @@ Station sends heartbeat events to Tower via HTTP POST to `/tower/events/ingest`:
 - Tower event ingestion endpoint (`/tower/events/ingest`) via HTTP POST
 - Tower event buffer with bounded, thread-safe storage (1000 event capacity)
 - WebSocket event streaming endpoint (`/tower/events`) for real-time event delivery
-- WebSocket recent events endpoint (`/tower/events/recent`) for initial event catch-up
 - Station event emission: All required event types from contracts (PE4, DJ4, OS3)
 - Non-blocking, purely observational event system
 - Full contract compliance with all tests passing
+- **Note:** Events are not stored for historical retrieval; they are delivered immediately to connected clients or dropped
 
 **Event Types Implemented:**
 - Segment lifecycle: `segment_started`, `segment_progress`, `segment_finished`

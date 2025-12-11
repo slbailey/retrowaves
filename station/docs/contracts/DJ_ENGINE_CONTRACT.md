@@ -13,6 +13,7 @@ This is the behavioral heart of Station: the DJ is the brain that makes all cont
 **THINK** **MUST**:
 
 - Select `next_song` via RotationManager
+- Extract MP3 metadata (title, artist, album, duration) for `next_song` and store it in the `AudioEvent.metadata` field
 - Select 0..N IDs (station identification clips)
 - Optionally select `intro` and/or `outro` for the next song
 - Determine whether selected ID is legal (metadata only, no file I/O)
@@ -23,6 +24,8 @@ This is the behavioral heart of Station: the DJ is the brain that makes all cont
 
 - All paths must be absolute file paths
 - All paths must reference existing, playable MP3 files
+- The `next_song` AudioEvent **MUST** include MP3 metadata (title, artist, album, duration) in its `metadata` field
+- Metadata must be extracted during THINK phase and stored with the intent
 - Intent must be complete and immutable once THINK finishes
 
 ### DJ1.3 — THINK Prohibitions

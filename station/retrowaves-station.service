@@ -9,16 +9,16 @@ User=retrowaves
 Group=retrowaves
 
 # Your actual project root
-WorkingDirectory=/opt/retrowaves/station
+WorkingDirectory=/opt/retrowaves
 
-# Ensure imports resolve correctly
-Environment="PYTHONPATH=/opt/retrowaves/station"
+# Ensure imports resolve correctly - must be parent directory for station.* imports
+Environment=PYTHONPATH=/opt/retrowaves
 
 # Optional config
 EnvironmentFile=-/etc/retrowaves/station.env
 
-# Correct venv path
-ExecStart=/opt/retrowaves/venv/bin/python3 -m app.radio
+# Correct venv path - use station module's __main__.py entry point
+ExecStart=/opt/retrowaves/venv/bin/python3 -m station
 
 Restart=always
 RestartSec=2

@@ -61,9 +61,16 @@ The Fallback Provider **MUST** support and apply the following priority order in
 
 A looping audio file (MP3, WAV, or PCM).
 
-- **MUST** decode or read frames matching system PCM format
-- **MUST** seamlessly loop when reaching EOF
+If `TOWER_SILENCE_MP3_PATH` environment variable is set and points to a valid MP3 or WAV file:
+
+- **MUST** decode or read frames matching system PCM format (48kHz, stereo, 16-bit, 1024 samples per frame, 4096 bytes)
+- **MUST** seamlessly loop when reaching EOF (no gaps or clicks)
 - **MUST NOT** block the tick loop during decode
+- **MUST** use a background thread with buffering to ensure zero-latency frame delivery
+- **MUST** fall back to tone if file is unavailable, invalid, or fails to decode
+- **MUST NOT** return silence frames from file source when buffer is empty; it **MUST** fall back to tone instead
+
+File decoding **MUST** occur in a background thread that continuously fills a buffer. The `next_frame()` method **MUST** return frames immediately from this buffer without blocking, ensuring zero-latency delivery per FP2.2.
 
 ### FP3.2 — Tone-Based Fallback (440Hz) — Preferred Fallback
 

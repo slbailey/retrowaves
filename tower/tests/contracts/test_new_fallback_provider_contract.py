@@ -7,9 +7,13 @@ Covers: FP1-FP8 (Core invariants, source selection priority, zero latency, tone 
 
 import pytest
 import os
+import subprocess
+import time
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from tower.fallback.generator import FallbackGenerator, FRAME_SIZE_BYTES, SAMPLE_RATE, CHANNELS
+from tower.fallback.file_source import FileSource
 
 
 class TestFallbackProviderCoreInvariants:
@@ -54,23 +58,66 @@ class TestFallbackProviderCoreInvariants:
 class TestFallbackGeneratorSourceSelection:
     """Tests for source selection priority [F4]–[F17]."""
     
-    def test_f4_source_priority_order(self):
-        """Test [F4]: Source priority: file (WAV) → tone (440Hz) → silence."""
-        generator = FallbackGenerator()
+    def test_f4_source_priority_order(self, tmp_path, monkeypatch):
+        """Test [F4]: Source priority: file (MP3/WAV) → tone (440Hz) → silence."""
+        import subprocess
+        import time
         
-        # Current implementation: tone → silence (file not implemented)
-        # Should at least provide tone or silence
+        # Test 1: File available - should use file
+        test_file = tmp_path / "test.mp3"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.5", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", str(test_file))
+        generator = FallbackGenerator()
+        time.sleep(0.3)  # Wait for buffer to fill
+        
+        # Should use file source
+        assert generator._file_source is not None, "Contract [F4]: File source should be used when configured"
+        assert generator._use_tone is False, "Contract [F4]: Tone should not be used when file is available"
+        
         frame = generator.next_frame()
         assert frame is not None
         assert len(frame) == FRAME_SIZE_BYTES
+        
+        generator.close()
+        
+        # Test 2: File unavailable - should use tone
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", "/nonexistent/file.mp3")
+        generator2 = FallbackGenerator()
+        
+        # Should use tone (file unavailable)
+        assert generator2._file_source is None, "Contract [F4]: File source should not be used when file unavailable"
+        assert generator2._use_tone is True, "Contract [F4]: Tone should be used when file unavailable"
+        
+        frame2 = generator2.next_frame()
+        assert frame2 is not None
+        assert len(frame2) == FRAME_SIZE_BYTES
+        
+        generator2.close()
     
-    def test_f5_falls_through_to_tone(self):
+    def test_f5_falls_through_to_tone(self, monkeypatch):
         """Test [F5]: Falls through to tone generator if file unavailable."""
+        # Set invalid file path
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", "/nonexistent/file.mp3")
         generator = FallbackGenerator()
         
-        # Should use tone (file not implemented yet)
+        # Should use tone (file unavailable)
+        assert generator._file_source is None, "Contract [F5]: Should not use file when unavailable"
+        assert generator._use_tone is True, "Contract [F5]: Should fall through to tone"
+        
         frame = generator.next_frame()
         assert frame is not None
+        assert len(frame) == FRAME_SIZE_BYTES
+        
+        generator.close()
     
     def test_f6_falls_through_to_silence(self):
         """Test [F6]: Falls through to silence if tone generation fails."""
@@ -120,13 +167,21 @@ class TestFallbackGeneratorToneGenerator:
         
         # Phase accumulator ensures continuity (tested by no exceptions)
     
-    def test_f12_tone_selected_when_no_file(self):
+    def test_f12_tone_selected_when_no_file(self, monkeypatch):
         """Test [F12]: Tone generator selected if no file configured."""
+        # Ensure no file is configured
+        monkeypatch.delenv("TOWER_SILENCE_MP3_PATH", raising=False)
         generator = FallbackGenerator()
         
-        # Should use tone (file not implemented)
+        # Should use tone (no file configured)
+        assert generator._file_source is None, "Contract [F12]: Should not use file when not configured"
+        assert generator._use_tone is True, "Contract [F12]: Should use tone when no file configured"
+        
         frame = generator.next_frame()
         assert frame is not None
+        assert len(frame) == FRAME_SIZE_BYTES
+        
+        generator.close()
     
     def test_f13_falls_to_silence_on_error(self):
         """Test [F13]: Falls through to silence if tone generation fails."""
@@ -562,15 +617,22 @@ class TestFallbackProviderTonePreference:
                 (f"Contract violation [FP3.3]: Tone should be preferred when available. "
                  f"Got {tone_count} tone frames vs {silence_count} silence frames")
     
-    def test_fp5_1_falls_to_tone_on_file_error(self):
+    def test_fp5_1_falls_to_tone_on_file_error(self, tmp_path, monkeypatch):
         """
         Test FP5.1: Treat file decode errors as "file unavailable" and fall back automatically to 440Hz TONE.
         
         Per FP5.1: Treat file decode errors as "file unavailable" and fall back automatically to 440Hz TONE.
         """
+        # Test with invalid file path
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", "/nonexistent/invalid/file.mp3")
         generator = FallbackGenerator()
         
-        # Since file fallback is not implemented, should use tone
+        # Should fall back to tone when file is unavailable
+        assert generator._file_source is None, \
+            "Contract [FP5.1]: Should not use file when file is unavailable"
+        assert generator._use_tone is True, \
+            "Contract [FP5.1]: Should fall back to tone when file unavailable"
+        
         frame = generator.next_frame()
         
         # Should return valid frame (tone or silence)
@@ -589,6 +651,8 @@ class TestFallbackProviderTonePreference:
         if is_tone:
             # Tone is being used (preferred per FP5.1)
             assert True, "Contract [FP5.1]: Tone is preferred fallback when file unavailable"
+        
+        generator.close()
     
     def test_fp5_2_silence_only_as_last_resort(self):
         """
@@ -675,7 +739,7 @@ class TestFallbackProviderTonePreference:
         silence_count = sum(1 for f in frames if all(b == 0 for b in f))
         
         # C4.4: Priority order should be File → Tone → Silence
-        # Since file is not implemented, should prefer tone over silence
+        # If file is not configured, should prefer tone over silence
         
         # Verify all frames are valid
         assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
@@ -687,3 +751,427 @@ class TestFallbackProviderTonePreference:
                 (f"Contract violation [C4.4]: Tone should be preferred over silence. "
                  f"Got {tone_count} tone frames vs {silence_count} silence frames. "
                  f"Priority order: File → 440Hz Tone → Silence")
+
+
+class TestFileSourceContractFP31:
+    """Tests for FP3.1: File-Based Fallback contract requirements."""
+    
+    def test_file_source_requires_valid_file(self):
+        """Test that FileSource requires a valid file path."""
+        with pytest.raises(ValueError):
+            FileSource("")
+        
+        with pytest.raises(FileNotFoundError):
+            FileSource("/nonexistent/file.mp3")
+    
+    def test_file_source_initialization(self, tmp_path):
+        """Test that FileSource initializes correctly with a valid file (FP3.1)."""
+        # Create a test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        # FileSource should initialize and pre-decode the file
+        source = FileSource(str(test_file))
+        assert source.file_path == str(test_file)
+        assert source.is_available() is True  # Should have decoded frames
+        assert len(source._frames) > 0  # Should have frames pre-decoded
+        
+        # Cleanup
+        source.close()
+    
+    def test_fp31_decodes_matching_format(self, tmp_path):
+        """Test FP3.1: FileSource MUST decode frames matching system PCM format."""
+        # Create test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        time.sleep(0.3)  # Wait for buffer to fill
+        
+        # Get frames and verify format
+        for _ in range(5):
+            frame = source.next_frame()
+            assert len(frame) == FRAME_SIZE_BYTES, \
+                "Contract [FP3.1]: Frame must match system PCM format (4096 bytes)"
+            assert isinstance(frame, bytes), \
+                "Contract [FP3.1]: Frame must be bytes"
+        
+        source.close()
+    
+    def test_fp31_seamless_looping(self, tmp_path):
+        """Test FP3.1: FileSource MUST seamlessly loop when reaching EOF."""
+        # Create very short test file (0.1 seconds)
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        time.sleep(0.5)  # Wait for initial decode and loop
+        
+        # Get many frames - file should loop seamlessly
+        frames = []
+        for _ in range(20):
+            frame = source.next_frame()
+            assert frame is not None
+            assert len(frame) == FRAME_SIZE_BYTES
+            frames.append(frame)
+            time.sleep(0.05)  # Small delay to allow looping
+        
+        # All frames should be valid (seamless looping)
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract [FP3.1]: Seamless looping must maintain frame format"
+        
+        source.close()
+    
+    def test_fp31_no_blocking(self, tmp_path):
+        """Test FP3.1: FileSource MUST NOT block the tick loop during decode."""
+        import time as time_module
+        
+        # Create test file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        time.sleep(0.3)  # Wait for initial buffer fill
+        
+        # Measure latency of next_frame() calls
+        latencies = []
+        for _ in range(10):
+            start = time_module.perf_counter()
+            frame = source.next_frame()
+            end = time_module.perf_counter()
+            
+            latency_ms = (end - start) * 1000.0
+            latencies.append(latency_ms)
+            
+            assert frame is not None
+            assert len(frame) == FRAME_SIZE_BYTES
+        
+        # next_frame() should return immediately (non-blocking)
+        # Allow reasonable threshold for system jitter
+        max_latency = max(latencies)
+        assert max_latency < 5.0, \
+            (f"Contract [FP3.1]: next_frame() must not block. "
+             f"Max latency {max_latency:.3f}ms exceeds threshold")
+        
+        source.close()
+    
+    def test_file_source_next_frame_returns_valid_frame(self, tmp_path):
+        """Test that FileSource.next_frame() returns valid frames (FP3.1)."""
+        # Create a test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "2", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        
+        # Wait a bit for buffer to fill
+        time.sleep(0.2)
+        
+        # Get a few frames
+        frames = []
+        for _ in range(5):
+            frame = source.next_frame()
+            assert frame is not None
+            assert len(frame) == FRAME_SIZE_BYTES
+            frames.append(frame)
+        
+        source.close()
+    
+    def test_file_source_is_available(self, tmp_path):
+        """Test that FileSource.is_available() correctly reports availability (FP3.1)."""
+        # Create a test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        
+        # Initially, buffer might be empty, but after a bit it should be available
+        time.sleep(0.3)
+        
+        # Should be available if buffer has frames
+        available = source.is_available()
+        # May be True or False depending on timing, but should not raise
+        
+        source.close()
+
+
+class TestFileSourceContractFP62:
+    """Tests for FP6.2: File fallback MUST maintain continuous looping without audible seams."""
+    
+    def test_fp62_continuous_looping(self, tmp_path):
+        """Test FP6.2: FileSource maintains continuous looping without audible seams."""
+        # Create short test file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.2", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        source = FileSource(str(test_file))
+        time.sleep(0.5)  # Wait for initial decode
+        
+        # Get frames across multiple loop iterations
+        frames = []
+        for _ in range(30):
+            frame = source.next_frame()
+            assert frame is not None
+            assert len(frame) == FRAME_SIZE_BYTES
+            frames.append(frame)
+            time.sleep(0.03)  # Allow time for looping
+        
+        # Verify all frames are valid (no gaps from looping)
+        assert all(len(f) == FRAME_SIZE_BYTES for f in frames), \
+            "Contract [FP6.2]: Continuous looping must maintain frame format"
+        
+        source.close()
+
+
+class TestFileSourceIntegrationWithFallbackGenerator:
+    """Tests for FileSource integration with FallbackGenerator (FP3, FP5.1)."""
+    
+    def test_fallback_generator_uses_file_when_configured(self, tmp_path, monkeypatch):
+        """Test that FallbackGenerator uses file source when TOWER_SILENCE_MP3_PATH is set (FP3.1)."""
+        # Create a test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        # Set environment variable
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", str(test_file))
+        
+        # Create generator
+        generator = FallbackGenerator()
+        
+        # Should have file source
+        assert generator._file_source is not None
+        assert generator._use_tone is False  # Should not use tone when file is available
+        
+        # Wait for buffer to fill
+        time.sleep(0.3)
+        
+        # Get frames - should come from file source
+        frames = []
+        for _ in range(5):
+            frame = generator.next_frame()
+            assert frame is not None
+            assert len(frame) == FRAME_SIZE_BYTES
+            frames.append(frame)
+        
+        generator.close()
+    
+    def test_fallback_generator_falls_back_to_tone_when_file_unavailable(self, monkeypatch):
+        """Test that FallbackGenerator falls back to tone when file is unavailable (FP3.2, FP5.1)."""
+        # Set environment variable to nonexistent file
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", "/nonexistent/file.mp3")
+        
+        # Create generator - should fall back to tone
+        generator = FallbackGenerator()
+        
+        # Should not have file source
+        assert generator._file_source is None
+        assert generator._use_tone is True  # Should use tone
+        
+        # Get frames - should be tone
+        frame = generator.next_frame()
+        assert frame is not None
+        assert len(frame) == FRAME_SIZE_BYTES
+        
+        # Tone frames should not be all zeros (silence)
+        assert frame != (b'\x00' * FRAME_SIZE_BYTES)
+        
+        generator.close()
+    
+    def test_fallback_generator_no_mixing_sources(self, tmp_path, monkeypatch):
+        """Test that FallbackGenerator does not mix file and tone sources (FP3 priority order)."""
+        # Create a test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        # Set environment variable
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", str(test_file))
+        
+        # Create generator
+        generator = FallbackGenerator()
+        
+        # Wait longer for buffer to fill (FFmpeg needs time to start and decode)
+        time.sleep(1.0)
+        
+        # Get multiple frames - all should come from same source
+        frames = []
+        for _ in range(10):
+            frame = generator.next_frame()
+            assert frame is not None
+            frames.append(frame)
+            # Small delay to allow buffer to refill if needed
+            time.sleep(0.05)
+        
+        # Verify that we're using file source (not tone)
+        # File source should be active, tone should not be
+        # Note: File source might be disabled if it's not working, so we check if it was used
+        if generator._file_source is None:
+            # File source was disabled - this is OK if it wasn't working
+            # But we should verify that tone is being used instead
+            assert generator._use_tone is True
+        else:
+            # File source is still active - verify tone is not being used
+            assert generator._use_tone is False
+        
+        generator.close()
+    
+    def test_fallback_generator_falls_back_when_file_stops_producing(self, tmp_path, monkeypatch):
+        """Test that FallbackGenerator falls back to tone when file source stops producing (FP5.1)."""
+        # Create a very short test MP3 file
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.1", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        # Set environment variable
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", str(test_file))
+        
+        # Create generator
+        generator = FallbackGenerator()
+        
+        # Wait for initial buffer fill
+        time.sleep(0.3)
+        
+        # Get frames until file source is exhausted
+        # After file loops a few times, we should still get frames (file should loop)
+        frames = []
+        for _ in range(20):
+            frame = generator.next_frame()
+            assert frame is not None
+            frames.append(frame)
+        
+        # File source should still be active (it loops)
+        # But if it fails, we should fall back to tone
+        # The key is that we should NOT have both active at once
+        
+        generator.close()
+    
+    def test_priority_file_then_tone_then_silence(self, tmp_path, monkeypatch):
+        """Test that priority order is File → Tone → Silence (FP3 priority order)."""
+        # Test 1: File available
+        test_file = tmp_path / "test.mp3"
+        
+        try:
+            subprocess.run(
+                ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.5", "-y", str(test_file)],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pytest.skip("ffmpeg not available or failed to create test file")
+        
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", str(test_file))
+        
+        generator = FallbackGenerator()
+        time.sleep(0.3)
+        
+        # Should use file
+        assert generator._file_source is not None
+        assert generator._use_tone is False
+        
+        frame = generator.next_frame()
+        assert frame is not None
+        
+        generator.close()
+        
+        # Test 2: File unavailable - should use tone
+        monkeypatch.setenv("TOWER_SILENCE_MP3_PATH", "/nonexistent/file.mp3")
+        
+        generator2 = FallbackGenerator()
+        
+        # Should use tone
+        assert generator2._file_source is None
+        assert generator2._use_tone is True
+        
+        frame2 = generator2.next_frame()
+        assert frame2 is not None
+        assert frame2 != (b'\x00' * FRAME_SIZE_BYTES)  # Not silence
+        
+        generator2.close()

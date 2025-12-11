@@ -31,10 +31,7 @@ from unittest.mock import Mock
 from tower.service import TowerService
 
 # Import WebSocket test helpers
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from websocket_client import (
+from tower.tests.websocket_client import (
     create_websocket_upgrade_request,
     read_websocket_response,
     read_websocket_messages
@@ -986,6 +983,7 @@ class TestStationEventReception:
                     "file_path": "/path/to/file.mp3",
                     "title": "Test Song",
                     "artist": "Test Artist",
+                    "album": "Test Album",
                     "duration": 180.0
                 }
             }

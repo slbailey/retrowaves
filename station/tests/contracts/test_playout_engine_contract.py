@@ -212,7 +212,7 @@ class TestPE4_HeartbeatEvents:
         mock_dj_callback.on_segment_started.assert_called_once_with(segment)
         
         # PE4.1 requires new_song heartbeat event with metadata
-        # Event should include: file_path, title, artist, duration
+        # Event should include: file_path, title, artist, album, duration
         assert mock_tower_control.send_event.called, "Contract requires new_song event when song starts"
         call_args = mock_tower_control.send_event.call_args
         assert call_args[1]["event_type"] == "new_song", "Event type must be new_song"

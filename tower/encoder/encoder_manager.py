@@ -538,6 +538,15 @@ class EncoderManager:
         # Clear fallback grace period state
         self._fallback_grace_timer_start = None
         
+        # Clean up fallback generator (closes file source if used)
+        if self._fallback_generator is not None:
+            try:
+                if hasattr(self._fallback_generator, 'close'):
+                    self._fallback_generator.close()
+            except Exception as e:
+                logger.warning(f"Error closing fallback generator: {e}")
+            self._fallback_generator = None
+        
         # Per contract [M30] #4: Stop recovery thread per contract [BG22]
         self._stop_recovery_thread()
         

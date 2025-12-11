@@ -13,6 +13,8 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 **DJIntent** **MUST** contain:
 
 - **`next_song`**: `AudioEvent` (required) — The next song to play
+  - **MUST** include MP3 metadata in `AudioEvent.metadata` field (title, artist, album, duration)
+  - Metadata **MUST** be collected during THINK phase and stored with the intent
 - **`outro`**: `AudioEvent?` (optional) — Outro clip for current song
 - **`station_ids`**: `list[AudioEvent]` — List of station identification clips (0..N)
 - **`intro`**: `AudioEvent?` (optional) — Intro clip for next song
@@ -53,6 +55,8 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 
 - DJIntent is a dataclass or similar immutable structure
 - All paths are validated during THINK phase
+- MP3 metadata for `next_song` is extracted during THINK phase and stored in `AudioEvent.metadata`
+- Metadata is retrieved from the intent when `new_song` events are created during DO phase
 - DO phase trusts that intent is valid and complete
 - Intent may contain empty lists (e.g., no IDs) but must be structurally complete
 

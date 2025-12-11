@@ -175,7 +175,10 @@ PlayoutEngine **MUST** emit control-channel events for observability. These even
   - `file_path`: Path to the MP3 file
   - `title`: Song title (from MP3 metadata, if available, otherwise None)
   - `artist`: Artist name (from MP3 metadata, if available, otherwise None)
+  - `album`: Album name (from MP3 metadata, if available, otherwise None)
   - `duration`: Duration in seconds (from MP3 metadata, if available, otherwise None)
+- MP3 metadata **MUST** be retrieved from the `AudioEvent.metadata` field, which was populated during the THINK phase
+- If metadata is not available in `AudioEvent.metadata`, it **MAY** be extracted during DO phase as a fallback (though this should not occur in normal operation)
 - Event **MUST** be emitted from the playout thread
 - Event **MUST NOT** modify queue or state
 - Event **MUST NOT** rely on Tower timing or state

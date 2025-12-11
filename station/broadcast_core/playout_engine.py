@@ -57,9 +57,9 @@ def _get_audio_duration(file_path: str) -> Optional[float]:
 
 def _get_mp3_metadata(file_path: str) -> dict:
     """
-    Get MP3 metadata (title, artist, duration) using ffprobe.
+    Get MP3 metadata (title, artist, album, duration) using ffprobe.
     
-    Returns a dictionary with keys: title, artist, duration.
+    Returns a dictionary with keys: title, artist, album, duration.
     Missing values will be None.
     
     Uses a single ffprobe call to get both format duration and tags for efficiency.
@@ -73,6 +73,7 @@ def _get_mp3_metadata(file_path: str) -> dict:
     metadata = {
         "title": None,
         "artist": None,
+        "album": None,
         "duration": None
     }
     
@@ -81,7 +82,7 @@ def _get_mp3_metadata(file_path: str) -> dict:
         cmd = [
             "ffprobe",
             "-v", "error",
-            "-show_entries", "format=duration:format_tags=title:format_tags=artist",
+            "-show_entries", "format=duration:format_tags=title:format_tags=artist:format_tags=album",
             "-of", "json",
             file_path
         ]
@@ -108,6 +109,8 @@ def _get_mp3_metadata(file_path: str) -> dict:
                     metadata["title"] = tags["title"]
                 if "artist" in tags:
                     metadata["artist"] = tags["artist"]
+                if "album" in tags:
+                    metadata["album"] = tags["album"]
             except (json.JSONDecodeError, KeyError, ValueError):
                 pass
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
@@ -283,6 +286,7 @@ class PlayoutEngine:
                             "file_path": segment.path,
                             "title": metadata.get("title") if metadata else None,
                             "artist": metadata.get("artist") if metadata else None,
+                            "album": metadata.get("album") if metadata else None,
                             "duration": metadata.get("duration") if metadata else None
                         }
                     )

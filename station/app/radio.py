@@ -23,10 +23,11 @@ except ImportError:
     # Fallback for direct execution
     import sys
     from pathlib import Path
-    station_dir = Path(__file__).parent.parent
-    if str(station_dir) not in sys.path:
-        sys.path.insert(0, str(station_dir))
-    from app.station import Station
+    # Need parent directory (/opt/retrowaves) in path for station.* imports
+    project_root = Path(__file__).parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from station.app.station import Station
 
 logger = logging.getLogger(__name__)
 
