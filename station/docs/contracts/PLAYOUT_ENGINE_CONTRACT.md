@@ -4,6 +4,10 @@
 
 Defines the real-time audio engine that executes the DO phase. PlayoutEngine is responsible for decoding and playing audio segments.
 
+**Cross-Contract References:**
+- **Two-Clock Architecture:** See `STATION_TOWER_PCM_BRIDGE_CONTRACT.md` Section C for the complete Two-Clock Model specification
+- **Tower Buffer API:** See `NEW_TOWER_RUNTIME_CONTRACT.md` T-BUF for the `/tower/buffer` endpoint specification (used by PE6 PID controller)
+
 ---
 
 ## PE1 — Segment Lifecycle
@@ -68,7 +72,7 @@ This clock is based on `time.monotonic()` and measures **content time**, NOT PCM
 - This pacing must target ≈21.333 ms per 1024-sample frame for real-time MP3 playback
 - This metronome is for local playback correctness only — ensuring songs take their real duration (e.g., a 200-second MP3 takes 200 seconds to decode)
 - Clock A must be monotonic and maintain wall-clock fidelity
-- Clock A must never attempt to observe Tower state
+- Clock A may observe Tower buffer status via `/tower/buffer` endpoint exclusively for the optional Clock A PID controller (PE6)
 - Clock A must never alter pacing based on socket success/failure
 
 **Playback duration MUST be measured as:**
@@ -124,7 +128,7 @@ elapsed = time.monotonic() - segment_start
   - `next_frame_time += FRAME_DURATION`  # ~21.333 ms
   - `sleep(max(0, next_frame_time - now))`  # allow drift correction
 - Clock A must be monotonic and maintain wall-clock fidelity
-- Clock A must never attempt to observe Tower state
+- Clock A may observe Tower buffer status via `/tower/buffer` endpoint exclusively for the optional Clock A PID controller (PE6)
 - Clock A must never alter pacing based on socket success/failure
 
 **Socket write rules (MUST remain non-blocking):**
@@ -133,9 +137,13 @@ elapsed = time.monotonic() - segment_start
 - Socket writes must fire as soon as frames are available (after decode pacing, if used)
 
 **FORBIDDEN pacing approaches:**
-- Station MUST NOT apply adaptive pacing, buffer-based pacing, or rate correction
-- No proportional control, no PID loops, no drift feedback from Tower
-- No Tower-synchronized pacing (see PE3.2)
+- Station MUST NOT apply Tower-synchronized pacing (see PE3.2)
+- Station MUST NOT attempt to match Tower's AudioPump cadence
+
+**ALLOWED adaptive pacing (when PID controller is enabled):**
+- Station MAY use adaptive Clock A pacing based on Tower buffer status (per PE6)
+- PID controller adjusts decode pacing to maintain Tower buffer at target fill level
+- PID controller does NOT affect segment timing, Clock B, or Tower-synchronized pacing
 
 **Segment timing invariant:**
 - Segment timing = wall clock only
@@ -247,10 +255,11 @@ If drift compensation is enabled, Station **MAY** adjust Clock A decode metronom
 
 **Forbidden adjustments:**
 - Station **MUST NOT** attempt to match Tower PCM clock (Clock B)
-- Station **MUST NOT** apply adaptive pacing based on PCM ingestion feedback
+- Station **MUST NOT** apply adaptive pacing based on PCM ingestion feedback (for drift compensation)
 - Station **MUST NOT** use Tower state to influence compensation
 - Station **MUST NOT** exceed permitted compensation bounds (implementation-defined threshold)
 - Station **MUST NOT** affect segment duration logic (segments still wall clock driven)
+- **Note:** This restriction applies only to drift compensation. It does not prohibit the Clock A PID controller described in PE6, which is allowed to use Tower buffer telemetry.
 
 ### PE5.4 — Segment Duration Invariant
 
@@ -286,8 +295,283 @@ Drift compensation **MUST** operate independently of Tower.
 - Station **MUST NOT** use Tower timing to detect or correct drift
 - Station **MUST NOT** use PCM write success/failure to influence compensation
 - Station **MUST NOT** attempt to synchronize with Tower's Clock B
-- Station **MUST NOT** apply adaptive pacing based on Tower ingestion behavior
+- Station **MUST NOT** apply adaptive pacing based on Tower ingestion behavior (for drift compensation)
 - All drift detection and compensation **MUST** use only Station-local monotonic time
+- **Note:** This restriction applies only to drift compensation. It does not prohibit the Clock A PID controller described in PE6, which is allowed to use Tower buffer telemetry.
+
+---
+
+## PE6 — Optional Adaptive Buffer Management with PID Controller
+
+Station **MAY** implement optional PID (Proportional-Integral-Derivative) controller for adaptive Clock A decode pacing based on Tower buffer status. This extends PE3.3 to allow adaptive pacing while maintaining all architectural invariants.
+
+### PE6.1 — Scope and Architectural Alignment
+
+**The PID controller extends Clock A (Station decode metronome) to be adaptive based on Tower buffer feedback.**
+
+- **Clock A** remains the Station decode pacing metronome (per PE3.1, PE3.3)
+- **Clock B** (Tower AudioPump) remains the sole authority for broadcast timing (per PE3.2)
+- **Segment timing** remains wall-clock based and is NOT affected by PID controller (per PE3.1)
+- PID controller **ONLY** adjusts decode pacing (Clock A) to prevent Tower buffer underflow/overflow
+- PID controller does NOT affect segment duration, DJ THINK/DO timing, or content playback clock
+
+**Station MAY observe Tower buffer status via `/tower/buffer` endpoint to inform Clock A pacing adjustments.**
+
+- Station queries Tower buffer status periodically (configurable interval, default: 500ms)
+- Buffer status includes: `fill`, `capacity`, `ratio` (0.0-1.0)
+- Buffer status is used **ONLY** for Clock A pacing adjustment, NOT for segment timing
+- If Tower buffer status is unavailable, PID controller falls back to fixed-rate Clock A pacing
+- Buffer observation must be non-blocking and must not affect decode thread
+
+**PID controller adjusts Clock A frame-to-frame sleep duration to maintain Tower buffer at target fill level.**
+
+- Target buffer fill ratio: configurable (default: 0.5 = 50% full)
+- PID controller calculates error: `error = target_ratio - current_ratio`
+- PID controller calculates sleep adjustment: `sleep_adjustment = PID(error)`
+- Adjusted sleep duration: `sleep_duration = base_frame_duration + sleep_adjustment`
+- Sleep duration is clamped to safety limits (min/max sleep times)
+
+### PE6.2 — PID Controller Algorithm
+
+**Proportional term (P) responds to current buffer fill deviation from target.**
+
+- **P term calculation:**
+  ```
+  P = Kp * error
+  ```
+  where:
+  - `Kp` = Proportional gain coefficient (configurable, default: 0.1)
+  - `error` = `target_ratio - current_ratio` (range: -1.0 to +1.0)
+  
+- **Behavior:**
+  - Positive error (buffer too low): P term increases sleep duration (slows decode)
+  - Negative error (buffer too high): P term decreases sleep duration (speeds decode)
+  - Response is immediate and proportional to error magnitude
+
+**Integral term (I) accumulates error over time to eliminate steady-state offset.**
+
+- **I term calculation:**
+  ```
+  I = Ki * integral_sum
+  integral_sum += error * dt
+  ```
+  where:
+  - `Ki` = Integral gain coefficient (configurable, default: 0.01)
+  - `integral_sum` = Accumulated error over time (initialized to 0.0)
+  - `dt` = Time since last PID update (seconds)
+  
+- **Behavior:**
+  - Accumulates persistent error to correct long-term drift
+  - Prevents steady-state offset (e.g., buffer consistently at 40% when target is 50%)
+  - Integral term is clamped to prevent windup (configurable limit, default: ±10.0)
+  
+- **Integral Windup Prevention:**
+  - When sleep duration hits safety limits (min/max), integral accumulation is paused
+  - This prevents integral term from growing unbounded when controller is saturated
+
+**Derivative term (D) predicts future error based on rate of change.**
+
+- **D term calculation:**
+  ```
+  D = Kd * (error - previous_error) / dt
+  ```
+  where:
+  - `Kd` = Derivative gain coefficient (configurable, default: 0.05)
+  - `previous_error` = Error from previous PID update
+  - `dt` = Time since last PID update (seconds)
+  
+- **Behavior:**
+  - Responds to rate of change in buffer fill
+  - Dampens oscillations and provides predictive correction
+  - Helps prevent overshoot when buffer is approaching target
+
+**PID controller combines P, I, and D terms to calculate sleep adjustment.**
+
+- **Combined calculation:**
+  ```
+  sleep_adjustment = P + I + D
+  adjusted_sleep = base_frame_duration + sleep_adjustment
+  ```
+  where:
+  - `base_frame_duration` = 21.333 ms (1024 samples / 48000 Hz)
+  - `sleep_adjustment` = Combined PID output (can be positive or negative)
+  
+- **Final sleep duration:**
+  ```
+  sleep_duration = clamp(adjusted_sleep, min_sleep, max_sleep)
+  ```
+  where:
+  - `min_sleep` = Minimum sleep duration (configurable, default: 0.0 ms)
+  - `max_sleep` = Maximum sleep duration (configurable, default: 100.0 ms)
+
+### PE6.3 — Configuration Parameters
+
+**PID controller MUST support configurable coefficients (Kp, Ki, Kd).**
+
+- **Kp (Proportional gain):**
+  - Default: 0.1
+  - Range: 0.0 to 10.0
+  - Higher values = more aggressive response to current error
+  - Lower values = gentler response, more stable but slower correction
+  
+- **Ki (Integral gain):**
+  - Default: 0.01
+  - Range: 0.0 to 1.0
+  - Higher values = faster elimination of steady-state offset
+  - Lower values = slower offset correction, less overshoot
+  
+- **Kd (Derivative gain):**
+  - Default: 0.05
+  - Range: 0.0 to 1.0
+  - Higher values = stronger damping, less oscillation
+  - Lower values = less damping, more responsive but potentially oscillatory
+
+**Target buffer fill ratio MUST be configurable.**
+
+- **Target ratio:**
+  - Default: 0.5 (50% full)
+  - Range: 0.1 to 0.9
+  - Lower values = maintain buffer closer to empty (more aggressive)
+  - Higher values = maintain buffer closer to full (more conservative)
+
+**Sleep duration MUST be clamped to safety limits.**
+
+- **Minimum sleep:**
+  - Default: 0.0 ms (no minimum delay)
+  - Range: 0.0 to 50.0 ms
+  - Prevents negative sleep durations
+  
+- **Maximum sleep:**
+  - Default: 100.0 ms (5x base frame duration)
+  - Range: 10.0 to 500.0 ms
+  - Prevents excessive delays that could cause decode stuttering
+  
+- **Integral windup limit:**
+  - Default: ±10.0
+  - Range: ±1.0 to ±100.0
+  - Prevents integral term from growing unbounded
+
+**PID controller MUST update at configurable intervals.**
+
+- **Update interval:**
+  - Default: 500 ms
+  - Range: 100 ms to 5000 ms
+  - Shorter intervals = more responsive but more CPU overhead
+  - Longer intervals = less responsive but lower CPU overhead
+
+### PE6.4 — Implementation Requirements
+
+**Tower buffer status queries MUST be non-blocking and must not affect decode thread.**
+
+- Buffer queries MUST use async HTTP client or timeout-limited requests
+- Query timeout: configurable (default: 100 ms)
+- If query fails or times out, PID controller uses last known buffer status or falls back to fixed-rate pacing
+- Query failures MUST NOT block decode thread or cause frame drops
+
+**PID controller state MUST be thread-safe.**
+
+- PID state (error history, integral sum, previous error) MUST be protected by locks
+- Buffer status updates and sleep duration calculations MUST be atomic
+- Decode thread MUST read sleep duration atomically without blocking
+
+**PID controller MUST gracefully handle Tower unavailability.**
+
+- If Tower buffer status is unavailable:
+  - PID controller falls back to fixed-rate Clock A pacing (21.333 ms per frame)
+  - Integral term is reset to prevent stale accumulation
+  - Controller resumes PID control when Tower buffer status becomes available again
+
+**PID controller MUST initialize with safe defaults.**
+
+- On startup:
+  - Integral sum = 0.0
+  - Previous error = 0.0
+  - Sleep duration = base_frame_duration (21.333 ms)
+  - Controller begins with fixed-rate pacing until first buffer status is received
+
+### PE6.5 — Integration with PlayoutEngine
+
+**PID controller replaces the current 3-zone buffer controller in `PlayoutEngine._play_audio_segment()`.**
+
+- Current zone-based logic (low/normal/high zones with fixed sleep times) is replaced by PID controller
+- PID controller provides continuous rate adjustment instead of discrete zone transitions
+- This eliminates stuttering from zone transitions
+
+**PID controller integrates with Clock A decode pacing metronome.**
+
+- In `_play_audio_segment()`:
+  ```python
+  # Clock A: Adaptive decode pacing with PID controller
+  now = time.monotonic()
+  sleep_duration = pid_controller.get_sleep_duration(now)
+  if sleep_duration > 0:
+      time.sleep(sleep_duration)
+  next_frame_time += FRAME_DURATION  # Update Clock A timeline
+  ```
+  
+- PID controller calculates sleep duration based on:
+  - Base frame duration (21.333 ms)
+  - Current Tower buffer status
+  - PID error terms (P, I, D)
+  - Safety limits (min/max sleep)
+
+**PID controller MUST update buffer status periodically during decode loop.**
+
+- Buffer status is queried at configurable intervals (default: every 500 ms)
+- Query happens in decode loop but MUST be non-blocking
+- If query is in progress, controller uses last known buffer status
+- Query failures are handled gracefully (fallback to fixed-rate pacing)
+
+### PE6.6 — Observability and Monitoring
+
+**PID controller MUST log state changes for observability.**
+
+- Log PID state at configurable intervals (default: every 10 seconds):
+  - Current buffer fill ratio
+  - Target buffer fill ratio
+  - Error (target - current)
+  - P, I, D terms
+  - Calculated sleep adjustment
+  - Final sleep duration
+  - Integral sum (for windup detection)
+
+**PID controller MUST track performance metrics.**
+
+- Track:
+  - Number of buffer status queries
+  - Number of query failures/timeouts
+  - Number of times sleep duration hit safety limits (min/max)
+  - Number of integral windup events
+  - Average buffer fill ratio over time
+  - Buffer fill ratio variance (for stability assessment)
+
+**PID controller MAY emit control-channel events for monitoring.**
+
+- Optional events:
+  - `pid_state_update`: Emitted periodically with PID state (buffer ratio, error, terms, sleep duration)
+  - `pid_limit_hit`: Emitted when sleep duration hits min/max limits
+  - `pid_windup_detected`: Emitted when integral windup limit is reached
+
+### PE6.7 — Architectural Invariants
+
+**PID controller MUST maintain all architectural invariants from this contract.**
+
+- ✅ **Clock A (Station decode metronome):** PID controller extends Clock A to be adaptive, but Clock A remains Station's decode pacing mechanism
+- ✅ **Clock B (Tower AudioPump):** Clock B remains the sole authority for broadcast timing (unchanged)
+- ✅ **Segment timing:** Segment timing remains wall-clock based and is NOT affected by PID controller
+- ✅ **Socket writes:** Socket writes remain non-blocking and fire immediately (unchanged)
+- ✅ **No Tower-synchronized pacing:** PID controller adjusts decode pacing based on buffer status, but does NOT attempt to match Tower's AudioPump cadence
+
+### PE6.8 — Optional Implementation
+
+PID controller is **OPTIONAL** and implementation-defined.
+
+- Station **MAY** implement PID controller
+- Station **MAY** choose not to implement PID controller
+- If not implemented, Station uses fixed-rate Clock A pacing (21.333 ms per frame)
+- When disabled, behavior matches current implementation
+- Configuration allows gradual rollout and testing
+- Behavioral restrictions (PE6.1 through PE6.7) **MUST** be followed if PID controller is implemented
 
 ---
 
@@ -300,8 +584,11 @@ Drift compensation **MUST** operate independently of Tower.
 - All operations must be real-time and non-blocking
 - **Segment timing:** Uses wall clock (`time.monotonic()`) to measure elapsed time
 - **Decode pacing:** Station may use Clock A (decode metronome) to pace frame consumption at ~21.333ms per frame
+  - **Optional PID controller (PE6):** Station may use adaptive Clock A pacing based on Tower buffer status
+  - **Optional drift compensation (PE5):** Station may use drift compensation within Clock A
 - **PCM output:** Socket writes remain non-blocking and fire immediately (no pacing on writes)
 - **Two clocks:** Clock A (Station decode metronome) for local playback correctness; Clock B (Tower AudioPump) for broadcast timing
+- **PID Controller:** Create `BufferPIDController` class in `station/broadcast_core/buffer_pid_controller.py` if implementing PE6
 
 
 

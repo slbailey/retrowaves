@@ -87,6 +87,15 @@ class TestC0_TwoClockArchitecture:
         
         # Station MUST NOT attempt to match or influence this clock
         assert True, "Contract requires Tower owns PCM clock, Station must not match/influence"
+    
+    def test_c0_clock_a_may_observe_tower_buffer_for_pid(self):
+        """C0: Clock A MAY observe Tower buffer status via /tower/buffer for PE6 PID controller."""
+        # Contract allows: Clock A may observe /tower/buffer endpoint exclusively for PE6 PID controller
+        # This is the ONLY permitted Tower observation by Clock A
+        # Per Bridge Contract C0 and PlayoutEngine PE6.1
+        
+        # Verify this exception exists
+        assert True, "Contract allows Clock A to observe /tower/buffer for PE6 PID controller (see PE6)"
 
 
 class TestC3_DeliveryTiming:

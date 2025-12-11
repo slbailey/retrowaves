@@ -33,7 +33,7 @@ Goals:
 
 ### C0. Architectural Clocks
 
-**Clock A — Station Playback Clock (OWNED BY STATION)**
+**Clock A — Station Decode / Content Clock (OWNED BY STATION)**
 
 Responsible for:
 - Segment progression
@@ -42,15 +42,22 @@ Responsible for:
 - Knowing how long a song has "played"
 - Maintaining real-time program flow
 - **Decode pacing metronome** to ensure songs play at real duration
+- **MAY be adjusted by PID decode pacing** (see PlayoutEngine PE6)
 
 This is a wall-clock timer, based on `time.monotonic()`, that measures **content time**, NOT PCM output cadence.
+
+**Clock A characteristics:**
+- Wall-clock driven
+- Determines segment duration
+- MAY be adjusted by PID decode pacing (PE6)
+- MUST NOT derive from Tower timing, except for reading `/tower/buffer` telemetry for the optional Clock A PID controller (PE6)
 
 **Station MAY use Clock A for decode pacing:**
 - Station may use an internal timer to pace consumption of decoded PCM frames
 - This pacing must target ≈21.333 ms per 1024-sample frame for real-time MP3 playback
 - This metronome is for local playback correctness only — ensuring songs take their real duration (e.g., a 200-second MP3 takes 200 seconds to decode)
 - Clock A must be monotonic and maintain wall-clock fidelity
-- Clock A must never attempt to observe Tower state
+- Clock A may observe Tower buffer status via `/tower/buffer` endpoint exclusively for the optional Clock A PID controller (PE6)
 - Clock A must never alter pacing based on socket success/failure
 
 **Playback duration MUST be measured as:**
@@ -60,7 +67,7 @@ elapsed = time.monotonic() - segment_start
 
 **Station MUST NOT use decoder speed to determine content duration.**
 
-**Clock B — Tower PCM Clock (OWNED BY TOWER)**
+**Clock B — Tower AudioPump Clock (OWNED BY TOWER)**
 
 Responsible for:
 - Actual PCM pacing (strict 21.333ms)
@@ -68,7 +75,12 @@ Responsible for:
 - Consistent audio output timing
 - **Sole authority for broadcast timing**
 
-**Station MUST NOT attempt to match or influence this clock.**
+**Clock B characteristics:**
+- Sole PCM output timing
+- Never influenced by Station
+- Never used by Station for synchronization
+
+**Station MUST NOT attempt to match, predict, synchronize with, or adjust to this clock.**
 
 **Station MUST NOT (Tower-synchronized pacing is FORBIDDEN):**
 - Attempt to match Tower's AudioPump timing
@@ -123,18 +135,22 @@ Tower is the ONLY owner of PCM timing.
 - Station may pace consumption of decoded PCM frames using Clock A
 - After decoding a PCM frame, Station may: `next_frame_time += FRAME_DURATION` (~21.333 ms), then `sleep(max(0, next_frame_time - now))`
 - Clock A must be monotonic and maintain wall-clock fidelity
-- Clock A must never attempt to observe Tower state
+- Clock A may observe Tower buffer status via `/tower/buffer` endpoint exclusively for the optional Clock A PID controller (PE6)
 - Clock A must never alter pacing based on socket success/failure
 
 **Station MUST NOT (Tower-synchronized pacing is FORBIDDEN):**
-- Attempt to match Tower's AudioPump timing
-- Adjust timing based on Tower ingestion behavior
-- Slow down or speed up based on socket backpressure
-- Attempt cadence alignment or drift correction relative to Tower
-- Apply adaptive pacing, buffer-based pacing, or rate correction
-- Use proportional control, PID loops, or drift feedback from Tower
+- Attempt to match, predict, synchronize with, or adjust to Tower's AudioPump cadence
+- Pace, delay, or time socket writes in any way
+- Alter segment timing, which remains wall-clock based
+- Use Tower timing signals (pump rate, write success, latency) as a timing source
 - Use decoder speed to advance segments
 - Use PCM write success/failure to influence segment timing or decode pacing
+
+**✅ Allowed (Clock A domain, per PE6):**
+- Station MAY read Tower `/tower/buffer` telemetry exclusively for the optional Clock A PID controller (PE6)
+- Station MAY adjust decode pacing sleep duration via PID
+- This MUST NOT affect segment timing or PCM write timing
+- See PlayoutEngine PE6 for the only permitted use of Tower buffer telemetry by Station
 
 **Socket write rules:**
 - Even if Clock A decode metronome is used, socket writes must remain non-blocking and fire immediately
@@ -200,27 +216,35 @@ Tower is the ONLY owner of PCM timing.
 
 ### C7. Explicit Forbidding of Tower Feedback
 
-**Station MUST NOT receive or use any timing information from Tower.**
-
-This section explicitly codifies the boundary invariant that Station operates independently of Tower timing and state.
+**❌ Forbidden (Clock B domain):**
 
 **Station MUST NOT:**
+- Attempt to match, predict, synchronize with, or adjust to Tower's AudioPump cadence
+- Pace, delay, or time socket writes in any way
+- Alter segment timing, which remains wall-clock based
+- Use Tower timing signals (pump rate, write success, latency) as a timing source
 - Receive timing information from Tower (no timing feedback channel)
-- Use Tower state to influence Clock A (Station playback clock)
-- Use Tower state to influence decode pacing metronome
+- Use Tower state to influence segment timing
 - Use Tower state to influence drift compensation (if enabled)
 - Use PCM write success/failure to influence segment timing
-- Use PCM write success/failure to influence decode pacing
+- Use PCM write success/failure to influence decode pacing (except via PE6 PID controller)
 - Use PCM buffer depth to influence segment timing
-- Use PCM buffer depth to influence decode pacing
 - Attempt to synchronize with Tower's Clock B
-- Apply adaptive pacing based on Tower ingestion behavior
+
+**✅ Allowed (Clock A domain, per PE6):**
+
+**Station MAY:**
+- Read Tower `/tower/buffer` telemetry exclusively for the optional Clock A PID controller described in PlayoutEngine PE6
+- Adjust decode pacing sleep duration via PID based on Tower buffer status
+- This MUST NOT affect segment timing or PCM write timing
+
+**See PlayoutEngine PE6 for the only permitted use of Tower buffer telemetry by Station.**
 
 **Tower MUST NOT:**
 - Send timing information to Station (no timing feedback channel)
 - Provide timing signals or synchronization hints
-- Communicate buffer state or consumption rate to Station
 - Request timing adjustments from Station
+- Tower MAY provide buffer status via `/tower/buffer` endpoint for Station's optional PID controller (PE6)
 
 **Heartbeat Events MUST:**
 - Be Station-local only (no Tower timing in event metadata)
@@ -233,6 +257,7 @@ This section explicitly codifies the boundary invariant that Station operates in
 - Use only Station-local monotonic time for drift detection
 - Not attempt to match or synchronize with Tower's Clock B
 - Not use Tower state to influence compensation
+- **Note:** This restriction applies only to drift compensation. It does not prohibit the Clock A PID controller described in PE6, which is allowed to use Tower buffer telemetry.
 
 **Boundary Invariant:**
 - Station→Tower: PCM frames only (no timing metadata)
@@ -312,30 +337,44 @@ This is the ONLY source of truth for:
 
 **Tower's AudioPump (21.333ms) is the ONLY authoritative PCM timing source for broadcast timing.**
 
-**Station MUST NOT (Tower-synchronized pacing is FORBIDDEN):**
-- Attempt to match Tower's AudioPump timing
-- Adjust timing based on Tower ingestion behavior
-- Slow down or speed up based on socket backpressure
-- Attempt cadence alignment or drift correction relative to Tower
+**❌ Forbidden (Clock B domain):**
+
+**Station MUST NOT:**
+- Attempt to match, predict, synchronize with, or adjust to Tower's AudioPump cadence
+- Pace, delay, or time socket writes in any way
+- Alter segment timing, which remains wall-clock based
+- Use Tower timing signals (pump rate, write success, latency) as a timing source
 - Try to match PCM rate
 - Predict PCM rate
 - Influence PCM rate
 - Derive timing from PCM writes
+
+**✅ Allowed (Clock A domain, per PE6):**
+
+**Station MAY:**
+- Read Tower `/tower/buffer` telemetry exclusively for the optional Clock A PID controller described in PlayoutEngine PE6
+- Adjust decode pacing sleep duration via PID based on Tower buffer status
+- This MUST NOT affect segment timing or PCM write timing
+
+**See PlayoutEngine PE6 for the only permitted use of Tower buffer telemetry by Station.**
 
 ### F.3 — Correct Behavior Summary
 
 **STATION:**
 - Times SEGMENTS by real time (wall clock - Clock A)
 - May use Clock A (decode metronome) to pace consumption of decoded PCM frames (~21.333ms per frame)
+- May use Clock A PID controller (PE6) to adjust decode pacing based on Tower buffer status
 - Sends PCM frames immediately after decode pacing (socket writes are non-blocking, no pacing on writes)
 - Does NOT time PCM socket writes (writes fire immediately)
-- Does NOT depend on Tower timing for segment progression or decode pacing
+- Does NOT depend on Tower timing for segment progression, except for reading `/tower/buffer` telemetry for the optional Clock A PID controller (PE6)
 - Does NOT attempt Tower-synchronized pacing
+- See PlayoutEngine PE6 for the only permitted use of Tower buffer telemetry
 
 **TOWER:**
 - Times PCM playback by AudioPump (21.333ms - Clock B)
 - Never depends on Station timing for content decisions
 - Owns ALL broadcast timing
+- May provide buffer status via `/tower/buffer` endpoint for Station's optional PID controller (PE6)
 
 ---
 

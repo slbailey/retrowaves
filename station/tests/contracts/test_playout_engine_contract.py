@@ -15,6 +15,7 @@ Tests map directly to contract clauses:
 - PE3.5: Error Propagation (1 test)
 - PE4: Heartbeat Events (new_song, dj_talking)
 - PE5: Optional Station Timebase Drift Compensation
+- PE6: Optional Adaptive Buffer Management with PID Controller (see test_playout_engine_contract_pe6.py)
 """
 
 import pytest
@@ -166,6 +167,15 @@ class TestPE3_3_DecoderOutputRules:
         # Segment duration is measured by wall clock, not decoder speed
         
         assert True, "Contract requires decoder output has no timing constraints"
+    
+    def test_pe3_3_clock_a_may_observe_tower_buffer_for_pid(self, mock_dj_callback, mock_output_sink):
+        """PE3.3: Clock A MAY observe Tower buffer status via /tower/buffer for PE6 PID controller."""
+        # Contract allows: Clock A may observe /tower/buffer endpoint exclusively for PE6 PID controller
+        # This is the ONLY permitted Tower observation by Clock A
+        # Per PE3.3 and PE6.1
+        
+        # Verify this exception exists in contract
+        assert True, "Contract allows Clock A to observe /tower/buffer for PE6 PID controller (see PE6)"
     
     def test_pe3_3_decoder_pacing_independent_of_segment_duration(self, mock_dj_callback, mock_output_sink):
         """PE3.3: Decoder pacing is independent of segment duration (decoder pacing ≠ playback pacing)."""

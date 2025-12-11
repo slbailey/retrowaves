@@ -218,7 +218,15 @@ class TowerPCMSink(BaseSink):
             return True
             
         except FileNotFoundError:
-            logger.debug(f"[TOWER] Tower socket not found: {self.socket_path} (Tower may not be running)")
+            # Log only on first few attempts to avoid spam
+            if not hasattr(self, '_socket_not_found_log_count'):
+                self._socket_not_found_log_count = 0
+            self._socket_not_found_log_count += 1
+            if self._socket_not_found_log_count <= 3:
+                logger.warning(
+                    f"[TOWER] Tower socket not found: {self.socket_path} "
+                    f"(Tower may not be running). Will retry connection."
+                )
             return False
         except ConnectionRefusedError:
             logger.debug(f"[TOWER] Tower socket connection refused: {self.socket_path}")

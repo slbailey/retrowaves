@@ -22,6 +22,7 @@ from typing import Optional, Protocol
 from station.broadcast_core.audio_event import AudioEvent
 from station.broadcast_core.playout_queue import PlayoutQueue
 from station.broadcast_core.ffmpeg_decoder import FFmpegDecoder
+from station.broadcast_core.buffer_pid_controller import BufferPIDController
 from station.mixer.mixer import Mixer
 from station.outputs.base_sink import BaseSink
 
@@ -179,7 +180,7 @@ class PlayoutEngine:
             dj_callback: Optional DJ callback object that implements
                         on_segment_started and on_segment_finished methods
             output_sink: Output sink to write audio frames to (required for real audio playback)
-            tower_control: Optional TowerControlClient (deprecated - not used for timing)
+            tower_control: Optional TowerControlClient (for PID controller Tower connection)
         """
         self._queue = PlayoutQueue()
         self._dj_callback = dj_callback
@@ -209,6 +210,24 @@ class PlayoutEngine:
             "talk": 30.0,       # 30 seconds
             "id": 5.0,          # 5 seconds
         }
+        
+        # PE6: Optional PID controller for adaptive Clock A pacing
+        # Initialize PID controller (enabled by default, can be disabled via config)
+        import os
+        tower_host = os.getenv("TOWER_HOST", "127.0.0.1")
+        tower_port = int(os.getenv("TOWER_PORT", "8005"))
+        pid_enabled = os.getenv("PID_ENABLED", "true").lower() == "true"
+        
+        self._pid_controller: Optional[BufferPIDController] = None
+        if pid_enabled:
+            self._pid_controller = BufferPIDController(
+                tower_host=tower_host,
+                tower_port=tower_port,
+                enabled=True,
+            )
+            logger.info("PID controller enabled for adaptive Clock A pacing")
+        else:
+            logger.info("PID controller disabled - using fixed-rate Clock A pacing")
     
     def set_dj_callback(self, dj_callback: Optional[DJCallback]) -> None:
         """
@@ -493,13 +512,36 @@ class PlayoutEngine:
                     logger.info(f"[PLAYOUT] Stopping playback early (shutdown={self._shutdown_requested}, stop requested)")
                     break
                 
-                # Clock A: Pace decode consumption for real-time playback
-                # This ensures songs take their real duration (e.g., 200-second MP3 takes 200 seconds)
+                # PE6.5: Periodic buffer status update (non-blocking)
+                # Poll /tower/buffer at configured intervals
+                if self._pid_controller:
+                    self._pid_controller.poll_buffer_status()
+                
+                # Clock A: Adaptive decode pacing with optional PID controller
+                # PE6.5: PID controller ADJUSTS Clock A pacing, does not replace it
                 now = time.monotonic()
-                sleep_duration = next_frame_time - now
+                
+                # Base Clock A pacing (always used for real-time decode pacing)
+                clock_a_sleep = next_frame_time - now
+                
+                if self._pid_controller:
+                    # PE6.5: PID controller provides sleep adjustment (not absolute duration)
+                    # PID adjusts Clock A's base sleep duration
+                    # When buffer is low: positive adjustment (slow decode) so Tower catches up
+                    # When buffer is high: negative adjustment (fast decode) so Tower drains
+                    pid_adjustment = self._pid_controller.get_sleep_adjustment(now)
+                    sleep_duration = clock_a_sleep + pid_adjustment
+                    # Ensure sleep is non-negative
+                    sleep_duration = max(0, sleep_duration)
+                else:
+                    # Fixed-rate Clock A pacing (original behavior)
+                    sleep_duration = clock_a_sleep
+                
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
-                # Update Clock A timeline for next frame (allow drift correction)
+                
+                # Update Clock A timeline for next frame (always advance for segment timing)
+                # PE6.7: Segment timing remains wall-clock based and NOT affected by PID controller
                 next_frame_time += FRAME_DURATION
                 
                 # Apply gain via mixer
@@ -508,8 +550,12 @@ class PlayoutEngine:
                 # Write frame immediately - no pacing on socket write, non-blocking
                 # TowerPCMSink handles non-blocking writes and drop-oldest semantics
                 # Clock A only paces decode consumption, NOT socket writes
-                self._output_sink.write(processed_frame)
-                frame_count += 1
+                try:
+                    self._output_sink.write(processed_frame)
+                    frame_count += 1
+                except Exception as e:
+                    logger.error(f"[PLAYOUT] Error writing frame to output sink: {e}", exc_info=True)
+                    # Continue decoding even if write fails (non-blocking behavior)
                 
                 
                 # Log progress every 1000 frames

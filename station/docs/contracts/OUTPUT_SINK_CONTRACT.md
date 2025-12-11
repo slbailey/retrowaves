@@ -4,6 +4,10 @@
 
 Defines how mixed PCM leaves the system. OutputSink is responsible for delivering PCM frames to external systems (Tower, file, Icecast, etc.).
 
+**Cross-Contract References:**
+- **Clock A PID Controller:** See `PLAYOUT_ENGINE_CONTRACT.md` PE6 for the optional adaptive decode pacing mechanism
+- **Two-Clock Architecture:** See `STATION_TOWER_PCM_BRIDGE_CONTRACT.md` Section C for the complete Two-Clock Model specification
+
 ---
 
 ## OS1 — Requirements
@@ -82,8 +86,8 @@ The choice of padding vs. dropping is an implementation decision, but in all cas
 - Tower owns all PCM broadcast timing (AudioPump @ 21.333ms - Clock B).
 
 **Two-Clock Model:**
-- Clock A (Station decode metronome): May pace decode consumption for local playback correctness
-- Clock B (Tower AudioPump): Sole authority for broadcast timing
+- **Clock A (Station Decode / Content Clock):** Wall-clock driven, determines segment duration, MAY be adjusted by PID decode pacing (see PlayoutEngine PE6), MUST NOT derive from Tower timing, except for reading `/tower/buffer` telemetry for the optional Clock A PID controller (PE6)
+- **Clock B (Tower AudioPump Clock):** Sole PCM output timing, never influenced by Station, never used by Station for synchronization
 - Sink writes fire immediately (non-blocking, no pacing on writes)
 - Sink does NOT influence Station's playback clock (Clock A) for segment timing
 - Sink does NOT attempt Tower-synchronized pacing

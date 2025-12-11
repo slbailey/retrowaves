@@ -36,49 +36,16 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🎯 Next Priority
 
-### Advanced Buffer Management with PID Controller
-
-**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
-
-**Current Status:**
-- Station uses a simple 3-zone controller (low/normal/high) with fixed sleep times
-- Buffer polling happens every 500ms
-- Works but can be improved for better stability
-
-**Desired Future Behavior:**
-- Implement a full PID controller for continuous rate adjustment
-- **Proportional (P) term:** Responds to current buffer fill deviation from target
-- **Integral (I) term:** Accumulates error over time to eliminate steady-state offset
-- **Derivative (D) term:** Predicts future error based on rate of change
-- Smooth, continuous rate adjustment without discrete zone transitions
-- Better handling of varying network conditions and Tower consumption rates
-- Tunable PID coefficients for different buffer sizes and network conditions
-
-**Benefits:**
-- Eliminates stuttering from discrete zone transitions
-- More responsive to rapid buffer changes
-- Better long-term stability (I term prevents drift)
-- Industry-standard approach used in streaming media encoders
-
-**Implementation Notes:**
-- PID controller would replace the current zone-based logic in `PlayoutEngine._play_audio_segment()`
-- Coefficients (Kp, Ki, Kd) should be configurable
-- May need different tuning for different buffer capacities
-- Should maintain safety limits (min/max sleep times)
-
----
-
-## 🔧 Stability & Performance
-
 ### Pre-Fill Stage for Tower Buffer
 
-**Future Goal:** Implement a pre-fill stage that builds up the Tower ring buffer before starting normal playback to prevent dropped frames when Tower comes online.
+**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
 
 **Current Status:**
 - Station starts sending frames immediately when playback begins
 - If Tower buffer is empty (0/50), frames are sent at normal rate
 - This can cause stuttering and dropped frames (e.g., 7940 dropped frames observed)
 - No pre-fill phase exists
+- PID controller is now available for smooth transition from pre-fill to normal pacing
 
 **Desired Future Behavior:**
 - Before starting normal playback, check Tower buffer fill level
@@ -87,7 +54,7 @@ This wishlist is organized by priority, starting with features that affect **ove
   - Decode and send frames as fast as possible (no sleep)
   - Monitor buffer fill level periodically
   - Continue until buffer reaches target fill (e.g., 50% = 25/50 frames)
-- Once target is reached, transition to normal adaptive pacing
+- Once target is reached, transition to normal adaptive pacing (PID controller)
 - Pre-fill should happen automatically when:
   - Station starts up
   - Tower restarts/reconnects
@@ -98,13 +65,18 @@ This wishlist is organized by priority, starting with features that affect **ove
 - Eliminates dropped frames during startup
 - Ensures smooth playback from the first frame
 - Better user experience with no audio gaps
+- Works seamlessly with PID controller for smooth transition
 
 **Implementation Notes:**
 - Pre-fill should be integrated into `PlayoutEngine._play_audio_segment()`
-- Should work seamlessly with the adaptive pacing system
-- May need to coordinate with Tower's buffer status endpoint
+- Should work seamlessly with the PID adaptive pacing system
+- Coordinate with Tower's `/tower/buffer` endpoint (already available via PID controller)
 - Should have a timeout/safety limit to prevent infinite pre-fill
-- Could be combined with PID controller for smooth transition
+- PID controller will handle smooth transition from pre-fill to normal pacing
+
+---
+
+## 🔧 Stability & Performance
 
 ### Graceful Shutdown with Offline Announcement
 
@@ -491,6 +463,76 @@ Just for fun.
 ---
 
 ## ✅ Completed Work
+
+### Advanced Buffer Management with PID Controller
+
+**Status:** ✅ **COMPLETED** - Production-ready implementation
+
+**Implementation Date:** 2024-12-11
+
+#### Purpose
+
+Implement a full PID (Proportional-Integral-Derivative) controller for adaptive Clock A decode pacing based on Tower buffer status, replacing the simple 3-zone controller with continuous rate adjustment.
+
+#### What Was Implemented
+
+✅ **BufferPIDController Class** (`station/broadcast_core/buffer_pid_controller.py`):
+- Full PID algorithm with P, I, and D terms
+- Proportional (P) term: Responds to current buffer fill deviation from target
+- Integral (I) term: Accumulates error over time to eliminate steady-state offset (with windup prevention)
+- Derivative (D) term: Predicts future error based on rate of change (with dt edge case handling)
+- Thread-safe state management with RLock
+- Non-blocking `/tower/buffer` polling with timeout support
+- Last-known buffer status fallback
+- Integral reset on Tower unavailability
+- Startup defaults (integral_sum=0, previous_error=0, base_frame_duration sleep)
+- Configurable PID coefficients (Kp, Ki, Kd), target ratio, safety limits
+- Observability: `get_state()` and `get_metrics()` methods
+
+✅ **PID Integration with PlayoutEngine**:
+- PID controller adjusts Clock A pacing (does not replace it)
+- Clock A base pacing (`next_frame_time - now`) is preserved
+- PID adjustment is added to Clock A sleep: `sleep = clock_a_sleep + pid_adjustment`
+- Periodic buffer status polling during decode loop (non-blocking)
+- Maintains all architectural invariants:
+  - Clock A timeline advances for segment timing
+  - Socket writes remain non-blocking and immediate
+  - Segment timing remains wall-clock based
+
+✅ **Control Direction (Correct Sign)**:
+- When buffer is LOW (positive error): Positive adjustment → More sleep → Slower decode → Tower catches up
+- When buffer is HIGH (negative error): Negative adjustment → Less sleep → Faster decode → Tower drains
+- Matches PE6 contract specification
+
+✅ **Edge Case Handling**:
+- Small dt (< 1ms): D-term disabled to prevent explosion
+- Large dt: D-term calculated but clamped
+- dt = 0: D-term disabled, no division by zero
+- Buffer ratio extremes (0.0, 1.0): Handled without oscillations
+- Startup transients: No derivative noise on first cycle
+- Tower unavailability: Falls back to Clock A base pacing, resets integral
+
+✅ **Configuration**:
+- `PID_ENABLED` environment variable (default: `true`)
+- `TOWER_HOST` and `TOWER_PORT` for Tower connection
+- PID coefficients configurable via constructor (defaults per PE6.3)
+
+✅ **Contract Compliance**:
+- PE6.1 through PE6.8: All contract requirements met
+- All 41 PE6 contract tests passing
+- Two-clock architecture preserved
+- Non-interference with segment timing, DJ THINK/DO, PCM writes
+
+**Files Created/Modified:**
+- `station/broadcast_core/buffer_pid_controller.py` - Full PID controller implementation (383 lines)
+- `station/broadcast_core/playout_engine.py` - PID integration with Clock A pacing
+- `station/tests/contracts/test_playout_engine_contract_pe6.py` - Comprehensive contract tests (41 tests)
+
+**Documentation:**
+- Contract: `station/docs/contracts/PLAYOUT_ENGINE_CONTRACT.md` (PE6)
+- All contract tests passing
+
+---
 
 ### MP3 Fallback Support (Looping Standby Audio)
 
