@@ -467,6 +467,33 @@ Just for fun.
 
 ## ✅ Completed Work
 
+### Standardized Logging with Rotation
+
+**Status:** ✅ **COMPLETED** - 2025-12-12
+
+**Implementation:**
+- All 13 components write logs to `/var/log/retrowaves/` directory:
+  - `/var/log/retrowaves/tower.log` for Tower components (TowerRuntime, AudioPump, EncoderManager, PCM Ingestion, Fallback Provider)
+  - `/var/log/retrowaves/ffmpeg.log` for FFmpegSupervisor (special case)
+  - `/var/log/retrowaves/station.log` for Station components (DJEngine, PlayoutEngine, OutputSink, Mixer, StationLifecycle, MasterSystem, FFmpegDecoder)
+- Uses `WatchedFileHandler` for automatic rotation tolerance (handles logrotate rename/truncate)
+- Non-blocking logging with graceful failure handling (per LOG1-LOG4 contract requirements)
+- Duplicate handler prevention for module reloads
+- All contracts, tests, and implementation files updated
+
+**Contract Compliance:**
+- ✅ LOG1: Deterministic log file paths
+- ✅ LOG2: Non-blocking logging (never blocks audio paths)
+- ✅ LOG3: Rotation tolerance (handles external logrotate)
+- ✅ LOG4: Silent degradation on failures
+
+**Documentation:**
+- Contracts: All 13 component contracts include LOG sections
+- Tests: 52 logging contract tests (211 individual test methods)
+- Implementation: All 13 components implement logging per contracts
+
+---
+
 ### Graceful Shutdown with Offline Announcement
 
 **Status:** ✅ **COMPLETED** - Production-ready implementation
