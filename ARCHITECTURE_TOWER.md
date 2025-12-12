@@ -1373,9 +1373,7 @@ Station configuration must include:
 - No THINK/DO decision-making
 - No DJIntent, ticklers, or rotation logic
 - No per-client stream customization (all clients get the same signal)
-- No metadata/event side-channel (handled by a separate Events service in the future)
-- No health check or status endpoints (may be added in future)
-- No logging/monitoring integration (may be added in future)
+- No health check or status endpoints (may be added in future - see FUTURE_ENHANCEMENTS_SYSTEM.md)
 
 ### 10.2 Future Extensions (Wishlist-Backed)
 
@@ -1383,11 +1381,12 @@ These are to be captured in the Wishlist, not here:
 
 - Standby playlist instead of a single tone/file
 - HLS output, Icecast/Shoutcast compatibility, multi-format outputs
-- Dedicated metadata/event side-channel (WebSocket/SSE) for OBS scene switching and "Now Playing"
 - Multi-station Tower instances (one Tower handling multiple Station inputs with separate endpoints)
 - Advanced health reporting and monitoring dashboards
-- Health check endpoint (`GET /health`)
-- Status endpoint (`GET /status`) showing current mode, client count, encoder status
+- Health check endpoint (`GET /health`) - See FUTURE_ENHANCEMENTS_SYSTEM.md
+- Status endpoint (`GET /status`) showing current mode, client count, encoder status - See FUTURE_ENHANCEMENTS_SYSTEM.md
+
+**Note:** Event system (WebSocket/SSE) for OBS scene switching and "Now Playing" has been implemented. See Section 7.7 for details.
 
 ---
 
@@ -1405,7 +1404,7 @@ This document defines the canonical behavior, responsibilities, and constraints 
 ---
 
 **Document:** Tower Unified Architecture (canonical)  
-**Last Updated:** 2025-01-XX  
+**Last Updated:** 2025-12-12  
 **Authority:** This document supersedes prior Tower-related architecture documents.  
 **Broadcast-Grade Behavior:** See Section 5.2.7 for complete broadcast-grade encoding behavior specification.
 

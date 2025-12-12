@@ -97,11 +97,45 @@ Ticklers constraint:
 
 No decisions, no blocking, no external calls in DO.
 
-### 3.4 on_station_stop
-`Station.stop()` handles state saving directly during shutdown:
-- Save DJ/rotation state and any tickler backlog.
-- Safely stop decoder and output sinks.
-- Ensure warm-start avoids immediate repeats.
+### 3.4 on_station_stop (Two-Phase Graceful Shutdown)
+
+`Station.stop()` implements a two-phase graceful shutdown protocol:
+
+**PHASE 1 (DRAINING):** Soft shutdown - current segment finishes, terminal THINK/DO allowed
+- Station enters DRAINING state immediately on shutdown request (SIGTERM, SIGINT, or `stop()` call)
+- Current segment (song/intro/outro/ID) finishes playing completely
+- Playout engine stops accepting new segments from queue
+- DJ generates/selects shutdown announcement during terminal THINK
+- Shutdown announcement plays to completion
+- `station_shutting_down` event sent to Tower AFTER announcement finishes (not immediately)
+
+**PHASE 2 (SHUTTING_DOWN):** Hard shutdown - state persistence, audio components close
+- All FFmpeg subprocesses are forcefully terminated (process group kill)
+- State is saved (warm restart possible)
+- All connections closed cleanly
+- Station exits
+
+**FFmpeg Process Isolation:**
+- FFmpeg subprocesses spawned with `preexec_fn=os.setsid` to isolate from Ctrl-C (SIGINT)
+- FFmpeg continues decoding during PHASE 1 even when parent receives SIGINT
+- Songs and shutdown announcements play to completion without interruption
+
+**Shutdown Announcement Support:**
+- DJEngine generates terminal intent with shutdown announcement during DRAINING
+- Announcement selected from `station_shutting_down/` directory pool
+- Plays as standard AudioEvent after current song finishes
+- Respects THINK/DO separation (announcement queued during THINK, plays during DO)
+
+**Event Timing:**
+- `station_shutting_down` event sent to Tower only AFTER shutdown announcement finishes
+- Ensures listeners hear complete shutdown sequence before event notification
+- Event sent in timeout/error cases as fallback to guarantee delivery
+
+**Safety Features:**
+- Timeout safety: Configurable max wait time (default 5 minutes) for long segments
+- Process group termination ensures no orphaned FFmpeg processes remain
+- Graceful first (SIGTERM), forceful if needed (SIGKILL after timeout)
+- Clean state persistence for warm restarts
 
 Note: `DJEngine.on_station_stop` exists for future expansion but is not part of the active flow. State saving is handled directly by `Station.stop()`, not through this callback.
 
@@ -270,16 +304,40 @@ Shutdown:
 
 ---
 
-## 11. Summary
+## 11. Logging & Observability
+
+All Station components implement standardized logging per contract requirements (LOG1-LOG4).
+
+**Log File Location:**
+- `/var/log/retrowaves/station.log` - DJEngine, PlayoutEngine, OutputSink, Mixer, StationLifecycle, MasterSystem, FFmpegDecoder
+
+**Logging Properties:**
+- **Non-blocking (LOG2):** Logging never blocks audio paths, tick loops, THINK/DO phases, or real-time processing
+- **Rotation tolerant (LOG3):** Uses `WatchedFileHandler` to automatically detect and handle external log rotation (e.g., logrotate)
+- **Failure tolerant (LOG4):** Logging failures degrade silently; component operation continues even if logging fails
+- **No elevated privileges:** Components do not require elevated privileges at runtime
+
+**Implementation:**
+- Each component configures its own logger with `WatchedFileHandler`
+- Handler creation wrapped in exception handling for graceful degradation
+- Duplicate handler prevention for module reloads
+- Standard formatter: `%(asctime)s [%(levelname)s] %(name)s: %(message)s`
+
+See component contracts for detailed logging requirements.
+
+## 12. Summary
 
 - THINK/DO model with `DJIntent` controls all programming decisions and execution timing.
 - Real audio pipeline: filesystem-backed assets, FFmpeg decoding, mixer, and output sinks.
 - Control flow: THINK decides, DO executes, playout is metronomic and non-blocking.
+- Two-phase graceful shutdown with offline announcement support.
+- Pre-fill stage for Tower buffer to prevent dropped frames.
+- Standardized logging with rotation tolerance and failure handling.
 
 ---
 
 Document: Unified Architecture (canonical)  
-Last Updated: 2025-12-03  
+Last Updated: 2025-12-12  
 Authority: This document supersedes prior architecture documents.
 
 
