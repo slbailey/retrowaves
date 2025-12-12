@@ -17,6 +17,8 @@ This document is a **wishlist of ideas** for potential future enhancements to th
 
 **Note:** Retrowaves is the software platform. Appalachia Radio is the first station instance that uses this software.
 
+**Architectural Constraint:** Nothing in this document may violate the THINK/DO execution model or real-time audio timing guarantees.
+
 ---
 
 ## Priority Overview
@@ -82,20 +84,110 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🔧 Stability & Performance
 
----
+### Ticklers: Deferred Improvement & Maintenance Tasks
+
+**Concept:**
+
+Ticklers are first-class architectural constructs in Retrowaves that represent non-critical, best-effort tasks for system improvement and maintenance. They enable the system to improve incrementally over time without ever blocking or interfering with core playout operations.
+
+**Purpose:**
+
+Ticklers allow Retrowaves to handle deferred work that enhances the system but is not required for immediate operation. Examples include loudness analysis for assets missing metadata, media library organization tasks, or gradual quality improvements. The system plays content immediately regardless of whether these improvements have been completed.
+
+**Execution Model:**
+
+Ticklers are created during THINK when the DJ engine identifies opportunities for improvement or detects missing metadata. They are scheduled for opportunistic execution but never block THINK or DO operations. Ticklers run asynchronously, can be interrupted at any time, and may be deferred if system resources are constrained. They are inherently interruptible and resumable, allowing the system to prioritize playout over maintenance tasks. Ticklers are persisted locally so that deferred improvements survive restarts, but their execution remains best-effort and non-blocking. Tickler execution occurs outside active playout threads and never shares timing-critical locks.
+
+**Distinction from Other Patterns:**
+
+Ticklers are explicitly not:
+- **Cron jobs:** Ticklers have no fixed schedule and execute opportunistically based on system state
+- **Background workers:** Ticklers are not separate processes or threads dedicated to maintenance; they integrate with the DJ engine's natural lifecycle
+- **Pipelines:** Ticklers do not process assets in bulk or require an ingest phase; they work incrementally on assets as they are encountered during normal operation
+
+**Canonical Example: Loudness Analysis**
+
+When the DJ engine encounters a song during THINK that lacks loudness metadata, it:
+1. Queues the asset for immediate playout at unity gain
+2. Creates a tickler to analyze the audio file and compute LUFS values
+3. Schedules the tickler for asynchronous execution
+4. On future plays, applies the cached loudness metadata
+
+The asset plays correctly on first encounter, and the system improves for subsequent plays. If tickler execution is delayed or interrupted, playout continues normally.
+
+**Guardrails:**
+
+**Ticklers MUST:**
+- Execute entirely outside the THINK/DO playout path
+- Be interruptible at any point without affecting playout
+- Work incrementally, improving the system one asset at a time
+- Cache results for future use (metadata, computed values, etc.)
+- Log their activities for observability
+- Be idempotent by design (duplicate execution is safe and acceptable)
+- Represent durable intent, not job progress or execution state (ticklers are not a job queue, scheduler, or workflow engine)
+
+**Ticklers MUST NOT:**
+- Block THINK operations
+- Block DO operations
+- Delay or prevent asset playback
+- Require completion before playout proceeds
+- Modify audio files in place (they may create metadata files)
+- Create dependencies between assets or require bulk processing
+- Execute during critical playout windows (can be deferred if needed)
+
+**Scope:**
+
+Ticklers are suitable for any deferred improvement task that enhances system quality but is not required for operation: loudness analysis, metadata extraction, library organization, quality metrics collection, and similar maintenance tasks. They are not suitable for time-critical operations, mandatory data processing, or anything that must complete before playout can proceed.
+
+**Architectural Invariant:**
+
+The THINK/DO execution model is inviolable. Audio timing and playout correctness must never depend on deferred or background work. All enhancements described in this document respect this fundamental constraint.
 
 ## 📡 Broadcast-Grade Features
 
-### Song Crossfading Logic
+**Note:** All features in this section operate within the THINK/DO model. Decisions occur during THINK; execution is queued for future segments. Current segments always complete without interruption.
 
-Fade-out current → fade-in next. DJ intros duck music automatically.
+### Loudness Normalization (Ingest-Free, Tickler-Driven)
 
-### ReplayGain / LUFS Normalization
+**Purpose:**
 
-Normalize loudness across:
-- songs
-- intros/outros
-- DJ talk segments
+Ensure consistent perceived loudness across all audio assets (songs, intros, outros, station IDs, fallback audio) to match professional broadcast behavior, without requiring an ingest pipeline or blocking playout operations.
+
+**Architecture:**
+
+Loudness normalization operates entirely within the THINK/DO model. During THINK, the DJ engine may detect missing loudness metadata for an asset. If metadata is present, the DJ applies a static gain value to the AudioEvent. This gain remains constant for the entire duration of the segment during DO phase playout. If metadata is absent, the asset plays at unity gain with no delay or blocking.
+
+**Implementation via Ticklers:**
+
+Loudness analysis is implemented exclusively through DJ ticklers, never as a blocking operation. When the DJ encounters an asset without loudness metadata during THINK:
+
+1. Asset is queued and plays immediately at unity gain
+2. A loudness analysis tickler is scheduled for asynchronous execution
+3. The tickler runs outside the playout path, analyzing the audio file and computing LUFS (or ReplayGain) values
+4. Metadata is cached alongside the asset for future plays
+5. On subsequent plays, the DJ applies the cached gain value during THINK
+
+**Example:**
+
+- **First play:** Song `Artist - Title.mp3` has no loudness metadata → Queued with gain=1.0 → Plays at unity → Tickler scheduled
+- **Future plays:** Same song now has cached LUFS=-16.5 → DJ computes gain=+2.0dB during THINK → Queued with gain=2.0 → Plays at normalized level
+
+**Constraints:**
+
+- Gain is static per asset: Once computed, the gain value for an asset remains constant unless explicitly re-analyzed via a tickler (not adaptive or real-time)
+- Gain is constant per segment: The entire segment (song, intro, outro, etc.) plays at a single gain value
+- Metadata is optional: Playout never requires loudness metadata. Missing metadata never blocks or delays playback
+- No real-time DSP: All analysis happens asynchronously via ticklers
+- No encoder-level normalization: Gain is applied during playout, not encoding
+- No database dependency: Metadata is cached per-asset in the file system or alongside media files
+
+**Non-Goals:**
+
+- Compressor/limiter as loudness control (gain is static, not dynamic)
+- Adaptive gain riding (gain is constant for segment duration)
+- Rewriting audio files (gain is applied at playout time only)
+- Central database for metadata (per-asset caching only)
+- Required ingest pipeline (assets play immediately, analysis is optional background work)
 
 ### "Now Playing" Metadata
 
@@ -114,8 +206,8 @@ Push via:
 ### Emergency Alert / Override Mode
 
 Trigger an emergency mode that:
-- stops normal rotation
-- plays emergency audio sequence
+- stops normal rotation (decision occurs during THINK, applies to next segment selection)
+- plays emergency audio sequence (queued during DO for future segments, current segment always completes)
 - sends alerts to clients
 
 ### Icecast/Shoutcast Compatibility
@@ -126,7 +218,7 @@ Trigger an emergency mode that:
 - Multiple mountpoints
 - Listener stats
 - Artist/song metadata
-- ReplayGain or normalization per Icecast spec
+- ReplayGain or normalization per Icecast spec (tickler-driven, per Loudness Normalization section)
 - DJ metadata updates ("Now playing…")
 
 ### HLS Output (Apple HTTP Live Streaming)
@@ -153,7 +245,7 @@ Core engine remains unchanged; outputs become modular.
 
 ### Local Recording / "Aircheck Mode"
 
-Record a rolling 24-hour version of the station:
+Record a rolling 24-hour version of the station via parallel write during DO phase (non-blocking):
 - For audits
 - DJ coaching
 - Troubleshooting
@@ -214,14 +306,15 @@ Could allow remote control via phone app.
 **Desired Future Behavior:**
 - DJEngine automatically extracts base song name from intros/outros
 - Detects generic vs per-song assets
-- Creates ticklers for safe migration
-- Moves files into structured directories during THINK windows
+- Creates ticklers for safe migration (file moves executed asynchronously)
+- Files moved into structured directories opportunistically (never during active THINK/DO)
 - Maintains backward compatibility
 - Zero downtime, zero manual labor
 
 **Implementation Notes:**
 - This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
-- Migration should happen incrementally during THINK windows (non-blocking)
+- File operations are executed asynchronously via ticklers (never during THINK or DO)
+- Moves are opportunistic and never block scheduling or playback
 - Files should be moved atomically with fallback to original location if needed
 - DJ should maintain a mapping of old paths to new paths during transition
 
@@ -413,7 +506,8 @@ Future DJ behaviors:
 Legal ID rules:
 - must play top of hour
 - must play exactly N times per hour
-- must delay if song pushes into the top-of-hour slot
+- scheduling decisions occur during THINK (next segment selection adjusts if song would push into top-of-hour slot, never delays current playback)
+- current segments always complete before legal ID plays
 - can merge with outros or intros
 
 ### Scheduled & Scripted Segments
@@ -447,7 +541,7 @@ Simulated callers and DJ responses.
 
 ### AI Song Facts Generator
 
-Pulls facts and band trivia automatically.
+Extracts facts and band trivia automatically via ticklers (analysis work performed asynchronously, never blocks playout). Metadata cached for future use in talk segments or "Now Playing" displays. Decisions about using facts occur during THINK; execution is queued for future segments. Current segments always complete.
 
 ### Multi-DJ Personalities
 
