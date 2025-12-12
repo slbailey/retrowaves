@@ -87,6 +87,73 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 
 ---
 
+## E1 — THINK/DO Behavior During Shutdown
+
+The THINK/DO model **MUST** be preserved during shutdown, with explicit rules governing shutdown detection and terminal intent execution.
+
+### E1.1 — Lifecycle Detection
+
+**Startup and shutdown detection MUST occur OUTSIDE the THINK/DO cycle.**
+
+- Startup and shutdown state is managed by Station lifecycle (per StationLifecycle Contract)
+- Lifecycle detection **MUST NOT** occur during THINK or DO execution
+- Lifecycle state **MAY** be observed by THINK, but lifecycle logic **MUST NOT** execute within THINK or DO
+
+### E1.2 — THINK During Lifecycle
+
+**Lifecycle state MAY be observed during THINK.**
+
+- During startup, THINK **MAY** observe startup state and select startup announcement
+- During shutdown, when Station is in DRAINING state, THINK **MAY** observe the shutdown flag
+- THINK **MAY** produce a terminal DJIntent when shutdown is active
+- Terminal intent **MUST** be marked as TERMINAL (per DJIntent Contract)
+- THINK **MUST NOT** trigger lifecycle state changes itself
+- THINK **MUST NOT** perform lifecycle-specific I/O or blocking work beyond normal THINK operations
+
+### E1.3 — DO During Lifecycle
+
+**DO executes intent without branching on lifecycle state.**
+
+- DO **MUST** execute intent (startup announcement, normal intent, or terminal intent) when provided
+- Intent execution **MUST** follow all normal DO rules regardless of lifecycle state
+- DO **MUST NOT** branch behavior based on lifecycle state
+- DO **MUST NOT** perform lifecycle-specific operations beyond intent execution
+
+### E1.4 — THINK/DO Separation Preserved
+
+**THINK/DO separation MUST be preserved during shutdown.**
+
+- Shutdown logic **MUST NOT** execute during DO beyond intent execution
+- THINK prepares terminal intent; DO executes it
+- No shutdown-specific behavior **MAY** be embedded in DO phase
+- All shutdown orchestration occurs outside THINK/DO boundaries
+
+### E1.5 — Event Prohibition After Terminal DO
+
+**After terminal intent execution, no further THINK or DO events MAY fire.**
+
+- System **MUST** prevent new THINK/DO cycles after terminal DO completes
+- Callbacks **MUST** be disabled or ignored after terminal DO
+- System transitions to SHUTTING_DOWN state (PHASE 2) after terminal segment finishes (or immediately if no terminal segment)
+- Purely observational events (per E0.7, E1.6) **MAY** continue after terminal DO completes
+- Observational events **MUST NOT** be THINK or DO events
+- Observational events **MUST NOT** mutate state, affect timing, or modify queues
+
+### E1.6 — Observability Events During Shutdown
+
+**Non-THINK/DO observability events MAY continue during shutdown.**
+
+- Observability events (per E0.7) **MAY** be emitted during shutdown phases
+- Shutdown-related observability events **MAY** include:
+  - `station_shutting_down` — emitted when Station enters DRAINING state
+  - `shutdown_announcement_started` — emitted when shutdown announcement segment starts (if present)
+  - `shutdown_announcement_finished` — emitted when shutdown announcement segment finishes (if present)
+- These events **MUST** be purely observational and **MUST NOT** influence shutdown behavior
+- These events **MUST NOT** trigger THINK or DO cycles
+- Observability events **MAY** continue until process exit
+
+---
+
 ## Contract Dependencies
 
 All other Station contracts reference this contract:

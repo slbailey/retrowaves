@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Protocol, Dict, Any
 
 import httpx
+import numpy as np
 
 from station.broadcast_core.audio_event import AudioEvent
 from station.broadcast_core.playout_queue import PlayoutQueue
@@ -193,8 +194,17 @@ class PlayoutEngine:
         self._is_running = False
         self._stop_event = threading.Event()
         self._play_thread: Optional[threading.Thread] = None
+        self._current_decoder: Optional[FFmpegDecoder] = None  # Track active decoder for PHASE 2 kill
         self._mixer = Mixer()
         self._shutdown_requested = False  # Per contract SL2.2: Prevent THINK/DO after shutdown
+        self._is_draining = False  # Per contract SL2.2.1: DRAINING state (stop dequeuing, finish current)
+        self._terminal_segment_played = False  # Track if terminal segment has been played (per PE7.3)
+        self._terminal_do_executed = False  # Track if terminal DO has been executed (per SL2.2, E1.3)
+        self._terminal_audio_queued = False  # Track if shutdown announcement was queued by terminal DO
+        self._terminal_audio_played = False  # Track if shutdown announcement actually played to EOF (frames emitted)
+        self._terminal_playout_complete = False  # Definitive flag: terminal DO executed AND (no audio queued OR audio played)
+        self._playout_stopped_event = threading.Event()  # Signal when playout loop has finished
+        self._current_segment_is_terminal = False  # Track if currently playing segment is the terminal shutdown announcement
         
         # Track talking state to avoid multiple dj_talking events for consecutive talk files
         self._is_in_talking_sequence = False
@@ -250,6 +260,22 @@ class PlayoutEngine:
         """
         self._shutdown_requested = True
     
+    def set_draining(self, is_draining: bool = True) -> None:
+        """
+        Set draining state (per SL2.2.1, PE7.2).
+        
+        When draining:
+        - Current segment MUST finish completely
+        - No new segments MAY be dequeued
+        - Exactly one terminal segment MAY play if present
+        
+        Args:
+            is_draining: True to enter DRAINING state
+        """
+        self._is_draining = is_draining
+        if is_draining:
+            logger.info("[PLAYOUT] Entering DRAINING state - current segment will finish, no new segments will be dequeued")
+    
     def queue_audio(self, audio_events: list[AudioEvent]) -> None:
         """
         Queue audio events for playout.
@@ -263,6 +289,15 @@ class PlayoutEngine:
         """
         self._queue.enqueue_multiple(audio_events)
         logger.info(f"Queued {len(audio_events)} audio event(s)")
+        
+        # Track if shutdown announcement was queued during DRAINING (terminal DO)
+        # Check if any of the queued events is the terminal shutdown announcement
+        if self._is_draining:
+            for event in audio_events:
+                if event and event.is_terminal:
+                    self._terminal_audio_queued = True
+                    logger.info(f"[PLAYOUT] Terminal shutdown announcement queued - {event.path}")
+                    break
     
     def start_segment(self, segment: AudioEvent) -> None:
         """
@@ -358,11 +393,31 @@ class PlayoutEngine:
         logger.info(f"Finishing segment: {segment.type} - {segment.path}")
         
         # Emit on_segment_finished callback (DO phase)
-        # Per contract SL2.2: No DO events MAY fire after shutdown begins
-        # Per contract SL2.2: Check both shutdown_requested and callback existence
-        if not self._shutdown_requested and self._dj_callback:
+        # Per contract SL2.2, E1.3: Terminal DO MUST be allowed to execute even if shutdown is requested
+        # Exception: If draining and terminal DO not yet executed, allow DO to run
+        # Otherwise, respect shutdown_requested (no DO events after shutdown, except terminal DO)
+        should_allow_do = False
+        if self._is_draining and not self._terminal_do_executed:
+            # Per SL2.2: Exactly one terminal THINK/DO cycle is permitted during DRAINING
+            # We're in DRAINING and terminal DO hasn't executed yet, so allow it
+            should_allow_do = True
+            logger.info("[PLAYOUT] Allowing terminal DO to execute (draining state, terminal DO not yet executed)")
+        elif not self._shutdown_requested:
+            # Normal case: not shutdown, allow DO
+            should_allow_do = True
+        
+        if should_allow_do and self._dj_callback:
             try:
                 self._dj_callback.on_segment_finished(segment)
+                # Check if this was a terminal DO by inspecting DJ engine's state
+                # Terminal DO is indicated by terminal intent being queued
+                if self._is_draining and hasattr(self._dj_callback, '_terminal_intent_queued'):
+                    if self._dj_callback._terminal_intent_queued:
+                        self._terminal_do_executed = True
+                        logger.info("[PLAYOUT] Terminal DO executed - no further THINK/DO cycles will occur")
+                        # Check if shutdown announcement was queued (terminal intent may be empty)
+                        # We'll detect this when we try to dequeue the terminal segment
+                        # For now, mark that terminal DO executed - terminal event queued will be set when we find it
             except Exception as e:
                 logger.error(f"Error in DJ callback on_segment_finished: {e}")
         
@@ -401,67 +456,122 @@ class PlayoutEngine:
         This loop checks _shutdown_requested at multiple points to ensure strict compliance.
         """
         logger.info("Playout loop started")
-        
-        # Per contract SL2.2: Check shutdown_requested in loop condition
-        while self._is_running and not self._stop_event.is_set() and not self._shutdown_requested:
-            # Periodic queue monitoring (every 5 seconds)
-            now = time.time()
-            if now - self._last_queue_log_time >= self._queue_log_interval:
-                queue_size = self._queue.size()
-                logger.info(
-                    f"[QUEUE_MONITOR] PlayoutQueue: {queue_size} segments waiting"
-                )
-                self._last_queue_log_time = now
-            
-            # Per contract SL2.2: Check shutdown before dequeueing new segment
-            if self._shutdown_requested:
-                logger.info("Playout loop stopping: shutdown requested")
-                break
-            
-            # Try to get next segment from queue
-            segment = self._queue.dequeue()
-            
-            if segment is None:
-                # Queue is empty, wait a bit before checking again
-                # Per contract SL2.2: Check shutdown during wait
-                if self._shutdown_requested:
-                    break
-                time.sleep(0.1)
-                continue
-            
-            # Per contract SL2.2: Check shutdown before THINK phase (on_segment_started)
-            if self._shutdown_requested:
-                logger.info("Playout loop stopping: shutdown requested before THINK phase")
-                break
-            
-            # Start the segment (triggers on_segment_started - THINK phase)
-            # start_segment() internally checks shutdown_requested before firing callback
-            self.start_segment(segment)
-            
-            # Per contract SL2.2: Check shutdown after THINK, before playback
-            if self._shutdown_requested:
-                logger.info("Playout loop stopping: shutdown requested after THINK phase")
-                break
-            
-            # Decode and play the audio segment
-            try:
-                self._play_audio_segment(segment)
-            except Exception as e:
-                logger.error(f"[PLAYOUT] Error playing segment {segment.path}: {e}", exc_info=True)
-                # Don't continue to finish_segment if playback failed
-                continue
-            
-            # Per contract SL2.2: Check shutdown before DO phase (on_segment_finished)
-            if self._shutdown_requested:
-                logger.info("Playout loop stopping: shutdown requested before DO phase")
-                break
-            
-            # Finish the segment (triggers on_segment_finished - DO phase)
-            # finish_segment() internally checks shutdown_requested before firing callback
-            # Note: finish_segment() will verify the segment is still current, so we can call it directly
-            self.finish_segment(segment)
-        
-        logger.info("Playout loop stopped")
+        try:
+            # Loop continues until: stop event OR terminal playout complete
+            # During DRAINING, loop MUST continue until terminal DO executed AND terminal segment (if any) finished
+            while self._is_running and not self._stop_event.is_set() and not self._terminal_playout_complete:
+                # Periodic queue monitoring (every 5 seconds)
+                now = time.time()
+                if now - self._last_queue_log_time >= self._queue_log_interval:
+                    queue_size = self._queue.size()
+                    logger.info(
+                        f"[QUEUE_MONITOR] PlayoutQueue: {queue_size} segments waiting"
+                    )
+                    self._last_queue_log_time = now
+                
+                # Per contract PE7.2: Stop dequeuing new segments once DRAINING state begins
+                # Exception: Allow exactly one terminal segment (shutdown announcement) to be dequeued (per PE7.3)
+                if self._is_draining:
+                    # Check if terminal playout is complete: DO executed AND (no audio queued OR audio played)
+                    if self._terminal_do_executed:
+                        if not self._terminal_audio_queued or self._terminal_audio_played:
+                            # Terminal playout complete: DO executed AND (no audio queued OR audio played)
+                            self._terminal_playout_complete = True
+                            if self._terminal_audio_played:
+                                logger.info("[PLAYOUT] DRAINING: Terminal playout complete - shutdown announcement played")
+                            else:
+                                logger.info("[PLAYOUT] DRAINING: Terminal playout complete - DO executed, no shutdown announcement queued")
+                            break
+                        # Terminal audio was queued but not yet played - continue to dequeue and play it
+                    
+                    # During DRAINING: Only dequeue terminal segments (shutdown announcement)
+                    # Must NOT dequeue arbitrary queued segments (IDs, intros, songs)
+                    segment = self._queue.dequeue()
+                    
+                    if segment is None:
+                        # Queue is empty - wait for terminal DO or terminal audio to be queued
+                        if not self._terminal_do_executed:
+                            # Waiting for terminal DO
+                            logger.debug("[PLAYOUT] DRAINING: Queue empty, waiting for terminal DO...")
+                            time.sleep(0.1)
+                            continue
+                        # Terminal DO executed - check if audio was queued
+                        if self._terminal_audio_queued and not self._terminal_audio_played:
+                            # Terminal audio was queued but not in queue - this shouldn't happen, but wait a bit
+                            logger.debug("[PLAYOUT] DRAINING: Terminal audio queued but not in queue, waiting...")
+                            time.sleep(0.1)
+                            continue
+                        # Terminal DO executed and no audio queued (or already played) - complete
+                        self._terminal_playout_complete = True
+                        logger.info("[PLAYOUT] DRAINING: Terminal playout complete (DO executed, no shutdown announcement in queue)")
+                        break
+                    
+                    # When draining: discard non-terminal segments, only play terminal shutdown announcement
+                    if not segment.is_terminal:
+                        logger.info(f"[PLAYOUT] DRAINING: Discarding non-terminal queued segment - {segment.type} - {segment.path}")
+                        continue
+                    
+                    # Terminal segment found - mark that we're about to play it
+                    self._current_segment_is_terminal = True
+                    # Ensure terminal_audio_queued is set (should already be set when queued, but ensure it)
+                    if not self._terminal_audio_queued:
+                        self._terminal_audio_queued = True
+                        logger.info(f"[PLAYOUT] DRAINING: Terminal audio detected when dequeuing - {segment.path}")
+                    logger.info(f"[PLAYOUT] DRAINING: Dequeued terminal shutdown announcement - {segment.path}")
+                else:
+                    # Not draining - normal dequeuing
+                    segment = self._queue.dequeue()
+                    self._current_segment_is_terminal = False
+                
+                if segment is None:
+                    # Queue is empty, wait a bit before checking again
+                    time.sleep(0.1)
+                    continue
+                
+                # Start the segment (triggers on_segment_started - THINK phase)
+                self.start_segment(segment)
+                
+                # Decode and play the audio segment
+                try:
+                    frame_count = self._play_audio_segment(segment)
+                except Exception as e:
+                    logger.error(f"[PLAYOUT] Error playing segment {segment.path}: {e}", exc_info=True)
+                    # Don't continue to finish_segment if playback failed
+                    continue
+                
+                # Finish the segment (triggers on_segment_finished - DO phase)
+                # finish_segment() will allow terminal DO to execute during DRAINING
+                # Note: finish_segment() will verify the segment is still current, so we can call it directly
+                self.finish_segment(segment)
+                
+                # Per contract PE7.3: Mark terminal segment as played ONLY IF:
+                # 1. segment.is_terminal == True
+                # 2. decoder reached EOF (we're here, so decode finished)
+                # 3. frame_count > 0 (frames were actually decoded and written)
+                # 
+                # Terminal playout completion requires:
+                # - terminal_do_executed (DJ decided to shut down)
+                # - AND (no_terminal_audio_queued OR terminal_audio_played)
+                if self._is_draining and segment.is_terminal and frame_count > 0:
+                    # Terminal shutdown announcement actually played to completion (decoded frames and reached EOF)
+                    self._terminal_audio_played = True
+                    self._terminal_segment_played = True
+                    logger.info(f"[PLAYOUT] Terminal shutdown announcement finished (decoded {frame_count} frames to EOF)")
+                    
+                    # Terminal playout is complete: terminal DO executed AND terminal audio played
+                    if self._terminal_do_executed:
+                        self._terminal_playout_complete = True
+                        logger.info("[PLAYOUT] Terminal playout complete: DO executed and shutdown announcement played to EOF")
+                        break
+                elif self._is_draining and not segment.is_terminal:
+                    # During DRAINING but this wasn't the terminal segment
+                    # This should only happen if we're finishing the current song before shutdown announcement
+                    logger.debug(f"[PLAYOUT] Segment finished during DRAINING (not terminal): {segment.type}")
+                    # Do NOT mark terminal playout complete here - wait for terminal audio to play
+        finally:
+            # Always signal that playout loop has stopped, regardless of how it exited
+            logger.info("Playout loop stopped")
+            self._playout_stopped_event.set()
     
     def _get_tower_buffer_status(self) -> Optional[Dict[str, Any]]:
         """
@@ -523,7 +633,6 @@ class PlayoutEngine:
     
     def _run_prefill_if_needed(
         self,
-        decoder: FFmpegDecoder,
         segment: AudioEvent,
         start_time: float,
         next_frame_time: float,
@@ -536,23 +645,32 @@ class PlayoutEngine:
         Pre-fill behavior:
         - Checks Tower buffer status via /tower/buffer endpoint
         - If buffer ratio < target (e.g., < 0.5), enters pre-fill mode
-        - Decodes and sends frames as fast as possible (no Clock A sleep)
+        - Sends NON-PROGRAM PCM (silence/tone) frames as fast as possible (no Clock A sleep)
         - Monitors buffer fill level periodically
         - Exits when buffer reaches target or timeout elapses
         
         Pre-fill MUST NOT:
+        - Decode program audio (segment file)
+        - Touch the decoder
+        - Advance file position
+        - Emit new_song event
+        - Make program audio audible
         - Change segment timing logic (elapsed = time.monotonic() - segment_start)
         - Reset or manipulate Clock A's internal next_frame_time
         - Introduce any pacing on socket writes (writes remain immediate + non-blocking)
         
+        Pre-fill MUST:
+        - Use fallback PCM (silence/tone) only
+        - Warm Tower buffer without audible program leak
+        - Preserve segment semantics (start from position 0 after pre-fill)
+        
         Args:
-            decoder: FFmpegDecoder instance for decoding frames
-            segment: AudioEvent being played
+            segment: AudioEvent being played (used for logging only, NOT decoded)
             start_time: Segment start time (Clock A baseline, MUST NOT be modified)
             next_frame_time: Clock A's next_frame_time (MUST NOT be modified)
         
         Returns:
-            True if pre-fill was executed (decoder consumed), False if skipped
+            True if pre-fill was executed, False if skipped
         """
         # C8: Pre-fill is optional and implementation-defined
         # Check if pre-fill should run
@@ -585,27 +703,30 @@ class PlayoutEngine:
             logger.debug(f"[PREFILL] Buffer ratio {ratio:.3f} >= target {target_ratio}, skipping pre-fill")
             return False
         
-        # C8: Enter pre-fill mode - decode and send frames as fast as possible
-        # Pre-fill is "front-load the first chunk(s) of the current segment"
-        # NOT "decode the whole thing" - we want to leave most of the segment for normal playback
-        logger.info(f"[PREFILL] Starting pre-fill (buffer ratio {ratio:.3f} < target {target_ratio})")
+        # C8: Enter pre-fill mode - send NON-PROGRAM PCM (silence) frames as fast as possible
+        # Pre-fill MUST NOT decode program audio or touch the decoder
+        # Pre-fill uses fallback PCM (silence/tone) to warm Tower buffer
+        logger.info(f"[PREFILL] Starting pre-fill with silence (buffer ratio {ratio:.3f} < target {target_ratio})")
         prefill_start_time = time.monotonic()
         frame_count = 0
         last_poll_time = prefill_start_time
         
-        # C8: Safety limit - don't pre-fill more than a reasonable chunk of the segment
-        # Pre-fill should be a "front-load" operation, not consume the entire segment
+        # C8: Safety limit - don't pre-fill indefinitely
         # Limit to ~10 seconds of audio (approximately 470 frames at 48kHz)
         max_prefill_frames = int(10.0 * 48000.0 / 1024.0)  # ~470 frames = ~10 seconds
         
+        # Generate silence frame: 1024 samples × 2 channels, int16, all zeros
+        # Format matches decoder output: numpy array shape (1024, 2), dtype int16
+        silence_frame = np.zeros((1024, 2), dtype=np.int16)
+        
         try:
-            for frame in decoder.read_frames():
+            while True:
                 # Check shutdown
                 if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
                     logger.info("[PREFILL] Stopping pre-fill early (shutdown requested)")
                     break
                 
-                # C8: Safety check - don't consume entire segment in pre-fill
+                # C8: Safety check - don't pre-fill indefinitely
                 if frame_count >= max_prefill_frames:
                     logger.info(f"[PREFILL] Pre-fill frame limit ({max_prefill_frames} frames) reached, exiting pre-fill")
                     break
@@ -628,25 +749,26 @@ class PlayoutEngine:
                             break
                     last_poll_time = now
                 
-                # C8: Apply gain and write frame immediately (no sleep, no pacing)
+                # C8: Write silence frame immediately (no sleep, no pacing, no decoder, no program audio)
                 # Pre-fill MUST NOT affect segment timing or Clock A timeline
-                processed_frame = self._mixer.mix(frame, gain=segment.gain)
+                # Pre-fill MUST NOT emit new_song or touch decoder
                 try:
-                    self._output_sink.write(processed_frame)
+                    # Write silence frame directly (no gain applied, no mixer - it's silence)
+                    self._output_sink.write(silence_frame)
                     frame_count += 1
                 except Exception as e:
                     logger.error(f"[PREFILL] Error writing frame: {e}", exc_info=True)
                     # Continue even if write fails (non-blocking behavior)
             
             prefill_duration = time.monotonic() - prefill_start_time
-            logger.info(f"[PREFILL] Pre-fill complete ({frame_count} frames in {prefill_duration:.2f}s)")
-            return True  # Decoder was consumed
+            logger.info(f"[PREFILL] Pre-fill complete ({frame_count} silence frames in {prefill_duration:.2f}s)")
+            return True  # Pre-fill executed
             
         except Exception as e:
             logger.error(f"[PREFILL] Error during pre-fill: {e}", exc_info=True)
-            return True  # Decoder may have been partially consumed
+            return True  # Pre-fill attempted
     
-    def _play_audio_segment(self, segment: AudioEvent) -> None:
+    def _play_audio_segment(self, segment: AudioEvent) -> int:
         """
         Decode and play an audio segment.
         
@@ -667,7 +789,7 @@ class PlayoutEngine:
             duration = self._get_segment_duration(segment)
             logger.debug(f"Simulating playback for {duration:.1f} seconds (no sink)")
             time.sleep(duration)
-            return
+            return 0
         
         # Get expected duration for logging
         expected_duration = self._get_segment_duration(segment)
@@ -681,6 +803,7 @@ class PlayoutEngine:
         FRAME_DURATION = 1024.0 / 48000.0  # ~0.021333 seconds
         next_frame_time = start_time  # Initialize Clock A timeline
         
+        decoder: Optional[FFmpegDecoder] = None
         try:
             # Create decoder for this segment
             # Note: decoder.read_frames() handles cleanup automatically via finally block
@@ -689,25 +812,46 @@ class PlayoutEngine:
             
             # C8: Pre-Fill Stage - build up Tower buffer before normal pacing
             # Pre-fill MUST NOT affect Clock A timeline or segment timing
-            # Pre-fill decodes and sends frames as fast as possible (no sleep)
-            # After pre-fill, normal decode loop continues with Clock A + PID pacing
-            prefill_consumed_decoder = self._run_prefill_if_needed(decoder, segment, start_time, next_frame_time)
+            # Pre-fill uses NON-PROGRAM PCM (silence/tone) only - does NOT decode segment
+            # After pre-fill, normal decode loop starts from position 0 with Clock A + PID pacing
+            prefill_executed = self._run_prefill_if_needed(segment, start_time, next_frame_time)
             
-            # If pre-fill consumed the decoder, recreate it for normal decode loop
-            # (decoder.read_frames() is an iterator that can only be consumed once)
-            if prefill_consumed_decoder:
-                decoder = FFmpegDecoder(segment.path, frame_size=1024)
-                logger.debug(f"[PLAYOUT] Recreated FFmpegDecoder after pre-fill for normal decode loop")
+            # C8: Pre-fill does NOT touch the decoder, so we create it fresh here
+            # Decoder starts from position 0 (beginning of file) after pre-fill completes
+            # This ensures no program audio leak and clean segment semantics
+            # Close the pre-prefill decoder and create the actual decoder
+            if decoder:
+                decoder.close()
+            decoder = FFmpegDecoder(segment.path, frame_size=1024)
+            # Track current decoder for PHASE 2 kill (thread-safe: only accessed from playout thread)
+            self._current_decoder = decoder
+            if prefill_executed:
+                logger.debug(f"[PLAYOUT] FFmpegDecoder created after pre-fill (starting from position 0)")
+            else:
+                logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
             
             # Decode and write frames with Clock A pacing
             # Clock A paces consumption to ensure real-time playback duration
             # Socket writes fire immediately (non-blocking, no pacing on writes)
             for frame in decoder.read_frames():
-                # Per contract SL2.2: Check shutdown_requested in playback loop
-                # Check if we should stop (shutdown or stop event)
-                if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
-                    logger.info(f"[PLAYOUT] Stopping playback early (shutdown={self._shutdown_requested}, stop requested)")
-                    break
+                # During DRAINING: Current segment MUST be atomic - play to completion
+                # Only allowed early-exit reasons: explicit hard stop (PHASE 2) or shutdown timeout safety
+                # DO NOT break for: shutdown_requested, stop_event, or any other reason
+                if self._is_draining:
+                    # DRAINING: Only stop if _is_running is False (explicit hard stop from PHASE 2)
+                    # This is the ONLY allowed early-exit reason during DRAINING
+                    # stop_event and shutdown_requested are IGNORED during DRAINING to allow completion
+                    if not self._is_running:
+                        expected_duration = self._get_segment_duration(segment)
+                        logger.warning(f"[PLAYOUT] Segment ended early during DRAINING: reason=explicit_hard_stop, frames={frame_count}, expected_duration={expected_duration:.1f}s")
+                        break
+                    # Continue decoding - current segment must play to completion during DRAINING
+                else:
+                    # Normal operation: respect shutdown/stop requests
+                    if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
+                        expected_duration = self._get_segment_duration(segment)
+                        logger.info(f"[PLAYOUT] Stopping playback early: reason=normal_shutdown, frames={frame_count}, expected_duration={expected_duration:.1f}s")
+                        break
                 
                 # PE6.5: Periodic buffer status update (non-blocking)
                 # Poll /tower/buffer at configured intervals
@@ -763,7 +907,17 @@ class PlayoutEngine:
                     logger.debug(f"[PLAYOUT] Decoded {frame_count} frames ({actual_elapsed:.1f}s elapsed)")
             
             total_time = time.monotonic() - start_time
-            logger.info(f"[PLAYOUT] Finished decoding {segment.path} ({frame_count} frames, {total_time:.1f}s)")
+            expected_duration = self._get_segment_duration(segment)
+            
+            # Log if segment ended early (before expected duration)
+            if total_time < expected_duration * 0.95:  # Allow 5% tolerance
+                logger.warning(f"[PLAYOUT] Segment ended early: {segment.path} (decoded {frame_count} frames, {total_time:.1f}s, expected {expected_duration:.1f}s)")
+                if self._is_draining:
+                    logger.warning(f"[PLAYOUT] CRITICAL: Segment cut off during DRAINING - this should not happen unless explicit hard stop or timeout")
+            else:
+                logger.info(f"[PLAYOUT] Finished decoding {segment.path} ({frame_count} frames, {total_time:.1f}s, expected {expected_duration:.1f}s)")
+            
+            return frame_count
             
         except FileNotFoundError:
             logger.error(f"[PLAYOUT] Audio file not found: {segment.path}")
@@ -771,6 +925,10 @@ class PlayoutEngine:
         except Exception as e:
             logger.error(f"[PLAYOUT] Error decoding/playing {segment.path}: {e}", exc_info=True)
             raise
+        finally:
+            # Clear decoder reference when segment finishes (decoder.close() is called by read_frames() finally block)
+            if self._current_decoder is decoder:
+                self._current_decoder = None
     
     def run(self) -> None:
         """
@@ -786,6 +944,15 @@ class PlayoutEngine:
         logger.info("Starting playout engine")
         self._is_running = True
         self._stop_event.clear()
+        self._playout_stopped_event.clear()  # Reset stopped event for new run
+        # Reset terminal flags for new run
+        self._terminal_segment_played = False
+        self._terminal_do_executed = False
+        self._terminal_audio_queued = False
+        self._terminal_audio_played = False
+        self._terminal_playout_complete = False
+        self._current_segment_is_terminal = False
+        self._current_decoder = None  # Clear decoder reference on new run
         
         # Start playout loop in background thread
         self._play_thread = threading.Thread(target=self._playout_loop, daemon=True)
@@ -796,6 +963,9 @@ class PlayoutEngine:
         Stop the playout engine gracefully.
         
         Waits for current segment to finish, then stops.
+        
+        Per PHASE 2 requirements: Kills all FFmpeg subprocesses to prevent orphaned processes
+        when systemd uses KillMode=process.
         """
         if not self._is_running:
             return
@@ -804,13 +974,50 @@ class PlayoutEngine:
         self._is_running = False
         self._stop_event.set()
         
-        # Wait for playout thread to finish
+        # PHASE 2: Kill active FFmpeg decoder to ensure no orphaned processes
+        # This is safe because stop() is only called during PHASE 2 (SHUTTING_DOWN)
+        if self._current_decoder is not None:
+            logger.info("[PLAYOUT] PHASE 2: Killing active FFmpeg decoder to prevent orphaned processes")
+            try:
+                self._current_decoder.kill(grace_period_seconds=2.0)
+            except Exception as e:
+                logger.error(f"[PLAYOUT] Error killing FFmpeg decoder during PHASE 2: {e}", exc_info=True)
+            finally:
+                self._current_decoder = None
+        
+        # Wait for playout thread to finish (per SL2.3.3: all threads must join within timeout)
+        # Use longer timeout to allow current segment to finish (matches Station shutdown timeout)
         if self._play_thread and self._play_thread.is_alive():
-            self._play_thread.join(timeout=5.0)
+            # Use a reasonable timeout (60 seconds) to allow long segments to finish
+            # Station.stop() will enforce its own max-wait timeout
+            self._play_thread.join(timeout=60.0)
             if self._play_thread.is_alive():
-                logger.warning("Playout thread did not stop within timeout")
+                logger.warning("Playout thread did not stop within timeout (60s)")
+                # If thread is still alive, try to kill decoder one more time (defensive)
+                if self._current_decoder is not None:
+                    logger.warning("[PLAYOUT] PHASE 2: Thread timeout - attempting to kill decoder again")
+                    try:
+                        self._current_decoder.kill(grace_period_seconds=1.0)
+                    except Exception:
+                        pass
+                    self._current_decoder = None
         
         logger.info("Playout engine stopped")
+    
+    def wait_for_playout_stopped(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait for the playout loop to stop.
+        
+        This provides a reliable signal that the playout loop has finished,
+        regardless of how it exited (normal completion, shutdown, error, etc.).
+        
+        Args:
+            timeout: Maximum time to wait in seconds (None = wait indefinitely)
+        
+        Returns:
+            True if playout stopped within timeout, False if timeout exceeded
+        """
+        return self._playout_stopped_event.wait(timeout=timeout)
     
     def is_playing(self) -> bool:
         """

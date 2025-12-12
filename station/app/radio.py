@@ -55,11 +55,31 @@ def main(args: Optional[list[str]] = None) -> None:
     # Create station instance (includes HTTP streaming if enabled)
     station = Station()
     
-    # Set up signal handlers for graceful shutdown
+    # Track if shutdown has been initiated (per SL2.2.4: idempotent shutdown)
+    shutdown_initiated = False
+    
+    # Set up signal handlers for graceful shutdown (per SL2.1)
     def signal_handler(sig, frame):
-        logger.info("\n[STATION] Received shutdown signal")
-        station.stop()
-        sys.exit(0)
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            logger.debug("[STATION] Shutdown already in progress, ignoring duplicate signal")
+            return
+        
+        shutdown_initiated = True
+        signal_name = "SIGTERM" if sig == signal.SIGTERM else "SIGINT"
+        logger.info(f"\n[STATION] Received {signal_name} signal - initiating graceful shutdown")
+        
+        # Per SL2.1: All shutdown triggers (SIGTERM, SIGINT, stop()) MUST be treated identically
+        # Call station.stop() which implements two-phase shutdown
+        # Note: This is synchronous and will block until shutdown completes
+        try:
+            station.stop()
+            logger.info("[STATION] Shutdown complete, exiting")
+        except Exception as e:
+            logger.error(f"[STATION] Error during shutdown: {e}", exc_info=True)
+        finally:
+            # Force exit even if shutdown had issues
+            sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -68,20 +88,37 @@ def main(args: Optional[list[str]] = None) -> None:
         # Start station (includes HTTP streaming server if enabled)
         station.start()
         
-        # Run continuously until interrupted
+        # Run continuously until interrupted or shutdown
         logger.info("[STATION] Station running. Press Ctrl+C to stop.")
         try:
-            while True:
-                time.sleep(1)
+            while station.running and not shutdown_initiated:
+                time.sleep(0.1)  # Shorter sleep for more responsive shutdown
+            
+            # If shutdown was initiated, exit immediately
+            if shutdown_initiated:
+                logger.debug("[STATION] Shutdown initiated, main loop exiting")
+                return
         except KeyboardInterrupt:
-            logger.info("\n[STATION] Interrupted by user")
+            # This should rarely be hit since signal handler should catch SIGINT
+            # But handle it gracefully if it does
+            logger.info("\n[STATION] Interrupted by user (KeyboardInterrupt)")
+            if not shutdown_initiated:
+                shutdown_initiated = True
+                try:
+                    station.stop()
+                    logger.info("[STATION] Shutdown complete, exiting")
+                except Exception as e:
+                    logger.error(f"[STATION] Error during shutdown: {e}", exc_info=True)
+                finally:
+                    sys.exit(0)
         
     except Exception as e:
         logger.error(f"[STATION] Error: {e}", exc_info=True)
         raise
     finally:
-        # Stop station (saves state, closes connections)
-        station.stop()
+        # Stop station (saves state, closes connections) if not already stopped
+        if not shutdown_initiated:
+            station.stop()
 
 
 if __name__ == "__main__":

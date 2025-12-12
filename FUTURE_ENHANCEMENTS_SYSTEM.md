@@ -36,52 +36,9 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🎯 Next Priority
 
-### Graceful Shutdown with Offline Announcement
+### Centralized Logging with Rotation
 
 **Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
-
-**Current Status:**
-- Station shutdown is immediate when stop() is called
-- No graceful completion of current playback
-- No offline announcement
-
-**Desired Future Behavior:**
-- On shutdown request (SIGTERM, Ctrl+C, or stop() call):
-  - Current segment (song/intro/outro/ID) finishes playing completely
-  - Playout engine stops accepting new segments from queue
-  - DJ optionally generates/selects an offline announcement
-  - Offline announcement plays (e.g., station-specific message like "Appalachia Radio is going offline for maintenance. We'll be back soon!")
-  - After announcement completes, gracefully close all connections and stop
-- Listeners hear a clean end to the stream, not an abrupt cut
-- State is saved after current segment finishes (warm restart possible)
-
-**Benefits:**
-- Professional shutdown experience for listeners
-- Clean state persistence for warm restarts
-- Configurable offline announcements
-- Respects THINK/DO separation
-
-**Implementation Notes:**
-- Shutdown should be a two-phase process:
-  1. **Soft shutdown**: Stop accepting new segments, finish current playback
-  2. **Hard shutdown**: Close connections, save state, exit
-- Offline announcement could be:
-  - Pre-recorded MP3 file (simple)
-  - Dynamically generated via TTS during THINK window (if TTS is available)
-  - Selected from a pool of offline messages
-- Should respect THINK/DO separation:
-  - Shutdown request detected during THINK or DO
-  - Announcement queued during next THINK window
-  - Plays during DO phase
-- Timeout safety: If current segment is very long, allow configurable max wait time
-- HTTP stream connections should remain open until announcement completes
-
----
-
-## 🔧 Stability & Performance
-
-
-### Centralized Logging with Rotation
 
 **Future Goal:** All Retrowaves components should write logs to standardized locations with automatic log rotation.
 
@@ -102,6 +59,10 @@ This wishlist is organized by priority, starting with features that affect **ove
 - Prevents log files from growing unbounded
 - Standardized log locations across all components
 - Better integration with system monitoring tools
+
+---
+
+## 🔧 Stability & Performance
 
 ---
 
@@ -432,6 +393,81 @@ Just for fun.
 ---
 
 ## ✅ Completed Work
+
+### Graceful Shutdown with Offline Announcement
+
+**Status:** ✅ **COMPLETED** - Production-ready implementation
+
+**Implementation Date:** 2024-12-19
+
+#### Purpose
+
+Implement graceful two-phase shutdown that allows current playback to finish, plays a shutdown announcement, and ensures clean termination of all subprocesses even when systemd uses KillMode=process.
+
+#### What Was Implemented
+
+✅ **Two-Phase Shutdown Protocol** (`station/app/station.py`):
+- **PHASE 1 (DRAINING)**: Soft shutdown - current segment finishes, terminal THINK/DO allowed
+  - Station enters DRAINING state immediately on shutdown request (SIGTERM, SIGINT, or stop() call)
+  - Current segment (song/intro/outro/ID) finishes playing completely
+  - Playout engine stops accepting new segments from queue
+  - DJ generates/selects shutdown announcement during terminal THINK
+  - Shutdown announcement plays to completion
+  - `station_shutting_down` event sent to Tower AFTER announcement finishes (not immediately)
+- **PHASE 2 (SHUTTING_DOWN)**: Hard shutdown - state persistence, audio components close
+  - All FFmpeg subprocesses are forcefully terminated (process group kill)
+  - State is saved (warm restart possible)
+  - All connections closed cleanly
+  - Station exits
+
+✅ **FFmpeg Process Isolation** (`station/broadcast_core/ffmpeg_decoder.py`):
+- FFmpeg subprocesses spawned with `preexec_fn=os.setsid` to isolate from Ctrl-C (SIGINT)
+- FFmpeg continues decoding during PHASE 1 even when parent receives SIGINT
+- Songs and shutdown announcements play to completion without interruption
+
+✅ **FFmpeg Termination During PHASE 2** (`station/broadcast_core/ffmpeg_decoder.py`, `station/broadcast_core/playout_engine.py`):
+- `FFmpegDecoder.kill()` method: Graceful termination with SIGTERM, then SIGKILL if needed
+- Process group termination via `os.killpg()` to ensure no orphaned processes
+- PlayoutEngine tracks active decoder and calls `kill()` during PHASE 2
+- Idempotent and safe to call multiple times
+- Clear logging at each step for observability
+
+✅ **Shutdown Announcement Support**:
+- DJEngine generates terminal intent with shutdown announcement during DRAINING
+- Announcement selected from `station_shutting_down/` directory pool
+- Plays as standard AudioEvent after current song finishes
+- Respects THINK/DO separation (announcement queued during THINK, plays during DO)
+
+✅ **Event Timing**:
+- `station_shutting_down` event sent to Tower only AFTER shutdown announcement finishes
+- Ensures listeners hear complete shutdown sequence before event notification
+- Event sent in timeout/error cases as fallback to guarantee delivery
+
+✅ **Safety Features**:
+- Timeout safety: Configurable max wait time (default 5 minutes) for long segments
+- Process group termination ensures no orphaned FFmpeg processes remain
+- Graceful first (SIGTERM), forceful if needed (SIGKILL after timeout)
+- Clean state persistence for warm restarts
+
+**Files Modified:**
+- `station/app/station.py` - Two-phase shutdown protocol, event timing
+- `station/broadcast_core/ffmpeg_decoder.py` - Process isolation, kill() method
+- `station/broadcast_core/playout_engine.py` - Decoder tracking, PHASE 2 termination
+- `station/dj_logic/dj_engine.py` - Terminal intent generation for shutdown announcement
+
+**Contract Compliance:**
+- SL2.1: Shutdown triggers (SIGTERM, SIGINT, stop())
+- SL2.2: PHASE 1 DRAINING behavior (current segment finishes, terminal THINK/DO)
+- SL2.3: PHASE 2 SHUTTING_DOWN behavior (state persistence, clean audio exit)
+- T-EVENTS1: `station_shutting_down` event sent exactly once, after announcement
+
+**Validation:**
+- `systemctl stop` during long song: Song finishes → Shutdown announcement plays → Station exits cleanly
+- Ctrl-C during playback: Song finishes → Shutdown announcement plays → Clean exit
+- No orphaned FFmpeg processes remain after shutdown
+- Journal logs clearly show FFmpeg termination during PHASE 2
+
+---
 
 ### Pre-Fill Stage for Tower Buffer
 

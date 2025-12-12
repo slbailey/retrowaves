@@ -12,12 +12,13 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 
 **DJIntent** **MUST** contain:
 
-- **`next_song`**: `AudioEvent` (required) — The next song to play
-  - **MUST** include MP3 metadata in `AudioEvent.metadata` field (title, artist, album, duration)
+- **`next_song`**: `AudioEvent?` (required for normal intents, optional for terminal intents) — The next song to play
+  - **MUST** include MP3 metadata in `AudioEvent.metadata` field (title, artist, album, duration) when present
   - Metadata **MUST** be collected during THINK phase and stored with the intent
+  - **MAY** be `None` for terminal intents (per INT2.4)
 - **`outro`**: `AudioEvent?` (optional) — Outro clip for current song
 - **`station_ids`**: `list[AudioEvent]` — List of station identification clips (0..N)
-- **`intro`**: `AudioEvent?` (optional) — Intro clip for next song
+- **`intro`**: `AudioEvent?` (optional) — Intro clip for next song (or shutdown announcement for terminal intents)
 - **`has_legal_id`**: `bool` — Whether any ID in `station_ids` is a legal ID
 
 ---
@@ -48,6 +49,22 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 - DO phase receives intent and executes it
 - Intent is not reused for subsequent segments
 - Each segment gets a new intent from THINK
+
+### INT2.4 — Terminal Intent
+
+**DJIntent MAY be marked as TERMINAL to signal end-of-stream.**
+
+- DJIntent **MAY** represent a terminal lifecycle intent
+- Terminal intent **MUST** be consumed exactly once (same as normal intent)
+- Terminal intent **MUST** produce no follow-up THINK cycle
+- Terminal intent **MUST** signal end-of-stream after execution
+- Terminal intent **MAY** contain only terminal AudioEvents (e.g., shutdown announcement)
+- Terminal intent **MAY** contain no AudioEvents if no shutdown announcement is available
+- Terminal intent structure **MUST** remain backward compatible with existing DJIntent structure
+- No new intent types or classes **MAY** be introduced
+- Terminal intent **MUST** contain standard AudioEvent(s) only (per AudioEvent Contract)
+- The `is_terminal` flag is a semantic marker indicating end-of-stream behavior, not a structural change to DJIntent
+- After terminal intent execution, the system **MUST** transition to SHUTTING_DOWN state (per StationLifecycle Contract)
 
 ---
 

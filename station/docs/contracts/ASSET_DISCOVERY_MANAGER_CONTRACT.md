@@ -26,6 +26,8 @@ Defines discovery, indexing, and safety for all audio assets (songs, IDs, intros
 - **`ids/`**: Station identification clips
 - **`talk/`**: Talk segments (if applicable)
 - **`music/`** or root: Main music library
+- **`station_starting_up/`**: Startup announcement pool
+- **`station_shutting_down/`**: Shutdown announcement pool
 
 ---
 
@@ -55,6 +57,18 @@ Defines discovery, indexing, and safety for all audio assets (songs, IDs, intros
 - Scans run in background threads
 - Cache updates are atomic and non-blocking
 - DJEngine always reads from cache (never waits for scan)
+
+### ADM2.4 — Lifecycle Announcement Pools
+
+**MUST** scan and cache lifecycle announcement directories.
+
+- **`station_starting_up/`** directory **MUST** be scanned and cached as startup announcement pool
+- **`station_shutting_down/`** directory **MUST** be scanned and cached as shutdown announcement pool
+- Assets **MUST** be scanned, cached, and validated like all other assets
+- Cached lists **MUST** be available during THINK phase
+- Empty directories are valid (no announcements available)
+- No blocking I/O **MAY** occur during THINK
+- No random selection occurs in AssetDiscoveryManager (selection belongs to DJEngine)
 
 ---
 

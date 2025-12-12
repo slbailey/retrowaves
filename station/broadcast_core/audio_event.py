@@ -26,9 +26,11 @@ class AudioEvent:
         type: Type of audio segment
         gain: Gain multiplier for audio level (default 1.0)
         metadata: Optional MP3 metadata (title, artist, duration) extracted during THINK phase
+        is_terminal: True if this is a terminal segment (e.g., shutdown announcement) during draining
     """
     path: str
-    type: Literal["song", "intro", "outro", "talk", "id"]
+    type: Literal["song", "intro", "outro", "talk", "id", "announcement"]
     gain: float = 1.0
     metadata: Optional[Dict[str, Any]] = field(default=None)
+    is_terminal: bool = False
 

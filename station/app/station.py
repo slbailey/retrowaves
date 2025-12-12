@@ -57,6 +57,10 @@ class Station:
         self.running = False
         self._shutdown_initiated = False
         
+        # Lifecycle state machine (per SL2.2.3)
+        # States: RUNNING, DRAINING, SHUTTING_DOWN
+        self._lifecycle_state_enum = "RUNNING"  # Initial state
+        
         # Lifecycle state tracking per contract T-EVENTS1
         # Per contract: Lifecycle events MUST be sent exactly once
         # Station MUST track whether lifecycle events have been sent to prevent duplicates
@@ -64,6 +68,10 @@ class Station:
             "station_starting_up": False,
             "station_shutting_down": False
         }
+        
+        # Max-wait timeout for long segments (per SL2.2.5)
+        self._shutdown_timeout_seconds = 300.0  # 5 minutes default
+        self._shutdown_start_time: Optional[float] = None
     
     def start(self):
         """
@@ -154,6 +162,10 @@ class Station:
         self.dj.set_playout_engine(self.engine)
         logger.info("PlayoutEngine initialized")
         
+        # SL1.3: Set startup flag for initial THINK (may select startup announcement)
+        # Per SL1.3: Startup announcement is selected during initial THINK phase
+        self.dj.set_lifecycle_state(is_startup=True, is_draining=False)
+        
         # SL1.2: Select first song BEFORE playout begins
         # This ensures first song is selected during startup, not during first THINK phase
         # Per SL1.2: First song selection occurs during startup, not during first THINK phase
@@ -162,16 +174,35 @@ class Station:
         if not first_song:
             raise RuntimeError("Failed to select first song: no tracks available")
         logger.info(f"First song selected: {first_song}")
-        
-        # SL1.3: Queue first song BEFORE starting playout
-        # Per SL1.3: No THINK event MAY occur before the first segment begins
-        # By queuing the first song before starting playout, we ensure:
-        # 1. First song is ready when playout starts
-        # 2. THINK will only be triggered when the first segment actually begins (after startup completes)
-        # 3. Startup is complete before any THINK events occur
-        # Extract metadata for first song during startup (since it doesn't go through THINK phase)
         first_song_metadata = _get_mp3_metadata(first_song)
         first_audio_event = AudioEvent(first_song, "song", metadata=first_song_metadata)
+        
+        # SL1.3: Trigger initial THINK to select startup announcement (if available)
+        # Per SL1.3: Startup announcement is selected during initial THINK phase
+        # We trigger THINK by calling on_segment_started with a dummy segment
+        # This allows DJEngine to select startup announcement during THINK
+        dummy_segment = AudioEvent(first_song, "song", metadata=first_song_metadata)
+        self.dj.on_segment_started(dummy_segment)
+        
+        # Check if startup announcement was selected
+        startup_queue = []
+        if self.dj.current_intent and self.dj.current_intent.next_song and self.dj.current_intent.next_song.type == "announcement":
+            # Startup announcement was selected, queue it directly
+            startup_announcement = self.dj.current_intent.next_song
+            startup_queue.append(startup_announcement)
+            logger.info(f"[LIFECYCLE] Startup announcement selected: {startup_announcement.path}")
+            # Clear intent so first song THINK can run when announcement starts
+            self.dj.current_intent = None
+        else:
+            logger.info("[LIFECYCLE] Startup announcement skipped (pool empty or not selected)")
+        
+        # Queue startup announcement (if selected) and first song
+        # Per SL1.4: If startup announcement exists, first song THINK occurs after startup announcement starts
+        if startup_queue:
+            self.engine.queue_audio(startup_queue)
+            logger.info("Startup announcement queued for playout")
+        # Always queue first song (it will play after startup announcement if present)
+        # When startup announcement starts, THINK will run to prepare intent for after first song
         self.engine.queue_audio([first_audio_event])
         logger.info("First song queued for playout")
         
@@ -198,7 +229,11 @@ class Station:
         self.engine.run()  # This starts the playout loop in a background thread
         logger.info("Playout engine started (startup complete, playout running in background)")
         
+        # Update lifecycle state to RUNNING
+        previous_state = self._lifecycle_state_enum
+        self._lifecycle_state_enum = "RUNNING"
         self.running = True
+        logger.info(f"[LIFECYCLE] State transition: {previous_state} → RUNNING")
         logger.info("=== Station started successfully ===")
     
     def run_forever(self):
@@ -216,11 +251,11 @@ class Station:
     
     def stop(self):
         """
-        Stop Station gracefully per contracts.
+        Stop Station gracefully per contracts (two-phase shutdown).
         
-        Per SL2.1: All DJ/rotation state MUST be saved.
-        Per SL2.2: No THINK or DO events MAY fire after shutdown begins.
-        Per SL2.3: All audio components MUST exit cleanly.
+        Per SL2.1: Shutdown triggers (SIGTERM, SIGINT, stop()) all enter DRAINING
+        Per SL2.2: PHASE 1 - Soft Shutdown (DRAINING): Current segment finishes, terminal THINK/DO allowed
+        Per SL2.3: PHASE 2 - Hard Shutdown (SHUTTING_DOWN): State persistence, audio components close
         Per T-EVENTS1: station_shutting_down event MUST be sent exactly once.
         """
         if self._shutdown_initiated:
@@ -229,43 +264,140 @@ class Station:
         
         logger.info("=== Station shutting down ===")
         self._shutdown_initiated = True
+        
+        # SL2.2.1: PHASE 1 - Enter DRAINING state immediately
+        previous_state = self._lifecycle_state_enum
+        logger.info("[SHUTDOWN] PHASE 1: Entering DRAINING state")
+        self._lifecycle_state_enum = "DRAINING"
+        logger.info(f"[LIFECYCLE] State transition: {previous_state} → DRAINING")
+        self._shutdown_start_time = time.monotonic()
+        
+        # Set draining state in DJEngine and PlayoutEngine
+        if self.dj:
+            self.dj.set_lifecycle_state(is_startup=False, is_draining=True)
+        if self.engine:
+            self.engine.set_draining(True)
+        
+        # SL2.2.1: Current segment MUST be allowed to finish
+        # SL2.2.2: DJ THINK MAY run one final time to prepare terminal intent
+        # SL2.2.5: Wait for current segment to finish (with timeout)
+        # PHASE 1 (DRAINING) is a true soft shutdown - MUST NOT interrupt playback
+        # MUST NOT call: engine.request_shutdown(), engine.stop(), sink.close(), stop_event.set()
+        logger.info("[SHUTDOWN] PHASE 1: Waiting for terminal playout to complete (soft shutdown - playback continues)...")
+        if self.engine:
+            # Wait for terminal playout to complete (terminal DO executed AND terminal segment finished if any)
+            # This is the definitive signal, not thread liveness
+            max_wait = self._shutdown_timeout_seconds
+            start_wait = time.monotonic()
+            logger.info(f"[SHUTDOWN] PHASE 1: Waiting for terminal playout to complete (timeout: {max_wait}s)...")
+            
+            while not self.engine._terminal_playout_complete and (time.monotonic() - start_wait) < max_wait:
+                time.sleep(0.1)
+            
+            # Check if terminal playout completed
+            if self.engine._terminal_playout_complete:
+                logger.info("[SHUTDOWN] PHASE 1: Terminal playout complete - current song finished, shutdown announcement played (if any)")
+                
+                # Per T-EVENTS1: Send station_shutting_down event to Tower AFTER shutdown announcement finishes (only once)
+                # This event MUST be sent after terminal playout completes, not when shutdown is initiated
+                if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+                    try:
+                        success = self.tower_control.send_event(
+                            event_type="station_shutting_down",
+                            timestamp=time.monotonic(),
+                            metadata={}
+                        )
+                        if success:
+                            self._lifecycle_state["station_shutting_down"] = True
+                            logger.info("Sent station_shutting_down event to Tower (after shutdown announcement finished)")
+                        else:
+                            logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                    except Exception as e:
+                        logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
+                elif self._lifecycle_state["station_shutting_down"]:
+                    logger.debug("station_shutting_down event already sent, skipping duplicate")
+                elif not self.tower_control:
+                    logger.warning("Tower control client not available, cannot send station_shutting_down event")
+                
+                logger.info("[SHUTDOWN] PHASE 1: Transitioning to PHASE 2 (hard shutdown)")
+            else:
+                # Check if playout thread has already stopped (might have exited early)
+                thread_stopped = (self.engine._play_thread is None or not self.engine._play_thread.is_alive())
+                if thread_stopped:
+                    logger.warning(f"[SHUTDOWN] PHASE 1: Playout thread stopped but terminal playout not complete, forcing transition to PHASE 2")
+                else:
+                    logger.warning(f"[SHUTDOWN] PHASE 1: Timeout ({max_wait}s) exceeded waiting for terminal playout, forcing transition to PHASE 2")
+                
+                # Per T-EVENTS1: Send station_shutting_down event even if terminal playout didn't complete normally
+                # This ensures the event is always sent, even in timeout/error cases
+                if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+                    try:
+                        success = self.tower_control.send_event(
+                            event_type="station_shutting_down",
+                            timestamp=time.monotonic(),
+                            metadata={}
+                        )
+                        if success:
+                            self._lifecycle_state["station_shutting_down"] = True
+                            logger.info("Sent station_shutting_down event to Tower (timeout/error case)")
+                        else:
+                            logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                    except Exception as e:
+                        logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
+                elif self._lifecycle_state["station_shutting_down"]:
+                    logger.debug("station_shutting_down event already sent, skipping duplicate")
+                elif not self.tower_control:
+                    logger.warning("Tower control client not available, cannot send station_shutting_down event")
+        else:
+            # Engine is None - send event immediately since there's no playout to wait for
+            if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+                try:
+                    success = self.tower_control.send_event(
+                        event_type="station_shutting_down",
+                        timestamp=time.monotonic(),
+                        metadata={}
+                    )
+                    if success:
+                        self._lifecycle_state["station_shutting_down"] = True
+                        logger.info("Sent station_shutting_down event to Tower (no engine)")
+                    else:
+                        logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                except Exception as e:
+                    logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
+            elif self._lifecycle_state["station_shutting_down"]:
+                logger.debug("station_shutting_down event already sent, skipping duplicate")
+            elif not self.tower_control:
+                logger.warning("Tower control client not available, cannot send station_shutting_down event")
+        
+        # SL2.3: PHASE 2 - Enter SHUTTING_DOWN state
+        previous_state = self._lifecycle_state_enum
+        logger.info("[SHUTDOWN] PHASE 2: Entering SHUTTING_DOWN state")
+        self._lifecycle_state_enum = "SHUTTING_DOWN"
+        logger.info(f"[LIFECYCLE] State transition: {previous_state} → SHUTTING_DOWN")
         self.running = False
         
-        # Per T-EVENTS1: Send station_shutting_down event to Tower (only once)
-        if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
-            try:
-                success = self.tower_control.send_event(
-                    event_type="station_shutting_down",
-                    timestamp=time.monotonic(),
-                    metadata={}
-                )
-                if success:
-                    self._lifecycle_state["station_shutting_down"] = True
-                    logger.info("Sent station_shutting_down event to Tower")
-                else:
-                    logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
-            except Exception as e:
-                logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
-        elif self._lifecycle_state["station_shutting_down"]:
-            logger.debug("station_shutting_down event already sent, skipping duplicate")
-        elif not self.tower_control:
-            logger.warning("Tower control client not available, cannot send station_shutting_down event")
-        
-        # SL2.2: Prevent new THINK/DO cycles
-        # Per SL2.2: No THINK or DO events MAY fire after shutdown begins
-        # First request shutdown (prevents callbacks in playout thread)
-        # Then set callback to None (additional safety for race conditions)
+        # SL2.3.2: No THINK or DO events MAY fire after SHUTTING_DOWN begins
         if self.engine:
-            self.engine.request_shutdown()  # Set shutdown flag before modifying callback
-            self.engine.set_dj_callback(None)  # Additional safety: clear callback reference
+            self.engine.set_dj_callback(None)  # Clear callback reference
         
-        # SL2.3: Stop playout engine cleanly (waits for current segment to finish)
+        # SL2.3.3: Stop playout engine cleanly
+        # CRITICAL: Only call engine.stop() AFTER terminal_playout_complete is True
+        # engine.stop() sets stop_event which would cut audio if called too early
         if self.engine:
-            logger.info("Stopping playout engine...")
+            # Verify terminal playout is complete before stopping
+            if not self.engine._terminal_playout_complete:
+                logger.warning("[SHUTDOWN] PHASE 2: Terminal playout not complete, waiting...")
+                # Wait a bit more for terminal playout to complete
+                max_wait = 5.0
+                start_wait = time.monotonic()
+                while not self.engine._terminal_playout_complete and (time.monotonic() - start_wait) < max_wait:
+                    time.sleep(0.1)
+            
+            logger.info("[SHUTDOWN] PHASE 2: Terminal playout confirmed complete, stopping playout engine...")
             self.engine.stop()
-            logger.info("Playout engine stopped")
+            logger.info("[SHUTDOWN] PHASE 2: Playout engine stopped")
         
-        # SL2.1: Save DJ state before shutdown
+        # SL2.3.1: State persistence occurs ONLY in SHUTTING_DOWN phase
         if self.dj and self.state_store:
             try:
                 logger.info("Saving DJ state...")
@@ -275,11 +407,13 @@ class Station:
             except Exception as e:
                 logger.error(f"Failed to save DJ state: {e}", exc_info=True)
         
-        # SL2.3: Close Tower PCM sink connection
+        # SL2.3.3: Close Tower PCM sink connection
+        # CRITICAL: Only close sink AFTER terminal playout completes and engine is stopped
+        # Closing sink would cut audio if called too early
         if self.sink:
-            logger.info("Closing Tower PCM sink...")
+            logger.info("[SHUTDOWN] PHASE 2: Terminal playout complete and engine stopped, closing Tower PCM sink...")
             self.sink.close()
-            logger.info("Tower PCM sink closed")
+            logger.info("[SHUTDOWN] PHASE 2: Tower PCM sink closed (audio output terminated)")
         
         logger.info("=== Station stopped ===")
     

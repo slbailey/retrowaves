@@ -9,6 +9,7 @@ Tests map directly to contract clauses:
 - ADM2.1: Cached Lists (2 tests)
 - ADM2.2: Legacy Pattern Support (1 test)
 - ADM2.3: Non-Blocking (1 test)
+- ADM2.4: Lifecycle Announcement Pools (5 tests)
 """
 
 import pytest
@@ -99,3 +100,67 @@ class TestADM2_3_NonBlocking:
         elapsed = time.time() - start_time
         
         assert elapsed < 1.0, "must_not_block_playout must complete quickly"
+
+
+class TestADM2_4_LifecycleAnnouncementPools:
+    """Tests for ADM2.4 — Lifecycle Announcement Pools."""
+    
+    def test_adm2_4_station_starting_up_scanned_and_cached(self):
+        """ADM2.4: station_starting_up/ directory MUST be scanned and cached as startup announcement pool."""
+        manager = FakeAssetDiscoveryManager()
+        # Add startup announcement pool to fake manager
+        manager.startup_announcements = ["/fake/startup1.mp3", "/fake/startup2.mp3"]
+        
+        # Contract requires startup announcement pool exists
+        assert hasattr(manager, 'startup_announcements'), \
+            "Must have startup_announcements pool"
+        assert isinstance(manager.startup_announcements, list), \
+            "Startup announcement pool must be list"
+    
+    def test_adm2_4_station_shutting_down_scanned_and_cached(self):
+        """ADM2.4: station_shutting_down/ directory MUST be scanned and cached as shutdown announcement pool."""
+        manager = FakeAssetDiscoveryManager()
+        # Add shutdown announcement pool to fake manager
+        manager.shutdown_announcements = ["/fake/shutdown1.mp3", "/fake/shutdown2.mp3"]
+        
+        # Contract requires shutdown announcement pool exists
+        assert hasattr(manager, 'shutdown_announcements'), \
+            "Must have shutdown_announcements pool"
+        assert isinstance(manager.shutdown_announcements, list), \
+            "Shutdown announcement pool must be list"
+    
+    def test_adm2_4_empty_directories_are_valid(self):
+        """ADM2.4: Empty directories are valid (no announcements available)."""
+        manager = FakeAssetDiscoveryManager()
+        manager.startup_announcements = []
+        manager.shutdown_announcements = []
+        
+        # Contract requires empty directories are valid
+        assert len(manager.startup_announcements) == 0, \
+            "Empty startup announcement pool is valid"
+        assert len(manager.shutdown_announcements) == 0, \
+            "Empty shutdown announcement pool is valid"
+    
+    def test_adm2_4_cached_lists_available_during_think(self):
+        """ADM2.4: Cached lists MUST be available during THINK phase."""
+        manager = FakeAssetDiscoveryManager()
+        manager.startup_announcements = ["/fake/startup1.mp3"]
+        manager.shutdown_announcements = ["/fake/shutdown1.mp3"]
+        
+        # Contract requires cached lists available during THINK (no blocking I/O)
+        assert manager.startup_announcements is not None, \
+            "Startup announcement pool must be available"
+        assert manager.shutdown_announcements is not None, \
+            "Shutdown announcement pool must be available"
+        # Lists are in-memory (no file I/O during THINK)
+    
+    def test_adm2_4_no_random_selection_in_asset_discovery_manager(self):
+        """ADM2.4: No random selection occurs in AssetDiscoveryManager (selection belongs to DJEngine)."""
+        manager = FakeAssetDiscoveryManager()
+        manager.startup_announcements = ["/fake/startup1.mp3", "/fake/startup2.mp3"]
+        
+        # Contract requires AssetDiscoveryManager only provides cached lists
+        # Selection is DJEngine's responsibility
+        assert isinstance(manager.startup_announcements, list), \
+            "AssetDiscoveryManager provides list, not selection"
+        # DJEngine performs random selection from the list

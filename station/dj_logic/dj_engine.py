@@ -103,6 +103,13 @@ class DJEngine:
         # Phase 9: Asset Discovery Manager for intros/outros
         self.asset_manager = AssetDiscoveryManager(self.dj_asset_path)
         
+        # Lifecycle state (set by Station, observed during THINK)
+        self._is_startup = False  # True during initial startup THINK
+        self._is_draining = False  # True when Station is in DRAINING state
+        
+        # Invariant: Terminal intent may only be queued once per lifecycle
+        self._terminal_intent_queued = False  # Tracks if terminal intent has been queued
+        
         logger.info("DJ Engine initialized (Phase 6)")
     
     def set_playout_engine(self, playout_engine: PlayoutEngine) -> None:
@@ -122,6 +129,19 @@ class DJEngine:
             rotation_manager: RotationManager instance for song selection
         """
         self.rotation_manager = rotation_manager
+    
+    def set_lifecycle_state(self, is_startup: bool = False, is_draining: bool = False) -> None:
+        """
+        Set lifecycle state (called by Station).
+        
+        Per E1.2: THINK may observe lifecycle state.
+        
+        Args:
+            is_startup: True during initial startup THINK
+            is_draining: True when Station is in DRAINING state
+        """
+        self._is_startup = is_startup
+        self._is_draining = is_draining
     
     def on_station_start(self) -> None:
         """
@@ -152,14 +172,69 @@ class DJEngine:
         Args:
             segment: The AudioEvent that just started playing
         """
+        logger.info(f"[DJ] THINK Phase: Segment started - {segment.type} - {segment.path}")
+        
+        # Check for shutdown state (per DJ2.5, E1.2)
+        if self._is_draining:
+            # Shutdown THINK: Select shutdown announcement if available, produce terminal intent
+            # CRITICAL: Only create terminal intent if one doesn't already exist
+            # Prevent duplicate terminal intent creation (e.g., when shutdown announcement segment starts)
+            if self._terminal_intent_queued:
+                # Terminal intent already created and queued - do not create another
+                logger.debug("[DJ] THINK: Terminal intent already queued, skipping duplicate creation")
+                return
+            
+            # Check if terminal intent already exists (but not yet queued)
+            if self.current_intent and self.current_intent.is_terminal:
+                logger.debug("[DJ] THINK: Terminal intent already exists, skipping duplicate creation")
+                return
+            
+            logger.info("[DJ] THINK: Shutdown detected, preparing terminal intent...")
+            self._handle_shutdown_think()
+            return
+        
+        # Check for startup announcement (per DJ2.4, SL1.3)
+        if self._is_startup:
+            # Startup THINK: May select startup announcement
+            startup_announcement = self._select_startup_announcement()
+            if startup_announcement:
+                # Create intent with only startup announcement (no next_song yet)
+                self.current_intent = DJIntent(
+                    next_song=startup_announcement,
+                    is_terminal=False
+                )
+                logger.info(f"[DJ] THINK: Selected startup announcement - {startup_announcement.path}")
+                # Reset startup flag after first THINK
+                self._is_startup = False
+                return
+        
         # Radio Industry Best Practice: Only SONGS trigger DJ THINK/DO.
         # IDs, intros, outros, and imaging do NOT trigger breaks.
+        # Exception: Startup announcements trigger THINK for first song (per SL1.4)
         # This ensures one break per song and prevents infinite queue growth.
-        if segment.type != "song":
+        if segment.type != "song" and segment.type != "announcement":
             logger.debug(f"[DJ] Skipping THINK for non-song segment: {segment.type} - {segment.path}")
             return  # skip THINK/DO
         
-        logger.info(f"[DJ] THINK Phase: Segment started - {segment.type} - {segment.path}")
+        # Special case: Startup announcement triggers THINK for first song (per SL1.4)
+        # When startup announcement starts, we need to prepare intent for after first song
+        if segment.type == "announcement":
+            # This could be startup or shutdown announcement
+            # If it's startup announcement, prepare intent for first song
+            # If it's shutdown announcement, it's already handled by terminal intent
+            if not self._is_draining:
+                # Startup announcement - prepare first song intent
+                logger.info("[DJ] THINK: Startup announcement started, preparing first song intent")
+                self._is_startup = False  # Reset flag
+                # Continue to normal THINK logic below to select first song
+            else:
+                # Shutdown announcement - terminal intent should already exist
+                # Do NOT create another terminal intent - prevent duplicate
+                if self._terminal_intent_queued or (self.current_intent and self.current_intent.is_terminal):
+                    logger.debug("[DJ] THINK: Shutdown announcement started, terminal intent already exists - skipping")
+                else:
+                    logger.warning("[DJ] THINK: Shutdown announcement started but no terminal intent exists - this should not happen")
+                return
         
         # Phase 9: Maybe rescan assets (only once per hour, non-blocking)
         self.asset_manager.maybe_rescan()
@@ -289,23 +364,64 @@ class DJEngine:
         Args:
             segment: The AudioEvent that just finished playing
         """
-        # Radio Industry Best Practice: Only SONGS trigger DJ THINK/DO.
-        # IDs, intros, outros, and imaging do NOT trigger breaks.
-        # This ensures one break per song and prevents infinite queue growth.
-        if segment.type != "song":
+        # Handle terminal intents (per INT2.4, E1.3)
+        # Terminal intents may be triggered by non-song segments (e.g., shutdown announcement)
+        is_terminal = False
+        if self.current_intent and self.current_intent.is_terminal:
+            is_terminal = True
+            logger.info("[DJ] DO Phase: Executing terminal intent (end-of-stream)")
+        elif segment.type != "song" and segment.type != "announcement":
+            # Radio Industry Best Practice: Only SONGS trigger DJ THINK/DO.
+            # IDs, intros, outros, and imaging do NOT trigger breaks.
+            # Exception: Announcement segments (startup/shutdown) may trigger DO
             logger.debug(f"[DJ] Skipping DO for non-song segment: {segment.type} - {segment.path}")
             return  # skip THINK/DO
         
+        # Special case: Startup announcement DO - no state updates needed, just continue
+        if segment.type == "announcement" and not is_terminal:
+            logger.info("[DJ] DO: Startup announcement finished, first song will play next")
+            # Don't record as song played, don't update rotation
+            # Just continue to queue next items if intent exists
+        
         logger.info(f"[DJ] DO Phase: Segment finished - {segment.type} - {segment.path}")
         
+        # During DRAINING: The first DO callback after entering DRAINING is the last chance to generate shutdown announcement
+        # If no terminal intent exists, create one now and execute terminal DO immediately
+        if self._is_draining:
+            # Check if terminal intent already exists
+            terminal_intent_exists = (self.current_intent and self.current_intent.is_terminal)
+            
+            if not terminal_intent_exists:
+                # No terminal intent exists - create one now and execute terminal DO immediately
+                logger.info("[DJ] DO: DRAINING state - no terminal intent exists, creating one now")
+                self._handle_shutdown_think()
+                # After creating terminal intent, check if it was created
+                if self.current_intent and self.current_intent.is_terminal:
+                    is_terminal = True
+                    logger.info("[DJ] DO: Terminal intent created, executing terminal DO immediately")
+                    # Continue to execute terminal DO below (don't return yet)
+                else:
+                    logger.error("[DJ] DO: Failed to create terminal intent during draining!")
+                    return
+            elif not is_terminal:
+                # Terminal intent exists but current segment is not terminal - this shouldn't happen
+                # but guard against it: skip normal intent processing during draining
+                logger.warning("[DJ] DO: DRAINING state - normal intent detected during draining, skipping")
+                if self.current_intent:
+                    logger.warning(f"[DJ] DO: Ignoring normal intent during draining: {self.current_intent}")
+                    self.current_intent = None  # Clear the intent to prevent leakage
+                return  # Skip normal DO processing during draining
+        
         # Record that this segment was played (state update, not a decision)
-        self._record_song_played(segment.path)
-        # Update rotation manager history as well
-        if self.rotation_manager:
-            try:
-                self.rotation_manager.record_song_played(segment.path)
-            except Exception as e:
-                logger.warning(f"[DJ] Failed to record play in RotationManager: {e}")
+        # Skip for terminal intents (no state updates needed)
+        if not is_terminal:
+            self._record_song_played(segment.path)
+            # Update rotation manager history as well
+            if self.rotation_manager:
+                try:
+                    self.rotation_manager.record_song_played(segment.path)
+                except Exception as e:
+                    logger.warning(f"[DJ] Failed to record play in RotationManager: {e}")
         
         # 1. Retrieve current DJIntent (must exist - THINK always creates one)
         if not self.current_intent:
@@ -314,32 +430,69 @@ class DJEngine:
             return
         
         # 2. Push AudioEvents to playout queue in order:
-        # [outro?] → [station_id(s)?] → [intro?] → [next_song]
+        # For normal intents: [outro?] → [station_id(s)?] → [intro?] → [next_song]
+        # For terminal intents: [shutdown_announcement?] (in intro field, no next_song)
         # Files were validated in THINK phase, so just execute here
         queue_order: list[AudioEvent] = []
         
-        if self.current_intent.outro:
-            queue_order.append(self.current_intent.outro)
-            logger.info(f"[DJ] DO: Queueing outro - {self.current_intent.outro.path}")
+        if is_terminal:
+            # Invariant assertion: Terminal intent may only be queued once per lifecycle
+            if self._terminal_intent_queued:
+                logger.error("[DJ] DO: CRITICAL - Terminal intent already queued! This should never happen.")
+                raise RuntimeError("Terminal intent may only be queued once per lifecycle")
+            
+            # Terminal intent: Only queue shutdown announcement if present (per INT2.4)
+            # Shutdown announcement is stored in intro field for terminal intents
+            if self.current_intent.intro:
+                queue_order.append(self.current_intent.intro)
+                logger.info(f"[DJ] DO: Queueing shutdown announcement - {self.current_intent.intro.path}")
+            # Terminal intent has no next_song (per DJ2.5)
+            self._terminal_intent_queued = True  # Mark as queued
+            logger.info("[DJ] DO: Terminal intent executed - no further THINK/DO cycles will occur")
+        else:
+            # Normal intent: Standard queue order
+            if self.current_intent.outro:
+                queue_order.append(self.current_intent.outro)
+                logger.info(f"[DJ] DO: Queueing outro - {self.current_intent.outro.path}")
+            
+            if self.current_intent.station_ids:
+                queue_order.extend(self.current_intent.station_ids)
+                for sid in self.current_intent.station_ids:
+                    logger.info(f"[DJ] DO: Queueing station ID - {sid.path}")
+            
+            if self.current_intent.intro:
+                queue_order.append(self.current_intent.intro)
+                logger.info(f"[DJ] DO: Queueing intro - {self.current_intent.intro.path}")
+            
+            if self.current_intent.next_song:
+                queue_order.append(self.current_intent.next_song)
+                logger.info(f"[DJ] DO: Queueing next song - {self.current_intent.next_song.path}")
         
-        if self.current_intent.station_ids:
-            queue_order.extend(self.current_intent.station_ids)
-            for sid in self.current_intent.station_ids:
-                logger.info(f"[DJ] DO: Queueing station ID - {sid.path}")
-        
-        if self.current_intent.intro:
-            queue_order.append(self.current_intent.intro)
-            logger.info(f"[DJ] DO: Queueing intro - {self.current_intent.intro.path}")
-        
-        queue_order.append(self.current_intent.next_song)
-        logger.info(f"[DJ] DO: Queueing next song - {self.current_intent.next_song.path}")
+        # Invariant: No non-terminal AudioEvent may be queued after draining begins
+        # Per contract SL2.2: During DRAINING, only terminal intents are allowed
+        if self._is_draining and not is_terminal:
+            logger.error("[DJ] DO: CRITICAL - Attempted to queue non-terminal audio during DRAINING!")
+            logger.error(f"[DJ] DO: Queue order would have been: {[e.path for e in queue_order]}")
+            raise RuntimeError("No non-terminal AudioEvent may be queued after draining begins")
         
         # Push to playout queue
         if self.playout_engine:
             self.playout_engine.queue_audio(queue_order)
             logger.info(f"[DJ] DO: Pushed {len(queue_order)} audio event(s) to playout queue")
+            
+            # Invariant: Terminal intent may only be queued once
+            if is_terminal:
+                logger.info("[DJ] DO: Terminal intent queued - invariant: terminal intent queued exactly once")
         else:
             logger.error("[DJ] DO: No playout engine reference! Cannot queue audio.")
+        
+        # For terminal intents: Only queue shutdown announcement, then return immediately
+        # Do NOT update timestamps, histories, schedule ticklers, or queue next_song
+        if is_terminal:
+            # Clear intent and return immediately (per INT2.4, E1.3)
+            self.current_intent = None
+            logger.info("[DJ] DO: Terminal intent cleared, no further scheduling")
+            return
         
         # 3. Update timestamps and histories (Phase 5)
         # Use metadata from intent (decided in THINK) - no decisions here
@@ -858,6 +1011,80 @@ class DJEngine:
             data["rotation"] = {}
         
         return data
+    
+    def _select_startup_announcement(self) -> Optional[AudioEvent]:
+        """
+        Select startup announcement from cached pool (per DJ2.4).
+        
+        Returns:
+            AudioEvent for startup announcement, or None if pool is empty
+        """
+        if not hasattr(self.asset_manager, 'startup_announcements'):
+            return None
+        
+        pool = self.asset_manager.startup_announcements
+        if not pool:
+            return None
+        
+        # Random selection from pool (per DJ2.4)
+        selected_path = random.choice(pool)
+        if selected_path and os.path.exists(selected_path):
+            metadata = _get_mp3_metadata(selected_path)
+            return AudioEvent(path=selected_path, type="announcement", metadata=metadata)
+        
+        return None
+    
+    def _handle_shutdown_think(self) -> None:
+        """
+        Handle shutdown THINK phase (per DJ2.5).
+        
+        Selects shutdown announcement if available and produces terminal intent.
+        """
+        # Clear any previous intent
+        self.current_intent = None
+        
+        # Select shutdown announcement from cached pool (per DJ2.5)
+        shutdown_announcement: Optional[AudioEvent] = None
+        if hasattr(self.asset_manager, 'shutdown_announcements'):
+            pool = self.asset_manager.shutdown_announcements
+            if pool:
+                # Random selection from pool (per DJ2.5)
+                selected_path = random.choice(pool)
+                if selected_path and os.path.exists(selected_path):
+                    metadata = _get_mp3_metadata(selected_path)
+                    shutdown_announcement = AudioEvent(path=selected_path, type="announcement", metadata=metadata, is_terminal=True)
+                    logger.info(f"[DJ] THINK: Selected shutdown announcement - {selected_path}")
+                    logger.info(f"[LIFECYCLE] Shutdown announcement selected: {selected_path}")
+            else:
+                logger.info("[LIFECYCLE] Shutdown announcement skipped (pool empty)")
+        else:
+            logger.info("[LIFECYCLE] Shutdown announcement skipped (pool not available)")
+        
+        # Create terminal intent (per DJ2.5, INT2.4)
+        # Terminal intent may contain shutdown announcement or be empty
+        # Terminal intent MUST NOT include next_song
+        if shutdown_announcement:
+            # Terminal intent with shutdown announcement
+            self.current_intent = DJIntent(
+                next_song=None,  # No next_song in terminal intent
+                outro=None,
+                station_ids=None,
+                intro=shutdown_announcement,  # Use intro field for shutdown announcement
+                has_legal_id=False,
+                is_terminal=True
+            )
+        else:
+            # Terminal intent with no AudioEvents (per SL2.2.6)
+            self.current_intent = DJIntent(
+                next_song=None,
+                outro=None,
+                station_ids=None,
+                intro=None,
+                has_legal_id=False,
+                is_terminal=True
+            )
+        
+        logger.info(f"[DJ] THINK: Terminal intent created (announcement={shutdown_announcement is not None})")
     
     def from_dict(self, data: dict) -> None:
         """

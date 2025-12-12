@@ -105,6 +105,10 @@ class FakeAssetDiscoveryManager:
         self.generic_intros: List[str] = ["/fake/generic_intro1.mp3"]
         self.generic_outros: List[str] = ["/fake/generic_outro1.mp3"]
         
+        # Lifecycle announcement pools (per ASSET_DISCOVERY_MANAGER_CONTRACT ADM2.4)
+        self.startup_announcements: List[str] = []
+        self.shutdown_announcements: List[str] = []
+        
         # Simulate initial scan
         import time
         self.last_scan_time = time.time()

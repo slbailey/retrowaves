@@ -26,14 +26,16 @@ class DJIntent:
     Architecture 3.1 Reference: Section 4.2
     
     Attributes:
-        next_song: Required next song AudioEvent
+        next_song: Required next song AudioEvent (None for terminal intents)
         outro: Optional outro AudioEvent for talk segments
         station_ids: Optional list of station ID AudioEvents (0-N)
         intro: Optional intro AudioEvent for the next song
         has_legal_id: True if any station_ids are legal IDs (decided in THINK)
+        is_terminal: True if this is a terminal intent (signals end-of-stream)
     """
-    next_song: AudioEvent                     # required
+    next_song: Optional[AudioEvent] = None    # required for normal intents, None for terminal
     outro: Optional[AudioEvent] = None        # optional
     station_ids: Optional[List[AudioEvent]] = None  # optional, 0–N IDs
     intro: Optional[AudioEvent] = None        # optional
     has_legal_id: bool = False                # metadata: True if any ID is legal (decided in THINK)
+    is_terminal: bool = False                 # metadata: True if this is a terminal intent (per INT2.4)

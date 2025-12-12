@@ -36,6 +36,9 @@ This is the behavioral heart of Station: the DJ is the brain that makes all cont
 - Perform audio decoding (decoding is PlayoutEngine's responsibility)
 - Make network calls (all data must be cached or local)
 - Perform file I/O except via cached discovery (AssetDiscoveryManager provides cached lists)
+- Trigger shutdown itself (shutdown is managed by Station lifecycle)
+- Perform I/O or blocking work beyond normal THINK operations
+- Modify queue directly (queue modification is DO's responsibility)
 
 ---
 
@@ -66,6 +69,43 @@ Selection **MUST** follow pacing rules:
 - THINK must complete before current segment finishes
 - If THINK takes too long, fall back to safe default intent
 - No blocking operations allowed during THINK
+
+### DJ2.4 — Startup Announcement Selection
+
+**THINK MAY select exactly one startup announcement AudioEvent during initial THINK phase.**
+
+- DJEngine **MAY** select exactly one startup announcement from cached startup pool (per AssetDiscoveryManager Contract)
+- Selection **MUST** be random from available files in `station_starting_up/` directory
+- Selection **MUST** occur during THINK only
+- Announcement is optional — if directory is empty or no selection is made, startup proceeds silently
+- Announcement **MUST** be wrapped in a standard AudioEvent (per AudioEvent Contract)
+- Announcement **MUST** be treated like any other segment (no special decode, mix, or output behavior)
+
+**DJEngine MUST NOT:**
+
+- Perform file I/O (selection from cached pool only)
+- Modify queues (queue modification is DO's responsibility)
+- Trigger startup itself (startup is managed by Station lifecycle)
+
+### DJ2.5 — Shutdown Announcement Selection
+
+**THINK MAY select exactly one shutdown announcement when shutdown flag is active.**
+
+- When Station is in DRAINING state (per StationLifecycle Contract), THINK **MAY** observe the shutdown flag
+- If shutdown flag is active:
+  - DJEngine **MAY** select exactly one shutdown announcement from cached shutdown pool (per AssetDiscoveryManager Contract)
+  - Selection **MUST** be random from available files in `station_shutting_down/` directory
+  - Selection **MUST** occur during THINK only
+  - Result **MUST** be a standard AudioEvent (per AudioEvent Contract)
+  - DJEngine **MUST NOT** generate `next_song` (no music after shutdown)
+  - DJEngine **MUST** produce a terminal intent (per DJIntent Contract)
+- If directory is empty or no selection is made, terminal intent may contain no AudioEvents
+
+**DJEngine MUST NOT:**
+
+- Trigger shutdown itself (shutdown is managed by Station lifecycle)
+- Perform I/O or blocking work beyond normal THINK operations
+- Modify queue directly (queue modification is DO's responsibility)
 
 ---
 

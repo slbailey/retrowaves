@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import numpy as np
 
@@ -17,9 +18,18 @@ class FFmpegDecoder:
     """
 
     def __init__(self, path: str, frame_size: int = 1024):
+        """
+        Initialize FFmpeg decoder.
+        
+        Args:
+            path: Path to audio file
+            frame_size: Number of samples per frame (default: 1024)
+        """
         self.path = path
         self.frame_size = frame_size
+        
         # Launch ffmpeg to decode to raw s16le stereo 48k
+        # Use preexec_fn=os.setsid to isolate FFmpeg from Ctrl-C (SIGINT) sent to parent
         self.proc = subprocess.Popen(
             [
                 "ffmpeg",
@@ -32,6 +42,7 @@ class FFmpegDecoder:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=self.frame_size * 4,  # hint
+            preexec_fn=os.setsid,
         )
 
     def read_frames(self):
@@ -80,12 +91,79 @@ class FFmpegDecoder:
             # Always cleanup, even if generator is stopped early
             self.close()
 
+    def kill(self, grace_period_seconds: float = 2.0) -> None:
+        """
+        Forcefully kill the FFmpeg process (PHASE 2 shutdown only).
+        
+        This method MUST be called during PHASE 2 (SHUTTING_DOWN) to ensure
+        FFmpeg processes are terminated even when systemd uses KillMode=process.
+        
+        Process is in its own process group (via os.setsid), so we kill the
+        entire process group to ensure no orphaned processes remain.
+        
+        Args:
+            grace_period_seconds: Time to wait for clean exit after SIGTERM before SIGKILL
+        
+        This method is idempotent and safe to call multiple times.
+        """
+        if self.proc is None:
+            return
+        
+        # Check if process is still running
+        if self.proc.poll() is not None:
+            # Process already exited
+            logger.debug(f"[DECODER] FFmpeg process already exited (pid={self.proc.pid})")
+            self.proc = None
+            return
+        
+        try:
+            # Get process group ID (negative PID sends signal to process group)
+            pgid = os.getpgid(self.proc.pid)
+            logger.info(f"[DECODER] FFmpeg SIGTERM sent (pid={self.proc.pid}, pgid={pgid})")
+            
+            # Send SIGTERM to process group
+            os.killpg(pgid, 15)  # 15 = SIGTERM
+            
+            # Wait for clean exit
+            try:
+                self.proc.wait(timeout=grace_period_seconds)
+                logger.info(f"[DECODER] FFmpeg exited cleanly (pid={self.proc.pid})")
+                self.proc = None
+                return
+            except subprocess.TimeoutExpired:
+                # Process didn't exit within grace period, force kill
+                logger.warning(f"[DECODER] FFmpeg SIGKILL sent (timeout exceeded, pid={self.proc.pid}, pgid={pgid})")
+                os.killpg(pgid, 9)  # 9 = SIGKILL
+                try:
+                    self.proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"[DECODER] FFmpeg process group did not exit after SIGKILL (pid={self.proc.pid}, pgid={pgid})")
+                except Exception:
+                    pass
+                self.proc = None
+        except ProcessLookupError:
+            # Process already exited (race condition)
+            logger.debug(f"[DECODER] FFmpeg process already exited (pid={self.proc.pid})")
+            self.proc = None
+        except Exception as e:
+            logger.error(f"[DECODER] Error killing FFmpeg process (pid={self.proc.pid}): {e}", exc_info=True)
+            # Try fallback: kill just the process (not process group)
+            try:
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                    self.proc.wait(timeout=1)
+            except Exception:
+                pass
+            self.proc = None
+    
     def close(self) -> None:
         """
         Clean up the ffmpeg process.
         
         Closes stdout and terminates/kills the process if still running.
         Safe to call multiple times.
+        
+        Note: For PHASE 2 shutdown, use kill() instead to ensure process group termination.
         """
         if self.proc is None:
             return

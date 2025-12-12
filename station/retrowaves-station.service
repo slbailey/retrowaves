@@ -28,7 +28,7 @@ CPUSchedulingPolicy=rr
 CPUSchedulingPriority=50
 
 KillMode=mixed
-TimeoutStopSec=5
+TimeoutStopSec=300
 
 StandardOutput=journal
 StandardError=journal

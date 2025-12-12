@@ -52,6 +52,10 @@ class AssetDiscoveryManager:
         self.generic_intros: List[str] = []  # list of generic intro paths
         self.generic_outros: List[str] = []  # list of generic outro paths
         
+        # Lifecycle announcement pools (per ADM2.4)
+        self.startup_announcements: List[str] = []  # list of startup announcement paths
+        self.shutdown_announcements: List[str] = []  # list of shutdown announcement paths
+        
         # Perform initial scan
         self._scan()
     
@@ -92,6 +96,8 @@ class AssetDiscoveryManager:
         self.outtros_per_song.clear()
         self.generic_intros.clear()
         self.generic_outros.clear()
+        self.startup_announcements.clear()
+        self.shutdown_announcements.clear()
         
         if not self.dj_path.exists():
             logger.warning(f"[ASSET SCAN] DJ path does not exist: {self.dj_path}")
@@ -119,10 +125,28 @@ class AssetDiscoveryManager:
                     return True
             return False
         
+        # Scan lifecycle announcement directories first (per ADM2.4)
+        startup_dir = self.dj_path / "station_starting_up"
+        shutdown_dir = self.dj_path / "station_shutting_down"
+        
+        if startup_dir.exists() and startup_dir.is_dir():
+            for file_path in startup_dir.glob("*.mp3"):
+                if file_path.is_file():
+                    self.startup_announcements.append(str(file_path))
+        
+        if shutdown_dir.exists() and shutdown_dir.is_dir():
+            for file_path in shutdown_dir.glob("*.mp3"):
+                if file_path.is_file():
+                    self.shutdown_announcements.append(str(file_path))
+        
         # Walk the directory tree
         for root, dirs, files in os.walk(self.dj_path):
             # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            # Skip lifecycle announcement directories (already scanned above)
+            if Path(root).name in ("station_starting_up", "station_shutting_down"):
+                continue
             
             for filename in files:
                 # Only process .mp3 files
@@ -181,7 +205,9 @@ class AssetDiscoveryManager:
             f"{total_per_song_outtros} per-song outtros "
             f"({unique_songs_with_outtros} unique songs), "
             f"{len(self.generic_intros)} generic intros, "
-            f"{len(self.generic_outros)} generic outros."
+            f"{len(self.generic_outros)} generic outros, "
+            f"{len(self.startup_announcements)} startup announcements, "
+            f"{len(self.shutdown_announcements)} shutdown announcements."
         )
         
         # Debug: log a few examples if we found any

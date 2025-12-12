@@ -222,6 +222,17 @@ All heartbeat events **MUST** follow these behavioral rules:
 - Event **MUST NOT** rely on Tower timing or state
 - Event **MUST** be purely observational
 
+### PE4.4 — Shutdown Observability Events
+
+**PlayoutEngine MAY emit shutdown-related observability events during shutdown phases.**
+
+- `shutdown_announcement_started` **MAY** be emitted when shutdown announcement segment starts (if present)
+- `shutdown_announcement_finished` **MAY** be emitted when shutdown announcement segment finishes (if present)
+- These events **MUST** follow all PE4.3 event emission rules
+- These events **MUST** be purely observational and **MUST NOT** influence shutdown behavior
+- These events **MUST NOT** trigger THINK or DO cycles
+- These events **MAY** be emitted even after terminal DO completes (per MasterSystem Contract E1.6)
+
 ---
 
 ## PE5 — Optional Station Timebase Drift Compensation
@@ -572,6 +583,73 @@ PID controller is **OPTIONAL** and implementation-defined.
 - When disabled, behavior matches current implementation
 - Configuration allows gradual rollout and testing
 - Behavioral restrictions (PE6.1 through PE6.7) **MUST** be followed if PID controller is implemented
+
+---
+
+## PE7 — Shutdown Interaction
+
+PlayoutEngine **MUST** interact gracefully with Station shutdown lifecycle (per StationLifecycle Contract SL2).
+
+### PE7.1 — Segment Completion During Shutdown
+
+**PlayoutEngine MUST finish the currently playing segment when shutdown begins.**
+
+- When Station enters DRAINING state (PHASE 1), PlayoutEngine **MUST** continue playing current segment to completion
+- PlayoutEngine **MUST NOT** abort or truncate the current segment
+- All PCM frames for the current segment **MUST** be emitted completely
+- Segment finish event **MUST** be emitted normally after segment completes
+
+### PE7.2 — Queue Dequeuing During Shutdown
+
+**PlayoutEngine MUST stop dequeuing new segments once shutdown begins.**
+
+- Once Station enters DRAINING state, PlayoutEngine **MUST NOT** dequeue additional segments from the playout queue
+- PlayoutEngine **MUST** stop accepting new segments for playback
+- Only the current segment and exactly one terminal segment (offline announcement) **MAY** play during shutdown
+
+### PE7.3 — Terminal AudioEvent
+
+**PlayoutEngine MUST play terminal AudioEvent if present, or exit immediately if absent.**
+
+- Terminal AudioEvent (shutdown announcement) **MUST** be the final segment played if present
+- Terminal segment **MUST** be dequeued and played exactly once
+- Terminal segment **MUST** complete fully before PlayoutEngine exits
+- If terminal intent contains no AudioEvents, PlayoutEngine **MUST** exit immediately after current segment finishes
+- After terminal segment ends (or if no terminal segment), no further segments **MAY** be played
+- When executing a terminal intent, PlayoutEngine **MUST** ignore any queued segments beyond the terminal AudioEvent
+- Queue contents **MUST NOT** be played after terminal execution, even if segments were prefetched or queued earlier
+
+### PE7.4 — Event Emission During Shutdown
+
+**After terminal segment ends, no further on_segment_started events MAY fire.**
+
+- PlayoutEngine **MUST** stop emitting `on_segment_started` events after terminal segment begins
+- PlayoutEngine **MUST** emit `on_segment_finished` for terminal segment normally
+- After terminal segment finishes, PlayoutEngine **MUST** exit cleanly
+
+### PE7.5 — Prohibited Behaviors
+
+**PlayoutEngine MUST NOT:**
+
+- Abruptly terminate mid-segment during shutdown
+- Emit partial PCM frames at shutdown
+- Skip the shutdown announcement once queued
+- Continue dequeuing segments after DRAINING state begins
+- Start new segments after terminal segment begins
+- Weaken existing timing, decode, or output rules during shutdown
+
+### PE7.6 — Clean Exit
+
+**PlayoutEngine MUST exit cleanly after terminal segment completes (or immediately if no terminal segment).**
+
+- PlayoutEngine **MUST** finish current segment during shutdown
+- PlayoutEngine **MUST** play terminal AudioEvent if present
+- PlayoutEngine **MUST NOT** dequeue further segments after terminal segment
+- PlayoutEngine **MUST** exit cleanly after terminal segment completes
+- All decoders **MUST** be closed
+- All output sinks **MUST** be flushed and closed
+- All threads **MUST** join within timeout
+- No audio artifacts or incomplete frames **MAY** remain
 
 ---
 
