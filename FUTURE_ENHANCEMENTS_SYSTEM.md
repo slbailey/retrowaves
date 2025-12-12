@@ -36,29 +36,47 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 ## 🎯 Next Priority
 
-### Centralized Logging with Rotation
+### Production Readiness & Observability
 
 **Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
 
-**Future Goal:** All Retrowaves components should write logs to standardized locations with automatic log rotation.
+**Goal:** Make Retrowaves production-ready with operational visibility and health monitoring.
 
-**Desired Behavior:**
-- Each component writes to `/var/log/retrowaves-<component>.log`
-  - `/var/log/retrowaves/tower.log` for Tower service
-  - `/var/log/retrowaves/station.log` for Station service
-  - `retrowaves-dj.log` for DJ engine (if separated)
-  - etc.
-- Use system log rotation mechanisms (e.g., `logrotate` on Linux)
-- Rotate logs based on size and/or time (e.g., daily rotation, 10MB max size)
-- Retain a configurable number of rotated log files (e.g., keep last 7 days or last 10 files)
-- Compress old log files to save disk space
-- Ensure log files have appropriate permissions (readable by `retrowaves` user/group)
+**Components:**
+
+1. **Health & Status Endpoints**
+   - `GET /health` - Simple health check (200 OK if service is running)
+   - `GET /status` - Detailed status JSON with:
+     - Encoder health (via FFmpegSupervisor status)
+     - Buffer occupancy (PCM and MP3 buffers)
+     - Number of connected clients
+     - Current source (program/tone/silence)
+     - Uptime and restart counts
+   - Per contract T14: Endpoints MUST NOT interfere with audio tick loop
+   - Non-blocking, thread-safe status queries
+
+2. **Integration Testing**
+   - Complete end-to-end system tests (structure exists, needs implementation)
+   - Tower-Station integration tests
+   - Real audio pipeline tests
+   - Service lifecycle tests
+
+3. **Deployment Documentation**
+   - Production deployment guide
+   - System requirements and dependencies
+   - Configuration management
+   - Troubleshooting runbook
+
+4. **Operational Observability**
+   - Basic metrics collection (beyond logging)
+   - Service health monitoring
+   - Performance baseline documentation
 
 **Benefits:**
-- Easier debugging and troubleshooting
-- Prevents log files from growing unbounded
-- Standardized log locations across all components
-- Better integration with system monitoring tools
+- Production-ready operational visibility
+- Easier troubleshooting and monitoring
+- Confidence in system reliability
+- Foundation for future monitoring integrations (Prometheus, etc.)
 
 ---
 
