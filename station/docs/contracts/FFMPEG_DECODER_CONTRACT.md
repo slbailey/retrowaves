@@ -72,6 +72,56 @@ Defines **WHAT** the decoder must guarantee, consistent with Station's architect
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+FFmpegDecoder **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- FFmpegDecoder **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with decoding operations.
+
+- Logging **MUST NOT** block frame decoding
+- Logging **MUST NOT** delay PCM frame delivery
+- Logging **MUST NOT** affect consumption rate requirement (FD2.2)
+- Logging **MUST NOT** block file I/O operations
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+FFmpegDecoder **MUST** tolerate external log rotation without crashing or stalling.
+
+- FFmpegDecoder **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- FFmpegDecoder **MUST** handle log file truncation or rename gracefully
+- FFmpegDecoder **MUST NOT** implement rotation logic in application code
+- FFmpegDecoder **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause decoding interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, FFmpegDecoder **MUST** continue decoding frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt frame decoding
+- Logging failures **MUST NOT** interrupt PCM frame delivery
+- FFmpegDecoder **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - FFmpegDecoder uses FFmpeg library for MP3 decoding

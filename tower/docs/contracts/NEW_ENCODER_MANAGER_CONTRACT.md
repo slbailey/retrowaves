@@ -239,3 +239,53 @@ EncoderManager **MUST** behave correctly even if upstream is permanently absent:
 
 - It **MUST** output fallback frames (via fallback provider) forever after `GRACE_SEC` elapses
 - It **MUST** remain responsive to new PCM frames if upstream resumes
+
+---
+
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+EncoderManager **MUST** write all log output to `/var/log/retrowaves/tower.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- EncoderManager **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with frame routing decisions.
+
+- Logging **MUST NOT** block calls to `next_frame()`
+- Logging **MUST NOT** delay PCM frame selection or routing
+- Logging **MUST NOT** delay fallback provider calls
+- Logging **MUST NOT** affect grace period timing
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+EncoderManager **MUST** tolerate external log rotation without crashing or stalling.
+
+- EncoderManager **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- EncoderManager **MUST** handle log file truncation or rename gracefully
+- EncoderManager **MUST NOT** implement rotation logic in application code
+- EncoderManager **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause frame routing interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, EncoderManager **MUST** continue routing frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt frame routing
+- Logging failures **MUST NOT** interrupt fallback provider calls
+- EncoderManager **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.

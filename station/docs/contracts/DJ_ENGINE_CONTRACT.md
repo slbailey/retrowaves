@@ -177,6 +177,56 @@ All THINK lifecycle events **MUST** follow these behavioral rules:
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+DJEngine **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- DJEngine **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with THINK phase execution.
+
+- Logging **MUST NOT** block THINK operations
+- Logging **MUST NOT** delay song selection or intent creation
+- Logging **MUST NOT** delay THINK lifecycle event emission
+- Logging **MUST NOT** affect time-bounded THINK requirement (DJ2.3)
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+DJEngine **MUST** tolerate external log rotation without crashing or stalling.
+
+- DJEngine **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- DJEngine **MUST** handle log file truncation or rename gracefully
+- DJEngine **MUST NOT** implement rotation logic in application code
+- DJEngine **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause THINK phase interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, DJEngine **MUST** continue THINK operations normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt song selection
+- Logging failures **MUST NOT** interrupt intent creation
+- DJEngine **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - DJEngine is called during `on_segment_started()` callback (THINK phase)

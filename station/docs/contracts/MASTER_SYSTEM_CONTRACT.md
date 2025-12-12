@@ -166,6 +166,56 @@ All other Station contracts reference this contract:
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+Master System components **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- Master System components **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with THINK/DO event model.
+
+- Logging **MUST NOT** block THINK phase execution
+- Logging **MUST NOT** block DO phase execution
+- Logging **MUST NOT** delay lifecycle event callbacks
+- Logging **MUST NOT** delay heartbeat event emission
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+Master System components **MUST** tolerate external log rotation without crashing or stalling.
+
+- Master System components **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- Master System components **MUST** handle log file truncation or rename gracefully
+- Master System components **MUST NOT** implement rotation logic in application code
+- Master System components **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause THINK/DO cycle interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, Master System **MUST** continue THINK/DO operations normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt THINK/DO cycles
+- Logging failures **MUST NOT** interrupt event callbacks
+- Master System components **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - THINK phase typically occurs during `on_segment_started()` callback

@@ -653,6 +653,57 @@ PlayoutEngine **MUST** interact gracefully with Station shutdown lifecycle (per 
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+PlayoutEngine **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- PlayoutEngine **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with audio playout.
+
+- Logging **MUST NOT** block segment decoding
+- Logging **MUST NOT** block PCM frame output
+- Logging **MUST NOT** block Clock A decode pacing (if used)
+- Logging **MUST NOT** delay segment start or finish events
+- Logging **MUST NOT** block heartbeat event emission
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+PlayoutEngine **MUST** tolerate external log rotation without crashing or stalling.
+
+- PlayoutEngine **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- PlayoutEngine **MUST** handle log file truncation or rename gracefully
+- PlayoutEngine **MUST NOT** implement rotation logic in application code
+- PlayoutEngine **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause audio playout interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, PlayoutEngine **MUST** continue playing audio normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt segment playback
+- Logging failures **MUST NOT** interrupt PCM frame output
+- PlayoutEngine **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - PlayoutEngine reads from playout queue (DO phase enqueues)

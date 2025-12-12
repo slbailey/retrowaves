@@ -282,3 +282,53 @@ This contract **MUST** be compatible with all other Tower contracts and **MUST N
 - `NEW_TOWER_RUNTIME_CONTRACT`
 - `NEW_FALLBACK_PROVIDER_CONTRACT`
 
+---
+
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+PCM Ingestion **MUST** write all log output to `/var/log/retrowaves/tower.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- PCM Ingestion **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with frame ingestion.
+
+- Logging **MUST NOT** block frame acceptance from upstream providers
+- Logging **MUST NOT** delay frame validation or delivery
+- Logging **MUST NOT** delay writes to upstream PCM buffer
+- Logging **MUST NOT** affect transport connection handling
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+PCM Ingestion **MUST** tolerate external log rotation without crashing or stalling.
+
+- PCM Ingestion **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- PCM Ingestion **MUST** handle log file truncation or rename gracefully
+- PCM Ingestion **MUST NOT** implement rotation logic in application code
+- PCM Ingestion **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause frame ingestion interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, PCM Ingestion **MUST** continue accepting frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt frame acceptance
+- Logging failures **MUST NOT** interrupt frame delivery to buffer
+- PCM Ingestion **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+

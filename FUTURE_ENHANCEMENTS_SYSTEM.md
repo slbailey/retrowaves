@@ -44,8 +44,8 @@ This wishlist is organized by priority, starting with features that affect **ove
 
 **Desired Behavior:**
 - Each component writes to `/var/log/retrowaves-<component>.log`
-  - `retrowaves-tower.log` for Tower service
-  - `retrowaves-station.log` for Station service
+  - `/var/log/retrowaves/tower.log` for Tower service
+  - `/var/log/retrowaves/station.log` for Station service
   - `retrowaves-dj.log` for DJ engine (if separated)
   - etc.
 - Use system log rotation mechanisms (e.g., `logrotate` on Linux)
@@ -253,6 +253,61 @@ Could allow remote control via phone app.
   - Running multiple genre stations (Country, Jazz, Rock) simultaneously
   - Test/production station instances
   - Regional variations of the same station
+
+### Core/Service Separation & Business Model
+
+**Future Goal:** Separate Retrowaves core functionality from additional paid services, ensuring the core remains free and open while premium features (UI, convenience tools) become paid add-ons.
+
+**Core Philosophy:**
+- **Retrowaves Core:** Free and always will be free
+  - Core audio engine (THINK/DO, playout, encoding)
+  - CLI interface for all operations
+  - Manual configuration and control
+  - Full functionality accessible via command line
+  - "If you want to do it manually, you always will be able to"
+- **Premium Services:** Paid add-ons
+  - Pretty UI and web-based control panels
+  - Easy-to-use graphical tools
+  - Advanced monitoring dashboards
+  - Convenience features and automation tools
+  - "Bells and whistles" that enhance UX but aren't required for operation
+
+**Architectural Requirements:**
+- **Solid API to Core:** Develop a comprehensive, well-documented API that allows UI and other clients to interact with the core system
+  - RESTful endpoints for all core operations
+  - WebSocket support for real-time updates
+  - Clear separation between core logic and presentation layer
+  - API must be stable and versioned
+  - Core should be fully functional without any UI dependencies
+- **Modular Design:** Core and premium services should be cleanly separated
+  - Premium services consume core via API only
+  - No tight coupling between core and UI
+  - Core can run standalone via CLI
+  - Premium services are optional add-ons
+
+**Licensing Model:**
+- **Open Source License for Core:** Define the proper open source license model for Retrowaves core
+  - Choose appropriate license (MIT, Apache 2.0, GPL, AGPL, etc.) that aligns with business goals
+  - Ensure license allows core to remain free and open forever
+  - Consider license compatibility with dependencies and future integrations
+  - License must clearly permit commercial use of core (for those who want to build on it)
+  - May need dual licensing strategy if certain use cases require different terms
+- **Premium Services Licensing:** Define licensing for paid add-ons
+  - Proprietary license for premium UI and convenience tools
+  - Clear separation between open source core and proprietary premium services
+  - Licensing terms that protect premium services while keeping core open
+- **License Documentation:** Clear documentation of what is open source vs. proprietary
+  - LICENSE file in core repository
+  - Clear attribution and contribution guidelines
+  - Documentation explaining licensing model to users and contributors
+
+**Implementation Notes:**
+- This is a major architectural and business model decision that requires significant planning
+- Core API design must be done carefully to support both CLI and future UI needs
+- Documentation must clearly distinguish between free core features and paid premium features
+- **Open source license model must be properly defined and documented before launch**
+- This idea will need massive expansion when the time comes to implement it
+- Current focus: Ensure core architecture supports this separation (API-first design)
 
 ---
 

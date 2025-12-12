@@ -521,6 +521,56 @@ WebSocket event endpoints **MUST NOT** depend on Station timing:
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+TowerRuntime **MUST** write all log output to `/var/log/retrowaves/tower.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- TowerRuntime **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with audio processing.
+
+- Logging **MUST NOT** block HTTP stream endpoint operations
+- Logging **MUST NOT** block MP3 broadcast loop
+- Logging **MUST NOT** block event ingestion or delivery
+- Logging **MUST NOT** block buffer status endpoint
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+TowerRuntime **MUST** tolerate external log rotation without crashing or stalling.
+
+- TowerRuntime **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- TowerRuntime **MUST** handle log file truncation or rename gracefully
+- TowerRuntime **MUST NOT** implement rotation logic in application code
+- TowerRuntime **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause audio pipeline interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, TowerRuntime **MUST** continue operating normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt HTTP streaming
+- Logging failures **MUST NOT** interrupt audio processing
+- TowerRuntime **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 ### Event Reception

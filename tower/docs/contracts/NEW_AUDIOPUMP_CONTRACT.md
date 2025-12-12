@@ -94,3 +94,53 @@ If `EncoderManager` raises unexpected errors, AudioPump **MAY**:
 
 ### A13
 AudioPump **MUST** never stop ticking solely because upstream PCM is absent; it **MUST** continue calling `EncoderManager` each tick.
+
+---
+
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+AudioPump **MUST** write all log output to `/var/log/retrowaves/tower.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- AudioPump **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with tick loop timing.
+
+- Logging **MUST NOT** block the tick loop
+- Logging **MUST NOT** introduce timing drift or jitter
+- Logging **MUST NOT** delay calls to `EncoderManager`
+- Logging **MUST NOT** delay PCM frame emission
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+AudioPump **MUST** tolerate external log rotation without crashing or stalling.
+
+- AudioPump **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- AudioPump **MUST** handle log file truncation or rename gracefully
+- AudioPump **MUST NOT** implement rotation logic in application code
+- AudioPump **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause tick loop interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, AudioPump **MUST** continue ticking normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt the tick loop
+- Logging failures **MUST NOT** interrupt PCM frame production
+- AudioPump **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.

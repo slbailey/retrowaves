@@ -170,6 +170,56 @@ After all cleanup completes, process **MAY** exit.
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+Station lifecycle components **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- Lifecycle components **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with startup or shutdown sequences.
+
+- Logging **MUST NOT** block component loading during startup
+- Logging **MUST NOT** block state persistence during shutdown
+- Logging **MUST NOT** delay state transitions (RUNNING → DRAINING → SHUTTING_DOWN)
+- Logging **MUST NOT** delay audio component cleanup
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+Station lifecycle components **MUST** tolerate external log rotation without crashing or stalling.
+
+- Lifecycle components **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- Lifecycle components **MUST** handle log file truncation or rename gracefully
+- Lifecycle components **MUST NOT** implement rotation logic in application code
+- Lifecycle components **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause startup or shutdown interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, Station lifecycle **MUST** continue startup and shutdown sequences normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt component loading
+- Logging failures **MUST NOT** interrupt state persistence
+- Lifecycle components **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - Startup sequence: Load state → Discover assets → Select first song → Start playout

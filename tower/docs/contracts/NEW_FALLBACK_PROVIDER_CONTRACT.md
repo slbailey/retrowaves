@@ -198,3 +198,53 @@ Call `fallback_provider.next_frame()` exactly when:
 - Grace period expired
 
 This ensures clean, single-responsibility boundaries.
+
+---
+
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+Fallback Provider **MUST** write all log output to `/var/log/retrowaves/tower.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- Fallback Provider **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with frame generation.
+
+- Logging **MUST NOT** block `next_frame()` calls
+- Logging **MUST NOT** delay frame generation or return
+- Logging **MUST NOT** affect zero-latency frame delivery requirement (FP2.2)
+- Logging **MUST NOT** delay fallback source selection
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+Fallback Provider **MUST** tolerate external log rotation without crashing or stalling.
+
+- Fallback Provider **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- Fallback Provider **MUST** handle log file truncation or rename gracefully
+- Fallback Provider **MUST NOT** implement rotation logic in application code
+- Fallback Provider **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause frame generation interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, Fallback Provider **MUST** continue generating frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt frame generation
+- Logging failures **MUST NOT** interrupt fallback source selection
+- Fallback Provider **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.

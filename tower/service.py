@@ -18,6 +18,36 @@ from tower.ingest.transport import UnixSocketIngestTransport
 
 logger = logging.getLogger(__name__)
 
+# Setup file handler for contract-compliant logging (LOG1, LOG2, LOG3, LOG4)
+# Per contract: /var/log/retrowaves/tower.log, non-blocking, rotation-tolerant
+try:
+    import logging.handlers
+    # Use WatchedFileHandler for rotation tolerance (per LOG3)
+    # WatchedFileHandler automatically detects file rotation and reopens
+    handler = logging.handlers.WatchedFileHandler('/var/log/retrowaves/tower.log', mode='a')
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    handler.setFormatter(formatter)
+    # Wrap emit to handle write failures gracefully (per LOG4)
+    original_emit = handler.emit
+    def safe_emit(record):
+        try:
+            original_emit(record)
+        except (IOError, OSError):
+            # Logging failures degrade silently per contract LOG4
+            pass
+    handler.emit = safe_emit
+    # Prevent duplicate handlers on module reload
+    if not any(isinstance(h, logging.handlers.WatchedFileHandler)
+               and getattr(h, 'baseFilename', None) == '/var/log/retrowaves/tower.log'
+               for h in logger.handlers):
+        logger.addHandler(handler)
+    logger.propagate = False  # Avoid duplicate logs
+except Exception:
+    # Logging must never crash component per LOG4
+    # Catch all exceptions (including I/O errors) to prevent import-time failures
+    pass
+
 
 class TowerService:
     def __init__(self, encoder_enabled: Optional[bool] = None):

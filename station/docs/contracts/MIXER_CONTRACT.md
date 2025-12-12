@@ -50,6 +50,56 @@ Defines the gain/combination layer. Mixer applies gain adjustments and combines 
 
 ---
 
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+Mixer **MUST** write all log output to `/var/log/retrowaves/station.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- Mixer **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with frame processing.
+
+- Logging **MUST NOT** block gain application
+- Logging **MUST NOT** delay frame output
+- Logging **MUST NOT** affect latency requirement (MX1.3)
+- Logging **MUST NOT** affect timing preservation (MX1.2)
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+Mixer **MUST** tolerate external log rotation without crashing or stalling.
+
+- Mixer **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- Mixer **MUST** handle log file truncation or rename gracefully
+- Mixer **MUST NOT** implement rotation logic in application code
+- Mixer **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause frame processing interruption
+
+### LOG4 — Failure Behavior
+If log file write operations fail, Mixer **MUST** continue processing frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt gain application
+- Logging failures **MUST NOT** interrupt frame output
+- Mixer **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+---
+
 ## Implementation Notes
 
 - Mixer is stateless (no memory between frames)

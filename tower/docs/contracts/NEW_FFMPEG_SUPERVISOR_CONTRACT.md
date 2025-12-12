@@ -200,3 +200,54 @@ Masking internal **BOOTING** under external **RESTARTING** ensures:
 **BOOTING** is externally visible only during cold startup and **MUST NOT** be externally visible during restart sequences.
 
 During restarts, the Supervisor **SHALL** internally enter **BOOTING** while launching the replacement process, but external state **SHALL** remain **RESTARTING** until the first MP3 frame is produced.
+
+---
+
+## LOG — Logging and Observability
+
+### LOG1 — Log File Location
+FFmpegSupervisor **MUST** write all log output to `/var/log/retrowaves/ffmpeg.log`.
+
+- Log file path **MUST** be deterministic and fixed
+- Log file **MUST** be readable by the retrowaves user/group
+- FFmpegSupervisor **MUST NOT** require elevated privileges at runtime to write logs
+
+### LOG2 — Non-Blocking Logging
+Logging operations **MUST** be non-blocking and **MUST NOT** interfere with PCM frame processing.
+
+- Logging **MUST NOT** block `push_pcm_frame()` calls
+- Logging **MUST NOT** delay PCM writes to ffmpeg stdin
+- Logging **MUST NOT** block process monitoring or restart logic
+- Logging **MUST NOT** affect MP3 output availability
+- Logging failures **MUST** degrade silently (stderr fallback allowed)
+
+### LOG3 — Rotation Tolerance
+FFmpegSupervisor **MUST** tolerate external log rotation without crashing or stalling.
+
+- FFmpegSupervisor **MUST** assume logs may be rotated externally (e.g., via logrotate)
+- FFmpegSupervisor **MUST** handle log file truncation or rename gracefully
+- FFmpegSupervisor **MUST NOT** implement rotation logic in application code
+- FFmpegSupervisor **MUST** reopen log files if they are rotated (implementation-defined mechanism)
+- Rotation **MUST NOT** cause PCM processing interruption
+- Rotation **MUST NOT** cause ffmpeg process restart
+
+### LOG4 — Failure Behavior
+If log file write operations fail, FFmpegSupervisor **MUST** continue processing PCM frames normally.
+
+- Logging failures **MUST NOT** crash the process
+- Logging failures **MUST NOT** interrupt PCM frame processing
+- Logging failures **MUST NOT** interrupt ffmpeg process management
+- FFmpegSupervisor **MAY** fall back to stderr for critical errors, but **MUST NOT** block on stderr writes
+
+---
+
+## Required Tests
+
+This contract requires the following logging compliance tests:
+
+- LOG1 — Log File Location
+- LOG2 — Non-Blocking Logging
+- LOG3 — Rotation Tolerance
+- LOG4 — Failure Behavior
+
+See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
