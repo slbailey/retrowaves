@@ -1199,6 +1199,71 @@ At startup TowerService must:
 - Implementation must be derivable directly from the document.
 - All public methods must match the interface signatures defined above.
 
+### 7.7 Logging & Observability
+
+All Tower components implement standardized logging per contract requirements (LOG1-LOG4).
+
+**Log File Locations:**
+- `/var/log/retrowaves/tower.log` - TowerRuntime, AudioPump, EncoderManager, PCM Ingestion, Fallback Provider
+- `/var/log/retrowaves/ffmpeg.log` - FFmpegSupervisor (special case)
+
+**Logging Properties:**
+- **Non-blocking (LOG2):** Logging never blocks audio paths, tick loops, or real-time processing
+- **Rotation tolerant (LOG3):** Uses `WatchedFileHandler` to automatically detect and handle external log rotation (e.g., logrotate)
+- **Failure tolerant (LOG4):** Logging failures degrade silently; component operation continues even if logging fails
+- **No elevated privileges:** Components do not require elevated privileges at runtime
+
+**Implementation:**
+- Each component configures its own logger with `WatchedFileHandler`
+- Handler creation wrapped in exception handling for graceful degradation
+- Duplicate handler prevention for module reloads
+- Standard formatter: `%(asctime)s [%(levelname)s] %(name)s: %(message)s`
+
+See component contracts for detailed logging requirements.
+
+### 7.8 Event System (Station → Tower WebSocket Events)
+
+Tower implements a real-time event streaming system that receives heartbeat events from Station and broadcasts them to connected WebSocket clients.
+
+**Event Ingestion:**
+- Station sends events via HTTP POST to `/tower/events/ingest`
+- Events are one-way (Station→Tower), purely observational
+- Tower validates and stores events in a bounded, thread-safe buffer (1000 event capacity)
+- Events are immediately broadcast to all connected WebSocket clients
+
+**Event Types:**
+- `segment_started` - New audio segment (song/intro/outro/ID) has started
+- `segment_progress` - Segment playback progress updates
+- `segment_finished` - Segment has finished playing
+- `dj_think_started` - DJ has entered THINK phase
+- `dj_think_completed` - DJ has completed THINK phase
+- `station_underflow` - Station buffer underflow detected
+- `station_overflow` - Station buffer overflow detected
+- `station_starting_up` - Station is starting up
+- `station_shutting_down` - Station is shutting down
+- `new_song` - New song has started (includes metadata: title, artist, duration)
+- `dj_talking` - DJ has started talking
+
+**WebSocket Streaming:**
+- Endpoint: `/tower/events` (WebSocket upgrade)
+- Real-time event delivery to all connected clients
+- Non-blocking, thread-safe event fanout
+- Events are not stored for historical retrieval; they are delivered immediately or dropped
+
+**Contract Compliance:**
+- Tower: T-EVENTS (reception, storage, validation)
+- Tower: T-EXPOSE (WebSocket endpoints, fanout, immediate flush)
+- Station: PE4 (PlayoutEngine heartbeat events)
+- Station: DJ4 (DJEngine THINK lifecycle events)
+- Station: OS3 (OutputSink buffer health events)
+
+**Architectural Note:**
+This maintains separation between:
+- **Pure audio stream** → radio's core
+- **Stateless metadata/event feed** → everything else
+
+This aligns with professional broadcast systems (Zetta, ENCO, WideOrbit) when interfacing with companion systems.
+
 ---
 
 ## 8. Tower Lifecycle
