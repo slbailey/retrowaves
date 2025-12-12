@@ -8,8 +8,9 @@ Architecture 3.1 Reference:
 - Section 4.2: DJ Intent Structure
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
+import uuid
 
 from station.broadcast_core.audio_event import AudioEvent
 
@@ -26,6 +27,7 @@ class DJIntent:
     Architecture 3.1 Reference: Section 4.2
     
     Attributes:
+        intent_id: Unique UUID identifying this intent (for atomic execution tracking)
         next_song: Required next song AudioEvent (None for terminal intents)
         outro: Optional outro AudioEvent for talk segments
         station_ids: Optional list of station ID AudioEvents (0-N)
@@ -33,6 +35,7 @@ class DJIntent:
         has_legal_id: True if any station_ids are legal IDs (decided in THINK)
         is_terminal: True if this is a terminal intent (signals end-of-stream)
     """
+    intent_id: uuid.UUID = field(default_factory=uuid.uuid4)  # Unique identifier for atomic execution
     next_song: Optional[AudioEvent] = None    # required for normal intents, None for terminal
     outro: Optional[AudioEvent] = None        # optional
     station_ids: Optional[List[AudioEvent]] = None  # optional, 0–N IDs

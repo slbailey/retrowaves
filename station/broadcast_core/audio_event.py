@@ -9,6 +9,7 @@ Architecture 3.1 Reference:
 
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Dict, Any
+import uuid
 
 
 @dataclass
@@ -27,10 +28,12 @@ class AudioEvent:
         gain: Gain multiplier for audio level (default 1.0)
         metadata: Optional MP3 metadata (title, artist, duration) extracted during THINK phase
         is_terminal: True if this is a terminal segment (e.g., shutdown announcement) during draining
+        intent_id: UUID of the DJIntent that created this AudioEvent (for atomic execution tracking)
     """
     path: str
     type: Literal["song", "intro", "outro", "talk", "id", "announcement"]
     gain: float = 1.0
     metadata: Optional[Dict[str, Any]] = field(default=None)
     is_terminal: bool = False
+    intent_id: Optional[uuid.UUID] = field(default=None)  # UUID of the DJIntent that created this event
 

@@ -238,6 +238,12 @@ class PlayoutEngine:
         # Track talking state to avoid multiple dj_talking events for consecutive talk files
         self._is_in_talking_sequence = False
         
+        # Track segment active state to prevent pre-fill during active playback
+        # Per contract C8: Pre-fill MUST NOT affect segment timing or active content
+        # Thread-safe lock for _segment_active reads/writes
+        self._segment_active_lock = threading.RLock()
+        self._segment_active = False
+        
         # Monitoring: track queue stats for debugging
         self._last_queue_log_time = time.time()
         self._queue_log_interval = 5.0  # Log queue stats every 5 seconds
@@ -349,7 +355,30 @@ class PlayoutEngine:
         self._current_segment_id = f"{segment.type}_{os.path.basename(segment.path)}_{int(time.monotonic() * 1000)}"
         self._last_progress_event_time = time.monotonic()
         
+        # Log intent_id and verify execution order (atomic intent execution tracking)
+        intent_id = segment.intent_id if segment.intent_id else None
+        if intent_id:
+            logger.info(f"Starting segment: intent_id={intent_id}, type={segment.type}, path={segment.path}")
+            
+            # Verify intent_id matches expected execution order
+            # This helps detect cross-intent leakage where segments from previous intents play
+            # Note: We can't verify against a "current expected intent" here since intents are consumed,
+            # but logging the intent_id allows post-hoc analysis of execution order
+            logger.debug(f"[PLAYOUT] Segment intent_id={intent_id} starting - execution order verification")
+        else:
+            logger.warning(f"Starting segment without intent_id: type={segment.type}, path={segment.path}")
+        
         logger.info(f"Starting segment: {segment.type} - {segment.path}")
+        
+        # Set segment_active = True at the segment commit boundary
+        # This MUST occur immediately when segment is committed for playback, before:
+        # - any prefill check
+        # - any buffer warmup logic
+        # - any decode setup
+        # Per contract C8: Pre-fill MUST NOT execute during active segment playback
+        # _segment_active remains True until decode completes AND segment teardown completes
+        with self._segment_active_lock:
+            self._segment_active = True
         
         # Emit appropriate event based on segment type
         if self._tower_control and not self._shutdown_requested:
@@ -453,6 +482,11 @@ class PlayoutEngine:
         # Clear current segment
         self._current_segment = None
         self._is_playing = False
+        
+        # Set segment_active = False when segment finishes
+        # Per contract C8: Pre-fill MUST NOT execute during active segment playback
+        with self._segment_active_lock:
+            self._segment_active = False
     
     def _get_segment_duration(self, segment: AudioEvent) -> float:
         """
@@ -687,11 +721,13 @@ class PlayoutEngine:
         - Change segment timing logic (elapsed = time.monotonic() - segment_start)
         - Reset or manipulate Clock A's internal next_frame_time
         - Introduce any pacing on socket writes (writes remain immediate + non-blocking)
+        - Execute during active segment playback (per C8: MUST NOT affect active content)
         
         Pre-fill MUST:
         - Use fallback PCM (silence/tone) only
         - Warm Tower buffer without audible program leak
         - Preserve segment semantics (start from position 0 after pre-fill)
+        - Only execute when NO segment is actively playing
         
         Args:
             segment: AudioEvent being played (used for logging only, NOT decoded)
@@ -701,6 +737,55 @@ class PlayoutEngine:
         Returns:
             True if pre-fill was executed, False if skipped
         """
+        # C8: Pre-fill MUST NOT execute during active segment playback
+        # Gate all pre-fill entry points to prevent silence injection mid-segment
+        # Read _segment_active under lock for thread safety
+        with self._segment_active_lock:
+            segment_active = self._segment_active
+            current_seg_type = self._current_segment.type if self._current_segment else "unknown"
+            current_seg_path = self._current_segment.path if self._current_segment else "unknown"
+        
+        if segment_active:
+            logger.warning(
+                f"[PREFILL-SILENCE] Skipped — segment active (type={current_seg_type}, path={current_seg_path})"
+            )
+            return False
+        
+        # SS5.1: Pre-fill MUST NOT run during any startup state where a segment is active
+        # SS5.1: Pre-fill MUST NOT run during STARTUP_ANNOUNCEMENT_PLAYING
+        # SS5.1: Pre-fill MUST NOT inject silence during startup announcement playback
+        if hasattr(self, '_station_startup_state_getter'):
+            startup_state = self._station_startup_state_getter()
+            if startup_state != "NORMAL_OPERATION":
+                logger.warning(f"[PREFILL-SILENCE] Skipped — startup state {startup_state} (SS5.1)")
+                return False
+        
+        # SD5.1, SD5.2: Pre-fill MUST be suppressed during DRAINING state
+        # SD5.1: Pre-fill silence injection MUST NOT occur while the shutdown announcement is playing
+        # SD5.2: Pre-fill MUST be suppressed throughout the DRAINING state
+        if self._is_draining:
+            logger.warning("[PREFILL-SILENCE] Skipped — DRAINING state (SD5.2)")
+            return False
+        
+        # SD5.1: Pre-fill MUST NOT occur while the shutdown announcement is playing
+        # Check if a shutdown announcement is currently active (segment is playing and is terminal)
+        with self._segment_active_lock:
+            segment_active = self._segment_active
+        if segment_active and self._current_segment_is_terminal:
+            current_seg_type = self._current_segment.type if self._current_segment else "unknown"
+            current_seg_path = self._current_segment.path if self._current_segment else "unknown"
+            logger.warning(
+                f"[PREFILL-SILENCE] Skipped — shutdown announcement playing (SD5.1) "
+                f"(type={current_seg_type}, path={current_seg_path})"
+            )
+            return False
+        
+        # SD5.1: Also suppress prefill before shutdown announcement starts (defensive check)
+        # Check if the segment about to play is a shutdown announcement
+        if segment and hasattr(segment, 'is_terminal') and segment.is_terminal and segment.type == "announcement":
+            logger.warning("[PREFILL-SILENCE] Skipped — shutdown announcement about to start (SD5.1)")
+            return False
+        
         # C8: Pre-fill is optional and implementation-defined
         # Check if pre-fill should run
         prefill_enabled = os.getenv("PREFILL_ENABLED", "true").lower() == "true"
@@ -711,7 +796,7 @@ class PlayoutEngine:
         buffer_status = self._get_tower_buffer_status()
         if buffer_status is None:
             # C8: If endpoint unavailable, skip pre-fill and fall back to normal pacing
-            logger.debug("[PREFILL] Tower buffer endpoint unavailable, skipping pre-fill")
+            logger.debug("[PREFILL-SILENCE] Tower buffer endpoint unavailable, skipping pre-fill")
             return False
         
         # Calculate buffer ratio
@@ -729,14 +814,26 @@ class PlayoutEngine:
         
         # C8: If ratio >= target, skip pre-fill
         if ratio >= target_ratio:
-            logger.debug(f"[PREFILL] Buffer ratio {ratio:.3f} >= target {target_ratio}, skipping pre-fill")
+            logger.debug(f"[PREFILL-SILENCE] Buffer ratio {ratio:.3f} >= target {target_ratio}, skipping pre-fill")
             return False
         
         # C8: Enter pre-fill mode - send NON-PROGRAM PCM (silence) frames as fast as possible
         # Pre-fill MUST NOT decode program audio or touch the decoder
         # Pre-fill uses fallback PCM (silence/tone) to warm Tower buffer
-        logger.info(f"[PREFILL] Starting pre-fill with silence (buffer ratio {ratio:.3f} < target {target_ratio})")
         prefill_start_time = time.monotonic()
+        
+        # Check if pre-fill occurs within ±250ms of segment start
+        time_to_segment_start = abs(prefill_start_time - start_time)
+        if time_to_segment_start <= 0.250:  # 250ms = 0.25 seconds
+            logger.warning(
+                f"[PREFILL-SILENCE] Pre-fill starting within ±250ms of segment start "
+                f"(time_to_start={time_to_segment_start*1000:.1f}ms, buffer_ratio={ratio:.3f} < target={target_ratio})"
+            )
+        
+        logger.info(
+            f"[PREFILL-SILENCE] Starting pre-fill with silence "
+            f"(buffer ratio {ratio:.3f} < target {target_ratio}, time_to_segment_start={time_to_segment_start*1000:.1f}ms)"
+        )
         frame_count = 0
         last_poll_time = prefill_start_time
         
@@ -752,18 +849,44 @@ class PlayoutEngine:
             while True:
                 # Check shutdown
                 if self._shutdown_requested or not self._is_running or self._stop_event.is_set():
-                    logger.info("[PREFILL] Stopping pre-fill early (shutdown requested)")
+                    elapsed = time.monotonic() - prefill_start_time
+                    logger.info(
+                        f"[PREFILL-SILENCE] Stopping pre-fill early (shutdown requested) "
+                        f"(frames={frame_count}, duration={elapsed:.3f}s, total_duration={elapsed*1000:.1f}ms)"
+                    )
                     break
+                
+                # C8: Continuously check if segment became active during prefill loop
+                # This prevents prefill from continuing if segment starts decoding mid-prefill
+                with self._segment_active_lock:
+                    segment_active = self._segment_active
+                    if segment_active:
+                        current_seg_type = self._current_segment.type if self._current_segment else "unknown"
+                        current_seg_path = self._current_segment.path if self._current_segment else "unknown"
+                        elapsed = time.monotonic() - prefill_start_time
+                        logger.warning(
+                            f"[PREFILL-SILENCE] Stopping pre-fill early — segment became active "
+                            f"(type={current_seg_type}, path={current_seg_path}, "
+                            f"frames={frame_count}, duration={elapsed:.3f}s, total_duration={elapsed*1000:.1f}ms)"
+                        )
+                        break
                 
                 # C8: Safety check - don't pre-fill indefinitely
                 if frame_count >= max_prefill_frames:
-                    logger.info(f"[PREFILL] Pre-fill frame limit ({max_prefill_frames} frames) reached, exiting pre-fill")
+                    elapsed = time.monotonic() - prefill_start_time
+                    logger.info(
+                        f"[PREFILL-SILENCE] Pre-fill frame limit reached "
+                        f"(frames={frame_count}/{max_prefill_frames}, duration={elapsed:.3f}s, total_duration={elapsed*1000:.1f}ms)"
+                    )
                     break
                 
                 # C8: Check timeout
                 elapsed = time.monotonic() - prefill_start_time
                 if elapsed >= prefill_timeout:
-                    logger.warning(f"[PREFILL] Pre-fill timeout ({prefill_timeout}s) reached, exiting pre-fill")
+                    logger.warning(
+                        f"[PREFILL-SILENCE] Pre-fill timeout reached "
+                        f"(frames={frame_count}, duration={elapsed:.3f}s, total_duration={elapsed*1000:.1f}ms, timeout={prefill_timeout}s)"
+                    )
                     break
                 
                 # C8: Poll buffer status periodically (every ~50-100ms)
@@ -774,7 +897,12 @@ class PlayoutEngine:
                         ratio = self._get_buffer_ratio(buffer_status)
                         # C8: Exit pre-fill when buffer reaches target
                         if ratio >= target_ratio:
-                            logger.info(f"[PREFILL] Buffer ratio {ratio:.3f} >= target {target_ratio}, pre-fill complete ({frame_count} frames)")
+                            elapsed = time.monotonic() - prefill_start_time
+                            logger.info(
+                                f"[PREFILL-SILENCE] Buffer target reached, pre-fill complete "
+                                f"(frames={frame_count}, duration={elapsed:.3f}s, total_duration={elapsed*1000:.1f}ms, "
+                                f"buffer_ratio={ratio:.3f} >= target={target_ratio})"
+                            )
                             break
                     last_poll_time = now
                 
@@ -786,15 +914,34 @@ class PlayoutEngine:
                     self._output_sink.write(silence_frame)
                     frame_count += 1
                 except Exception as e:
-                    logger.error(f"[PREFILL] Error writing frame: {e}", exc_info=True)
+                    elapsed = time.monotonic() - prefill_start_time
+                    logger.error(
+                        f"[PREFILL-SILENCE] Error writing silence frame "
+                        f"(frame_count={frame_count}, duration={elapsed:.3f}s): {e}",
+                        exc_info=True
+                    )
                     # Continue even if write fails (non-blocking behavior)
             
             prefill_duration = time.monotonic() - prefill_start_time
-            logger.info(f"[PREFILL] Pre-fill complete ({frame_count} silence frames in {prefill_duration:.2f}s)")
+            # Calculate total duration in milliseconds for clarity
+            total_duration_ms = prefill_duration * 1000
+            # Calculate frame duration (each frame is ~21.333ms at 48kHz)
+            frame_duration_ms = 1024.0 / 48000.0 * 1000  # ~21.333ms per frame
+            expected_duration_ms = frame_count * frame_duration_ms
+            logger.info(
+                f"[PREFILL-SILENCE] Pre-fill complete "
+                f"(frames={frame_count}, duration={prefill_duration:.3f}s, total_duration={total_duration_ms:.1f}ms, "
+                f"expected_duration={expected_duration_ms:.1f}ms)"
+            )
             return True  # Pre-fill executed
             
         except Exception as e:
-            logger.error(f"[PREFILL] Error during pre-fill: {e}", exc_info=True)
+            elapsed = time.monotonic() - prefill_start_time if 'prefill_start_time' in locals() else 0.0
+            logger.error(
+                f"[PREFILL-SILENCE] Error during pre-fill "
+                f"(frames={frame_count if 'frame_count' in locals() else 0}, duration={elapsed:.3f}s): {e}",
+                exc_info=True
+            )
             return True  # Pre-fill attempted
     
     def _play_audio_segment(self, segment: AudioEvent) -> int:
@@ -843,7 +990,16 @@ class PlayoutEngine:
             # Pre-fill MUST NOT affect Clock A timeline or segment timing
             # Pre-fill uses NON-PROGRAM PCM (silence/tone) only - does NOT decode segment
             # After pre-fill, normal decode loop starts from position 0 with Clock A + PID pacing
+            # Note: _segment_active is already True (set in start_segment at commit boundary)
+            # Pre-fill will check _segment_active and skip immediately, preventing silence injection
             prefill_executed = self._run_prefill_if_needed(segment, start_time, next_frame_time)
+            
+            # Safeguard: Ensure _segment_active is True before decoding begins
+            # (Already set in start_segment, but this ensures it's set even if start_segment wasn't called)
+            with self._segment_active_lock:
+                if not self._segment_active:
+                    logger.warning("[PLAYOUT] _segment_active was False before decode - setting as safeguard")
+                    self._segment_active = True
             
             # C8: Pre-fill does NOT touch the decoder, so we create it fresh here
             # Decoder starts from position 0 (beginning of file) after pre-fill completes
@@ -858,6 +1014,8 @@ class PlayoutEngine:
                 logger.debug(f"[PLAYOUT] FFmpegDecoder created after pre-fill (starting from position 0)")
             else:
                 logger.debug(f"[PLAYOUT] FFmpegDecoder created for {segment.path}")
+            
+            # _segment_active is already True (set in start_segment), ensuring prefill cannot run during decoding
             
             # Decode and write frames with Clock A pacing
             # Clock A paces consumption to ensure real-time playback duration
@@ -935,6 +1093,10 @@ class PlayoutEngine:
                     actual_elapsed = time.monotonic() - start_time
                     logger.debug(f"[PLAYOUT] Decoded {frame_count} frames ({actual_elapsed:.1f}s elapsed)")
             
+            # Note: _segment_active remains True after decode completes
+            # It will be set to False in finish_segment() after segment teardown completes
+            # This ensures prefill cannot run between decode completion and segment teardown
+            
             total_time = time.monotonic() - start_time
             expected_duration = self._get_segment_duration(segment)
             
@@ -955,6 +1117,10 @@ class PlayoutEngine:
             logger.error(f"[PLAYOUT] Error decoding/playing {segment.path}: {e}", exc_info=True)
             raise
         finally:
+            # Note: _segment_active remains True even if decode fails
+            # It will be set to False in finish_segment() after segment teardown completes
+            # This ensures prefill cannot run between decode failure and segment teardown
+            
             # Clear decoder reference when segment finishes (decoder.close() is called by read_frames() finally block)
             if self._current_decoder is decoder:
                 self._current_decoder = None

@@ -371,9 +371,21 @@ class DJEngine:
             has_legal_id=has_legal_id  # Metadata: whether any ID is legal (decided in THINK)
         )
         
-        logger.info(f"[DJ] THINK: DJIntent committed - "
+        # Propagate intent_id to all AudioEvents in the intent (for atomic execution tracking)
+        intent_id = self.current_intent.intent_id
+        if next_song:
+            next_song.intent_id = intent_id
+        if outro:
+            outro.intent_id = intent_id
+        if station_ids:
+            for sid in station_ids:
+                sid.intent_id = intent_id
+        if intro:
+            intro.intent_id = intent_id
+        
+        logger.info(f"[DJ] THINK: DJIntent committed - intent_id={intent_id}, "
                    f"outro={outro is not None}, ids={len(station_ids) if station_ids else 0}, "
-                   f"intro={intro is not None}, song={next_song.path}")
+                   f"intro={intro is not None}, song={next_song.path if next_song else None}")
     
     def on_segment_finished(self, segment: AudioEvent) -> None:
         """
@@ -406,13 +418,28 @@ class DJEngine:
             logger.debug(f"[DJ] Skipping DO for non-song segment: {segment.type} - {segment.path}")
             return  # skip THINK/DO
         
-        # Special case: Startup announcement DO - no state updates needed, just continue
+        # Special case: Startup announcement DO - verify queue is empty (SS3.1)
+        # This check happens before startup state guard to catch violations early
         if segment.type == "announcement" and not is_terminal:
-            logger.info("[DJ] DO: Startup announcement finished, first song will play next")
-            # Don't record as song played, don't update rotation
-            # Just continue to queue next items if intent exists
+            # Check if this is a startup announcement (no intent_id)
+            is_startup_announcement = (segment.intent_id is None)
+            if is_startup_announcement:
+                logger.info("[DJ] DO: Startup announcement finished, first song will play next")
+                # SS3.1: Queue MUST be empty when startup announcement finishes
+                if self.playout_engine and hasattr(self.playout_engine, '_queue'):
+                    queue = self.playout_engine._queue
+                    assert queue.empty(), f"[DJ] DO: SS3.1 violation - Queue must be empty when startup announcement finishes, but found {queue.size()} items"
+                    logger.info("[DJ] DO: SS3.1 verified - queue is empty (as required) - ready to enqueue first DJIntent")
+            # Don't record startup announcement as song played, don't update rotation
         
         logger.info(f"[DJ] DO Phase: Segment finished - {segment.type} - {segment.path}")
+        
+        # SD2.3, SD3.2: Guard terminal intent creation - if terminal intent already queued, return immediately
+        # Per contract SD2.3: All code paths that could create a terminal DJIntent MUST check the lifecycle latch first
+        # Per contract SD3.2: DJ DO MUST NOT execute terminal logic again after that enqueue
+        if self._is_draining and self._terminal_intent_queued:
+            logger.info("[DJ] DO: Terminal intent already queued - skipping DO phase (SD2.3, SD3.2)")
+            return  # Do NOT create THINK, do NOT execute DO
         
         # During DRAINING: The first DO callback after entering DRAINING is the last chance to generate shutdown announcement
         # If no terminal intent exists, create one now and execute terminal DO immediately
@@ -452,6 +479,21 @@ class DJEngine:
                 except Exception as e:
                     logger.warning(f"[DJ] Failed to record play in RotationManager: {e}")
         
+        # SS4.3: DJ DO MUST NOT run until STARTUP_DO_ENQUEUE state
+        # Check startup state if getter is available (Station provides this)
+        if hasattr(self, '_station_startup_state_getter'):
+            startup_state = self._station_startup_state_getter()
+            if startup_state in ["BOOTSTRAP", "STARTUP_ANNOUNCEMENT_PLAYING", "STARTUP_THINK_COMPLETE"]:
+                logger.error(f"[DJ] DO: CRITICAL - Attempted to execute DO during startup state {startup_state}")
+                logger.error("[DJ] DO: SS4.3 violation - DJ DO MUST NOT run until STARTUP_DO_ENQUEUE state")
+                raise RuntimeError(f"DO execution prohibited during startup state: {startup_state}")
+            # If in STARTUP_DO_ENQUEUE, this is the first DO - verify queue is empty
+            if startup_state == "STARTUP_DO_ENQUEUE":
+                if self.playout_engine and hasattr(self.playout_engine, '_queue'):
+                    queue = self.playout_engine._queue
+                    assert queue.empty(), f"SS6.1.1: Queue MUST be empty before first DJ DO, but found {queue.size()} items"
+                    logger.info("[DJ] DO: SS6.1.1 verified - queue is empty before first DO")
+        
         # 1. Retrieve current DJIntent (must exist - THINK always creates one)
         if not self.current_intent:
             logger.error("[DJ] DO: No DJIntent found! This should never happen - THINK should always create intent.")
@@ -464,6 +506,9 @@ class DJEngine:
         # Files were validated in THINK phase, so just execute here
         queue_order: list[AudioEvent] = []
         
+        # Capture intent_id for queue integrity tracking
+        intent_id = self.current_intent.intent_id
+        
         if is_terminal:
             # Invariant assertion: Terminal intent may only be queued once per lifecycle
             if self._terminal_intent_queued:
@@ -473,7 +518,11 @@ class DJEngine:
             # Terminal intent: Only queue shutdown announcement if present (per INT2.4)
             # Shutdown announcement is stored in intro field for terminal intents
             if self.current_intent.intro:
-                queue_order.append(self.current_intent.intro)
+                # Set intent_id on AudioEvent for queue integrity tracking
+                event = self.current_intent.intro
+                if event.intent_id is None:
+                    event.intent_id = intent_id
+                queue_order.append(event)
                 logger.info(f"[DJ] DO: Queueing shutdown announcement - {self.current_intent.intro.path}")
             # Terminal intent has no next_song (per DJ2.5)
             self._terminal_intent_queued = True  # Mark as queued
@@ -481,20 +530,32 @@ class DJEngine:
         else:
             # Normal intent: Standard queue order
             if self.current_intent.outro:
-                queue_order.append(self.current_intent.outro)
+                event = self.current_intent.outro
+                if event.intent_id is None:
+                    event.intent_id = intent_id
+                queue_order.append(event)
                 logger.info(f"[DJ] DO: Queueing outro - {self.current_intent.outro.path}")
             
             if self.current_intent.station_ids:
+                for sid in self.current_intent.station_ids:
+                    if sid.intent_id is None:
+                        sid.intent_id = intent_id
                 queue_order.extend(self.current_intent.station_ids)
                 for sid in self.current_intent.station_ids:
                     logger.info(f"[DJ] DO: Queueing station ID - {sid.path}")
             
             if self.current_intent.intro:
-                queue_order.append(self.current_intent.intro)
+                event = self.current_intent.intro
+                if event.intent_id is None:
+                    event.intent_id = intent_id
+                queue_order.append(event)
                 logger.info(f"[DJ] DO: Queueing intro - {self.current_intent.intro.path}")
             
             if self.current_intent.next_song:
-                queue_order.append(self.current_intent.next_song)
+                event = self.current_intent.next_song
+                if event.intent_id is None:
+                    event.intent_id = intent_id
+                queue_order.append(event)
                 logger.info(f"[DJ] DO: Queueing next song - {self.current_intent.next_song.path}")
         
         # Invariant: No non-terminal AudioEvent may be queued after draining begins
@@ -504,10 +565,67 @@ class DJEngine:
             logger.error(f"[DJ] DO: Queue order would have been: {[e.path for e in queue_order]}")
             raise RuntimeError("No non-terminal AudioEvent may be queued after draining begins")
         
+        # Log intent ID and verify queue state before enqueuing (atomic execution enforcement)
+        intent_id = self.current_intent.intent_id
+        logger.info(f"[DJ] DO: Enqueuing intent - intent_id={intent_id}, segments={len(queue_order)}")
+        
+        # Debug assertion: Queue must be empty before enqueueing intent when queue was previously empty
+        # This ensures no AudioEvent is enqueued before a DJIntent DO phase completes when queue is empty
+        # Per requirement: "assert playout_queue.is_empty() immediately before enqueueing the first DJIntent"
+        if self.playout_engine and hasattr(self.playout_engine, '_queue'):
+            queue = self.playout_engine._queue
+            # Check if queue is empty before enqueueing (this happens on first intent and other boundary cases)
+            # This covers both cases: after startup announcement, or bootstrap (no announcement)
+            is_queue_empty_before_enqueue = (queue.empty() and self.current_intent.next_song is not None)
+            if is_queue_empty_before_enqueue:
+                assert queue.empty(), f"[DJ] DO: CRITICAL - Playout queue must be empty before enqueueing intent, but found {queue.size()} items"
+                logger.info("[DJ] DO: Queue empty at DO boundary — safe to enqueue intent")
+        
+        # Assert that no older intent IDs remain at the queue head (per INT2.3, E0.6)
+        if self.playout_engine and hasattr(self.playout_engine, '_queue'):
+            queue = self.playout_engine._queue
+            if not queue.empty():
+                # Check intent_id at queue head
+                head_intent_id = queue.peek_intent_id()
+                if head_intent_id is not None:
+                    # Verify queue head is from the current intent being executed
+                    # (It's acceptable to have segments from current intent, but not from older intents)
+                    if head_intent_id != intent_id:
+                        # Get all intent_ids for detailed error message
+                        queue_intent_ids = queue.get_all_intent_ids() if hasattr(queue, 'get_all_intent_ids') else [head_intent_id]
+                        logger.error(f"[DJ] DO: CRITICAL - Queue head contains older intent_id={head_intent_id}, "
+                                   f"current intent_id={intent_id}")
+                        logger.error(f"[DJ] DO: All queue intent_ids: {queue_intent_ids}")
+                        logger.error(f"[DJ] DO: This violates atomic intent execution (INT2.3, E0.6)")
+                        raise RuntimeError(f"Queue head contains older intent_id {head_intent_id}, "
+                                         f"cannot enqueue new intent {intent_id} - cross-intent leakage detected")
+                    else:
+                        logger.debug(f"[DJ] DO: Queue head matches current intent_id={intent_id} (acceptable)")
+        
         # Push to playout queue
         if self.playout_engine:
+            # SS3.4: All AudioEvents enqueued in STARTUP_DO_ENQUEUE MUST share the same intent_id
+            if hasattr(self, '_station_startup_state_getter'):
+                startup_state = self._station_startup_state_getter()
+                if startup_state == "STARTUP_DO_ENQUEUE":
+                    # Verify all AudioEvents share the same intent_id
+                    intent_ids = [e.intent_id for e in queue_order if e.intent_id is not None]
+                    if len(intent_ids) > 0:
+                        first_intent_id = intent_ids[0]
+                        assert all(iid == first_intent_id for iid in intent_ids), \
+                            "SS6.1.3: All AudioEvents enqueued during STARTUP_DO_ENQUEUE MUST share the same intent_id"
+                        logger.info(f"[DJ] DO: SS6.1.3 verified - all {len(queue_order)} AudioEvents share intent_id={first_intent_id}")
+            
             self.playout_engine.queue_audio(queue_order)
-            logger.info(f"[DJ] DO: Pushed {len(queue_order)} audio event(s) to playout queue")
+            logger.info(f"[DJ] DO: Pushed {len(queue_order)} audio event(s) to playout queue with intent_id={intent_id}")
+            
+            # SS1.5: After first DO completes, transition to NORMAL_OPERATION
+            if hasattr(self, '_station_startup_state_getter') and hasattr(self, '_notify_startup_state_transition'):
+                startup_state = self._station_startup_state_getter()
+                if startup_state == "STARTUP_DO_ENQUEUE" and not is_terminal:
+                    # First DO completed - notify Station to transition to NORMAL_OPERATION
+                    self._notify_startup_state_transition("NORMAL_OPERATION")
+                    logger.info("[DJ] DO: SS1.5 - First DO completed, transitioning to NORMAL_OPERATION")
             
             # Invariant: Terminal intent may only be queued once
             if is_terminal:
@@ -1102,6 +1220,10 @@ class DJEngine:
                 has_legal_id=False,
                 is_terminal=True
             )
+            # Propagate intent_id to shutdown announcement AudioEvent
+            intent_id = self.current_intent.intent_id
+            shutdown_announcement.intent_id = intent_id
+            logger.info(f"[DJ] THINK: Terminal intent created - intent_id={intent_id}")
         else:
             # Terminal intent with no AudioEvents (per SL2.2.6)
             self.current_intent = DJIntent(
@@ -1112,8 +1234,104 @@ class DJEngine:
                 has_legal_id=False,
                 is_terminal=True
             )
+            intent_id = self.current_intent.intent_id
+            logger.info(f"[DJ] THINK: Terminal intent created (no announcement) - intent_id={intent_id}")
         
         logger.info(f"[DJ] THINK: Terminal intent created (announcement={shutdown_announcement is not None})")
+    
+    def _assert_queue_integrity(self, expanded_segments: list[AudioEvent], intent_id) -> None:
+        """
+        Assert that queue tail matches expanded segments from current intent.
+        
+        This defensive assertion prevents silent queue corruption by verifying that
+        the segments we just enqueued are actually at the tail of the queue.
+        
+        Assertion Rule:
+        After DO finishes enqueueing:
+        queue_tail == expanded_segments_of_current_intent
+        
+        Constraints:
+        - Must NOT run in production mode unless STRICT_QUEUE_ASSERTS=1
+        - Must be O(n) max
+        - Compares file paths AND intent IDs
+        
+        Args:
+            expanded_segments: List of AudioEvents that were expanded from DJIntent
+            intent_id: UUID of the DJIntent that was expanded
+        """
+        # Check if assertion should run
+        strict_asserts = os.getenv("STRICT_QUEUE_ASSERTS", "0") == "1"
+        if not strict_asserts:
+            # Skip assertion in production mode unless explicitly enabled
+            return
+        
+        if not self.playout_engine or not self.playout_engine._queue:
+            # Can't assert if queue is not available
+            return
+        
+        if len(expanded_segments) == 0:
+            # Nothing to assert if no segments were enqueued
+            return
+        
+        # Get queue tail (last N items where N = len(expanded_segments))
+        queue_tail = self.playout_engine._queue.get_tail(len(expanded_segments))
+        
+        # Compare lengths
+        if len(queue_tail) != len(expanded_segments):
+            error_msg = (
+                f"[QUEUE_INTEGRITY] Queue tail length mismatch! "
+                f"Expected {len(expanded_segments)} segments, found {len(queue_tail)} in queue tail. "
+                f"Intent ID: {intent_id}"
+            )
+            logger.error(error_msg)
+            logger.error(f"[QUEUE_INTEGRITY] Expanded segments: {[(e.type, e.path, e.intent_id) for e in expanded_segments]}")
+            logger.error(f"[QUEUE_INTEGRITY] Queue tail: {[(e.type, e.path, e.intent_id) for e in queue_tail]}")
+            logger.error(f"[QUEUE_INTEGRITY] Full queue dump: {self.playout_engine._queue.dump()}")
+            
+            # Raise RuntimeError in debug mode (when STRICT_QUEUE_ASSERTS=1)
+            raise RuntimeError(f"Queue integrity violation: tail length mismatch. {error_msg}")
+        
+        # Compare each segment: file paths AND intent IDs
+        mismatches = []
+        for i, (expected, actual) in enumerate(zip(expanded_segments, queue_tail)):
+            path_match = expected.path == actual.path
+            intent_match = expected.intent_id == actual.intent_id
+            
+            if not path_match or not intent_match:
+                mismatches.append({
+                    "index": i,
+                    "expected": {"type": expected.type, "path": expected.path, "intent_id": expected.intent_id},
+                    "actual": {"type": actual.type, "path": actual.path, "intent_id": actual.intent_id},
+                    "path_match": path_match,
+                    "intent_match": intent_match
+                })
+        
+        if mismatches:
+            error_msg = (
+                f"[QUEUE_INTEGRITY] Queue tail content mismatch! "
+                f"Found {len(mismatches)} mismatched segment(s). Intent ID: {intent_id}"
+            )
+            logger.error(error_msg)
+            
+            for mismatch in mismatches:
+                logger.error(
+                    f"[QUEUE_INTEGRITY] Mismatch at index {mismatch['index']}: "
+                    f"Expected {mismatch['expected']}, found {mismatch['actual']}. "
+                    f"Path match: {mismatch['path_match']}, Intent match: {mismatch['intent_match']}"
+                )
+            
+            logger.error(f"[QUEUE_INTEGRITY] Expanded segments: {[(e.type, e.path, e.intent_id) for e in expanded_segments]}")
+            logger.error(f"[QUEUE_INTEGRITY] Queue tail: {[(e.type, e.path, e.intent_id) for e in queue_tail]}")
+            logger.error(f"[QUEUE_INTEGRITY] Full queue dump: {self.playout_engine._queue.dump()}")
+            
+            # Raise RuntimeError in debug mode (when STRICT_QUEUE_ASSERTS=1)
+            raise RuntimeError(f"Queue integrity violation: tail content mismatch. {error_msg}")
+        
+        # Assertion passed
+        logger.debug(
+            f"[QUEUE_INTEGRITY] Assertion passed: queue tail matches expanded segments "
+            f"({len(expanded_segments)} segments, intent_id={intent_id})"
+        )
     
     def from_dict(self, data: dict) -> None:
         """

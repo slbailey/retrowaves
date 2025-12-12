@@ -18,6 +18,13 @@ from station.state.dj_state_store import DJStateStore
 
 logger = logging.getLogger(__name__)
 
+# Startup State Machine constants (per STATION_STARTUP_STATE_MACHINE_CONTRACT)
+STARTUP_STATE_BOOTSTRAP = "BOOTSTRAP"
+STARTUP_STATE_ANNOUNCEMENT_PLAYING = "STARTUP_ANNOUNCEMENT_PLAYING"
+STARTUP_STATE_THINK_COMPLETE = "STARTUP_THINK_COMPLETE"
+STARTUP_STATE_DO_ENQUEUE = "STARTUP_DO_ENQUEUE"
+STARTUP_STATE_NORMAL_OPERATION = "NORMAL_OPERATION"
+
 # Setup file handler for contract-compliant logging (LOG1, LOG2, LOG3, LOG4)
 # Per contract: /var/log/retrowaves/station.log, non-blocking, rotation-tolerant
 # StationLifecycle is implemented in Station class
@@ -87,6 +94,10 @@ class Station:
         self.running = False
         self._shutdown_initiated = False
         
+        # Startup state machine (per STATION_STARTUP_STATE_MACHINE_CONTRACT)
+        # SS1: Defined Startup States - MUST begin in BOOTSTRAP
+        self._startup_state = STARTUP_STATE_BOOTSTRAP
+        
         # Lifecycle state machine (per SL2.2.3)
         # States: RUNNING, DRAINING, SHUTTING_DOWN
         self._lifecycle_state_enum = "RUNNING"  # Initial state
@@ -102,6 +113,24 @@ class Station:
         # Max-wait timeout for long segments (per SL2.2.5)
         self._shutdown_timeout_seconds = 300.0  # 5 minutes default
         self._shutdown_start_time: Optional[float] = None
+    
+    def _set_lifecycle_state(self, new_state: str) -> None:
+        """
+        Set lifecycle state and log transition only when state actually changes.
+        
+        Prevents no-op transitions (e.g., RUNNING → RUNNING) from being logged.
+        Only logs and assigns when the state actually changes.
+        
+        Args:
+            new_state: New lifecycle state (RUNNING, DRAINING, SHUTTING_DOWN)
+        """
+        if self._lifecycle_state_enum == new_state:
+            logger.debug(f"[LIFECYCLE] State unchanged: {new_state}")
+            return
+        
+        previous_state = self._lifecycle_state_enum
+        self._lifecycle_state_enum = new_state
+        logger.info(f"[LIFECYCLE] State transition: {previous_state} → {new_state}")
     
     def start(self):
         """
@@ -190,51 +219,121 @@ class Station:
         )
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)
+        
+        # Pass startup state tracker to DJEngine for DO phase guards
+        self.dj._station_startup_state_getter = lambda: self._startup_state
+        
+        # Pass startup state tracker to PlayoutEngine for pre-fill gating (SS5.1)
+        self.engine._station_startup_state_getter = lambda: self._startup_state
+        
+        # Pass state transition notifier to DJEngine
+        def notify_startup_state_transition(new_state: str):
+            if self._startup_state != new_state:
+                logger.info(f"[STARTUP] State transition: {self._startup_state} → {new_state}")
+                self._startup_state = new_state
+        self.dj._notify_startup_state_transition = notify_startup_state_transition
+        
+        # Wrap DJ callbacks to track startup state transitions
+        original_on_segment_finished = self.dj.on_segment_finished
+        def wrapped_on_segment_finished(segment: AudioEvent):
+            # SS2.1: STARTUP_THINK_COMPLETE → STARTUP_DO_ENQUEUE
+            # Transition occurs when startup announcement finishes playing
+            # This MUST happen before DJ DO is allowed to run
+            if (self._startup_state == STARTUP_STATE_THINK_COMPLETE and 
+                segment.type == "announcement" and 
+                segment.intent_id is None):
+                logger.info(f"[STARTUP] Startup announcement finished: {segment.path}")
+                # SS3.1: Queue MUST be empty when startup announcement finishes
+                assert self.engine._queue.empty(), "SS3.1: Queue MUST be empty when startup announcement finishes"
+                logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_DO_ENQUEUE}")
+                self._startup_state = STARTUP_STATE_DO_ENQUEUE
+            # Call original callback (which will handle DO execution)
+            original_on_segment_finished(segment)
+        self.dj.on_segment_finished = wrapped_on_segment_finished
+        
+        # Wrap on_segment_started to track THINK completion during startup
+        original_on_segment_started = self.dj.on_segment_started
+        def wrapped_on_segment_started(segment: AudioEvent):
+            # Call original callback (which will handle THINK execution)
+            original_on_segment_started(segment)
+            # SS1.3: When THINK completes during startup announcement, transition to STARTUP_THINK_COMPLETE
+            if (self._startup_state == STARTUP_STATE_ANNOUNCEMENT_PLAYING and 
+                segment.type == "announcement" and 
+                self.dj.current_intent is not None):
+                logger.info(f"[STARTUP] THINK completed during startup announcement")
+                logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_THINK_COMPLETE}")
+                self._startup_state = STARTUP_STATE_THINK_COMPLETE
+        self.dj.on_segment_started = wrapped_on_segment_started
+        
         logger.info("PlayoutEngine initialized")
         
-        # SL1.3: Set startup flag for initial THINK (may select startup announcement)
+        # SS1.1: BOOTSTRAP state - Components initialized, queue empty
+        assert self._startup_state == STARTUP_STATE_BOOTSTRAP, "SS1.1: Startup state MUST begin in BOOTSTRAP"
+        assert self.engine._queue.empty(), "SS3.1: Playout queue MUST be empty in BOOTSTRAP"
+        logger.info(f"[STARTUP] State: {self._startup_state}")
+        
+        # SS1.3: Select startup announcement if available
         # Per SL1.3: Startup announcement is selected during initial THINK phase
         self.dj.set_lifecycle_state(is_startup=True, is_draining=False)
         
-        # SL1.2: Select first song BEFORE playout begins
-        # This ensures first song is selected during startup, not during first THINK phase
-        # Per SL1.2: First song selection occurs during startup, not during first THINK phase
-        logger.info("Selecting first song...")
-        first_song = self.rotation.select_next_song()
-        if not first_song:
-            raise RuntimeError("Failed to select first song: no tracks available")
-        logger.info(f"First song selected: {first_song}")
-        first_song_metadata = _get_mp3_metadata(first_song)
-        first_audio_event = AudioEvent(first_song, "song", metadata=first_song_metadata)
-        
-        # SL1.3: Trigger initial THINK to select startup announcement (if available)
-        # Per SL1.3: Startup announcement is selected during initial THINK phase
-        # We trigger THINK by calling on_segment_started with a dummy segment
-        # This allows DJEngine to select startup announcement during THINK
-        dummy_segment = AudioEvent(first_song, "song", metadata=first_song_metadata)
+        # Trigger initial THINK to select startup announcement (if available)
+        dummy_segment = AudioEvent("", "song", metadata=None)
         self.dj.on_segment_started(dummy_segment)
         
+        # Reset startup flag after initial THINK
+        self.dj.set_lifecycle_state(is_startup=False, is_draining=False)
+        
         # Check if startup announcement was selected
-        startup_queue = []
+        startup_announcement = None
         if self.dj.current_intent and self.dj.current_intent.next_song and self.dj.current_intent.next_song.type == "announcement":
-            # Startup announcement was selected, queue it directly
+            # SS1.2: Transition to STARTUP_ANNOUNCEMENT_PLAYING
             startup_announcement = self.dj.current_intent.next_song
-            startup_queue.append(startup_announcement)
-            logger.info(f"[LIFECYCLE] Startup announcement selected: {startup_announcement.path}")
-            # Clear intent so first song THINK can run when announcement starts
+            
+            # SS3.3: Startup announcement MUST NOT have intent_id
+            assert startup_announcement.intent_id is None, "SS3.3: Startup announcement MUST NOT have intent_id"
+            
+            # Ensure startup announcement has no intent_id (defensive)
+            startup_announcement.intent_id = None
+            
+            logger.info(f"[STARTUP] Startup announcement selected: {startup_announcement.path}")
+            logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_ANNOUNCEMENT_PLAYING}")
+            self._startup_state = STARTUP_STATE_ANNOUNCEMENT_PLAYING
+            
+            # SS3.3: Inject startup announcement as active segment (not via DJ DO)
+            # Queue it directly - it will be played immediately
+            self.engine.queue_audio([startup_announcement])
+            logger.info("[STARTUP] Startup announcement injected as active segment (no intent_id)")
+            
+            # Clear intent - when startup announcement starts, THINK will prepare first song intent
             self.dj.current_intent = None
         else:
-            logger.info("[LIFECYCLE] Startup announcement skipped (pool empty or not selected)")
-        
-        # Queue startup announcement (if selected) and first song
-        # Per SL1.4: If startup announcement exists, first song THINK occurs after startup announcement starts
-        if startup_queue:
-            self.engine.queue_audio(startup_queue)
-            logger.info("Startup announcement queued for playout")
-        # Always queue first song (it will play after startup announcement if present)
-        # When startup announcement starts, THINK will run to prepare intent for after first song
-        self.engine.queue_audio([first_audio_event])
-        logger.info("First song queued for playout")
+            # SS2.2: No announcement - skip to STARTUP_DO_ENQUEUE
+            logger.info("[STARTUP] Startup announcement skipped (pool empty or not selected)")
+            if self.dj.current_intent:
+                logger.warning("[STARTUP] THINK created intent without startup announcement - clearing")
+                self.dj.current_intent = None
+            
+            # Trigger THINK to prepare first intent
+            bootstrap_segment = AudioEvent("", "song", metadata=None)
+            self.dj.on_segment_started(bootstrap_segment)
+            
+            # SS1.4: Transition directly to STARTUP_DO_ENQUEUE (no announcement)
+            if self.dj.current_intent and self.dj.current_intent.next_song:
+                logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_DO_ENQUEUE}")
+                self._startup_state = STARTUP_STATE_DO_ENQUEUE
+                
+                # SS3.1: Queue MUST be empty before first DO
+                assert self.engine._queue.empty(), "SS6.1.1: Queue MUST be empty before first DJ DO"
+                
+                # Execute first DO to enqueue first song
+                self.dj.on_segment_finished(bootstrap_segment)
+                logger.info("[STARTUP] First song enqueued by bootstrap DO phase")
+                
+                # SS1.5: Transition to NORMAL_OPERATION
+                logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_NORMAL_OPERATION}")
+                self._startup_state = STARTUP_STATE_NORMAL_OPERATION
+            else:
+                logger.error("[STARTUP] THINK failed to create intent for first song - playout may not start")
         
         # SL1.3: Send lifecycle event BEFORE starting playout
         # Per SL1.3: Lifecycle event MUST be sent before playout begins to guarantee
@@ -259,11 +358,9 @@ class Station:
         self.engine.run()  # This starts the playout loop in a background thread
         logger.info("Playout engine started (startup complete, playout running in background)")
         
-        # Update lifecycle state to RUNNING
-        previous_state = self._lifecycle_state_enum
-        self._lifecycle_state_enum = "RUNNING"
+        # Update lifecycle state to RUNNING (only logs if state actually changes)
+        self._set_lifecycle_state("RUNNING")
         self.running = True
-        logger.info(f"[LIFECYCLE] State transition: {previous_state} → RUNNING")
         logger.info("=== Station started successfully ===")
     
     def run_forever(self):
@@ -296,10 +393,8 @@ class Station:
         self._shutdown_initiated = True
         
         # SL2.2.1: PHASE 1 - Enter DRAINING state immediately
-        previous_state = self._lifecycle_state_enum
         logger.info("[SHUTDOWN] PHASE 1: Entering DRAINING state")
-        self._lifecycle_state_enum = "DRAINING"
-        logger.info(f"[LIFECYCLE] State transition: {previous_state} → DRAINING")
+        self._set_lifecycle_state("DRAINING")
         self._shutdown_start_time = time.monotonic()
         
         # Set draining state in DJEngine and PlayoutEngine
@@ -400,10 +495,8 @@ class Station:
                 logger.warning("Tower control client not available, cannot send station_shutting_down event")
         
         # SL2.3: PHASE 2 - Enter SHUTTING_DOWN state
-        previous_state = self._lifecycle_state_enum
         logger.info("[SHUTDOWN] PHASE 2: Entering SHUTTING_DOWN state")
-        self._lifecycle_state_enum = "SHUTTING_DOWN"
-        logger.info(f"[LIFECYCLE] State transition: {previous_state} → SHUTTING_DOWN")
+        self._set_lifecycle_state("SHUTTING_DOWN")
         self.running = False
         
         # SL2.3.2: No THINK or DO events MAY fire after SHUTTING_DOWN begins
