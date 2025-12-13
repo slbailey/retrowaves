@@ -4,16 +4,27 @@ HTTP Server for Appalachia Radio 3.1.
 Handles HTTP streaming requests for live audio stream.
 """
 
+import json
 import logging
 import select
 import socket
 import socketserver
 import threading
 from http.server import BaseHTTPRequestHandler
+from typing import Optional
 
 from station.outputs.http_connection_manager import HTTPConnectionManager
 
 logger = logging.getLogger(__name__)
+
+# Module-level now_playing_manager (set by Station)
+_now_playing_manager = None
+
+
+def set_now_playing_manager(manager):
+    """Set the now_playing_manager for HTTP handlers."""
+    global _now_playing_manager
+    _now_playing_manager = manager
 
 
 class HTTPStreamingHandler(BaseHTTPRequestHandler):
@@ -29,6 +40,84 @@ class HTTPStreamingHandler(BaseHTTPRequestHandler):
         """Handle GET requests."""
         if self.path == "/stream":
             self._handle_stream()
+        elif self.path == "/now_playing":
+            self._handle_now_playing()
+        else:
+            self.send_error(404, "Not Found")
+    
+    def _handle_now_playing(self):
+        """
+        Handle /now_playing GET request (per NEW_NOW_PLAYING_STATE_CONTRACT E.3).
+        
+        Contract E.3: REST endpoint MUST respond to GET requests with current state.
+        Contract E.3: Endpoint MUST be read-only.
+        Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted.
+        """
+        # Contract E.3: Endpoint MUST respond to GET requests
+        global _now_playing_manager
+        if _now_playing_manager is None:
+            self.send_error(503, "Service Unavailable")
+            return
+        
+        state = _now_playing_manager.get_state()
+        
+        # Contract E.3: Endpoint MUST return None or empty representation when no segment is playing
+        if state is None:
+            response_data = None
+        else:
+            # Contract E.3: Endpoint MUST return state in a consistent format (JSON recommended)
+            response_data = {
+                "segment_type": state.segment_type,
+                "started_at": state.started_at,
+                "title": state.title,
+                "artist": state.artist,
+                "album": state.album,
+                "year": state.year,
+                "duration_sec": state.duration_sec,
+                "file_path": state.file_path
+            }
+        
+        # Send JSON response
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        
+        try:
+            response_json = json.dumps(response_data)
+            self.wfile.write(response_json.encode('utf-8'))
+        except Exception as e:
+            logger.debug(f"Error sending now_playing response: {e}")
+    
+    def do_POST(self):
+        """Reject POST requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
+        if self.path == "/now_playing":
+            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
+            self.send_error(405, "Method Not Allowed")
+        else:
+            self.send_error(404, "Not Found")
+    
+    def do_PUT(self):
+        """Reject PUT requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
+        if self.path == "/now_playing":
+            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
+            self.send_error(405, "Method Not Allowed")
+        else:
+            self.send_error(404, "Not Found")
+    
+    def do_PATCH(self):
+        """Reject PATCH requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
+        if self.path == "/now_playing":
+            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
+            self.send_error(405, "Method Not Allowed")
+        else:
+            self.send_error(404, "Not Found")
+    
+    def do_DELETE(self):
+        """Reject DELETE requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
+        if self.path == "/now_playing":
+            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
+            self.send_error(405, "Method Not Allowed")
         else:
             self.send_error(404, "Not Found")
     

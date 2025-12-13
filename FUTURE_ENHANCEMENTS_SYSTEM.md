@@ -95,6 +95,33 @@ Provide:
 
 All operations respect THINK/DO model: current segments always complete, decisions apply to future segments.
 
+### Station Control Plane (Future / Out of Scope)
+
+In the future, Retrowaves may support **direct operational control of Station behavior** via a dedicated Station-side control interface.
+
+This control plane is explicitly **separate from Tower**, which remains a one-way broadcast and telemetry distributor modeled after a real radio transmission tower.
+
+Conceptually, this control interface represents the ability to "call the station" — similar to how real broadcast automation systems allow engineers or operators to request actions without interfering with transmission infrastructure.
+
+Examples of potential control requests (non-exhaustive):
+
+- Request skip of next song
+- Request forced legal ID at next safe boundary
+- Request transition to live assist / hot mic
+- Request asset library reload
+- Request graceful shutdown after current segment
+
+Key constraints:
+
+- Control requests are **advisory**, not imperative
+- Station remains fully autonomous and decides **if and when** a request is honored
+- All requests are evaluated within existing THINK / DO boundaries
+- Control MUST NOT interrupt audio mid-segment
+- Control MUST NOT influence timing, buffering, or fallback behavior
+- Control MUST NOT be routed through Tower
+
+This item is intentionally deferred and documented here to preserve architectural intent without introducing premature control surfaces.
+
 ### Intelligent Media Library Self-Organization
 
 Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.

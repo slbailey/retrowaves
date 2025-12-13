@@ -15,6 +15,7 @@ from station.outputs.factory import create_output_sink
 from station.outputs.tower_pcm_sink import TowerPCMSink
 from station.outputs.tower_control import TowerControlClient
 from station.state.dj_state_store import DJStateStore
+from station.state.now_playing_state import NowPlayingStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ class Station:
         self.engine: Optional[PlayoutEngine] = None
         self.sink: Optional[TowerPCMSink] = None
         self.tower_control: Optional[TowerControlClient] = None
+        self.now_playing_manager: Optional[NowPlayingStateManager] = None
         
         # Runtime state
         self.running = False
@@ -220,6 +222,51 @@ class Station:
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)
         
+        # Initialize NowPlayingStateManager (per NEW_NOW_PLAYING_STATE_CONTRACT)
+        logger.info("Initializing NowPlayingStateManager...")
+        self.now_playing_manager = NowPlayingStateManager()
+        
+        # Register with HTTP server (if HTTP streaming is used)
+        try:
+            from station.app.http_server import set_now_playing_manager
+            set_now_playing_manager(self.now_playing_manager)
+            logger.info("NowPlayingStateManager registered with HTTP server")
+        except ImportError:
+            # HTTP server may not be available (e.g., if not using HTTP streaming)
+            logger.debug("HTTP server not available, skipping now_playing endpoint registration")
+        
+        # Add WebSocket event listener (send events via TowerControlClient)
+        if self.tower_control:
+            def send_now_playing_event(state):
+                """Send now_playing event to Tower (for WebSocket broadcasting)."""
+                if state is None:
+                    # State cleared - send empty event
+                    self.tower_control.send_event(
+                        event_type="now_playing",
+                        timestamp=time.monotonic(),
+                        metadata={}
+                    )
+                else:
+                    # State created - send state data
+                    self.tower_control.send_event(
+                        event_type="now_playing",
+                        timestamp=time.monotonic(),
+                        metadata={
+                            "segment_type": state.segment_type,
+                            "started_at": state.started_at,
+                            "title": state.title,
+                            "artist": state.artist,
+                            "album": state.album,
+                            "year": state.year,
+                            "duration_sec": state.duration_sec,
+                            "file_path": state.file_path
+                        }
+                    )
+            self.now_playing_manager.add_listener(send_now_playing_event)
+            logger.info("NowPlayingStateManager WebSocket events enabled")
+        else:
+            logger.info("NowPlayingStateManager initialized (no TowerControlClient for events)")
+        
         # Pass startup state tracker to DJEngine for DO phase guards
         self.dj._station_startup_state_getter = lambda: self._startup_state
         
@@ -249,6 +296,9 @@ class Station:
                 self._startup_state = STARTUP_STATE_DO_ENQUEUE
             # Call original callback (which will handle DO execution)
             original_on_segment_finished(segment)
+            # Update NowPlayingState (per NEW_NOW_PLAYING_STATE_CONTRACT U.3)
+            if self.now_playing_manager:
+                self.now_playing_manager.on_segment_finished()
         self.dj.on_segment_finished = wrapped_on_segment_finished
         
         # Wrap on_segment_started to track THINK completion during startup
@@ -263,6 +313,10 @@ class Station:
                 logger.info(f"[STARTUP] THINK completed during startup announcement")
                 logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_THINK_COMPLETE}")
                 self._startup_state = STARTUP_STATE_THINK_COMPLETE
+            # Update NowPlayingState (per NEW_NOW_PLAYING_STATE_CONTRACT U.1)
+            # This is called from PlayoutEngine.start_segment() when segment actually starts
+            if self.now_playing_manager:
+                self.now_playing_manager.on_segment_started(segment)
         self.dj.on_segment_started = wrapped_on_segment_started
         
         logger.info("PlayoutEngine initialized")
@@ -391,6 +445,11 @@ class Station:
         
         logger.info("=== Station shutting down ===")
         self._shutdown_initiated = True
+        
+        # Per NEW_NOW_PLAYING_STATE_CONTRACT U.3: Clear state on restart/shutdown
+        if self.now_playing_manager:
+            self.now_playing_manager.clear_state()
+            logger.debug("[NOW_PLAYING] State cleared on shutdown")
         
         # SL2.2.1: PHASE 1 - Enter DRAINING state immediately
         logger.info("[SHUTDOWN] PHASE 1: Entering DRAINING state")

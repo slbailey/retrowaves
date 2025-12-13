@@ -1028,7 +1028,7 @@ class TestStationEventReception:
         Test T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST to /tower/events/ingest.
         
         Per contract T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST.
-        Accepted event types: station_starting_up, station_shutting_down, new_song, dj_talking.
+        Accepted event types: station_starting_up, station_shutting_down, new_song, dj_talking, now_playing.
         """
         # Start HTTP server
         import random
