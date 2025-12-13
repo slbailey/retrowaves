@@ -288,3 +288,4 @@ The key insight is that shutdown is a terminal state: once a terminal shutdown a
 
 By enforcing that THINK/DO do not re-enter terminal logic after the shutdown announcement completes, and by suppressing pre-fill during terminal announcement playback, this contract ensures shutdown behavior is deterministic and idempotent, preventing race conditions and duplicate enqueueing attempts.
 
+

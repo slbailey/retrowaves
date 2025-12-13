@@ -6,7 +6,7 @@ This document is a **wishlist of ideas** for potential future enhancements to th
 
 **What This Document Is:**
 - A prioritized list of potential features and enhancements
-- Ideas organized by importance (stability/performance first, then features, then nice-to-haves)
+- Ideas organized by importance (operational robustness, then features, then nice-to-haves)
 - A reference for future development phases
 - Non-binding suggestions that can be implemented when ready
 
@@ -21,177 +21,143 @@ This document is a **wishlist of ideas** for potential future enhancements to th
 
 ---
 
-## Priority Overview
+## Core Broadcast Engine — Out of Scope for This Document
 
-This wishlist is organized by priority, starting with features that affect **overall stability, performance, and broadcast-grade implementation**, then moving down to less critical enhancements:
+Core broadcast correctness, timing discipline, fallback behavior, buffer stability, and two-clock enforcement are **not feature work**.
 
-1. **🎯 Next Priority** - Features ready for immediate implementation
-2. **🔧 Stability & Performance** - Core system improvements
-3. **📡 Broadcast-Grade Features** - Professional radio capabilities
-4. **⚙️ Operational Enhancements** - Tools and workflows
-5. **🎨 User Experience** - Monitoring and interfaces
-6. **🤖 AI & Advanced Features** - Experimental capabilities
-7. **🌟 Stretch Goals** - Fun/experimental ideas
-8. **✅ Completed Work** - Features that have been implemented
+These areas are formally defined and governed by:
+- Retrowaves Architecture Contracts
+- Retrowaves — Phase 1.0 Definition of Done (Broadcast-Grade Core)
+
+They are intentionally excluded from this wishlist to prevent feature creep, duplication of authority, or accidental violation of broadcast invariants.
+
+Any changes to core broadcast behavior MUST be made via contract revision and a new phase definition — not via future enhancements.
 
 ---
 
-## 🎯 Next Priority
+## 1️⃣ Station Autonomy & Operational Control
 
-### Production Readiness & Observability
+Items that allow starting/stopping a station cleanly, reloading assets, observability (logs, state, health), and manual override without breaking THINK/DO. Emergency behaviors (but not UI polish). This is about running a station, not managing many of them.
 
-**Status:** 🎯 **NEXT PRIORITY** - Ready for implementation
-
-**Goal:** Make Retrowaves production-ready with operational visibility and health monitoring.
+### Health & Status Endpoints
 
 **Components:**
+- `GET /health` - Simple health check (200 OK if service is running)
+- `GET /status` - Detailed status JSON with:
+  - Encoder health (via FFmpegSupervisor status)
+  - Buffer occupancy (PCM and MP3 buffers)
+  - Number of connected clients
+  - Current source (program/tone/silence)
+  - Uptime and restart counts
+- Per contract T14: Endpoints MUST NOT interfere with audio tick loop
+- Non-blocking, thread-safe status queries
 
-1. **Health & Status Endpoints**
-   - `GET /health` - Simple health check (200 OK if service is running)
-   - `GET /status` - Detailed status JSON with:
-     - Encoder health (via FFmpegSupervisor status)
-     - Buffer occupancy (PCM and MP3 buffers)
-     - Number of connected clients
-     - Current source (program/tone/silence)
-     - Uptime and restart counts
-   - Per contract T14: Endpoints MUST NOT interfere with audio tick loop
-   - Non-blocking, thread-safe status queries
+### Integration Testing
 
-2. **Integration Testing**
-   - Complete end-to-end system tests (structure exists, needs implementation)
-   - Tower-Station integration tests
-   - Real audio pipeline tests
-   - Service lifecycle tests
+- Complete end-to-end system tests (structure exists, needs implementation)
+- Tower-Station integration tests
+- Real audio pipeline tests
+- Service lifecycle tests
 
-3. **Deployment Documentation**
-   - Production deployment guide
-   - System requirements and dependencies
-   - Configuration management
-   - Troubleshooting runbook
+### Deployment Documentation
 
-4. **Operational Observability**
-   - Basic metrics collection (beyond logging)
-   - Service health monitoring
-   - Performance baseline documentation
+- Production deployment guide
+- System requirements and dependencies
+- Configuration management
+- Troubleshooting runbook
 
-**Benefits:**
-- Production-ready operational visibility
-- Easier troubleshooting and monitoring
-- Confidence in system reliability
+### Operational Observability
+
+- Basic metrics collection (beyond logging)
+- Service health monitoring
+- Performance baseline documentation
 - Foundation for future monitoring integrations (Prometheus, etc.)
+
+### "Debug Stream" Mode
+
+Mirror the main stream to:
+- Local WAV file
+- GUI visualizer
+- Waveform display
+- Detailed timing logs
+
+For testing timing drift and DJ behavior.
+
+### Radio Station API (HTTP/JSON)
+
+Provide:
+- `/now_playing` - Current segment metadata
+- `/next_up` - Next queued segment
+- `/history` - Recent playlist history
+- `/listeners` - Connected client count
+- `/skip` - Skip current segment (applies to next segment, current completes)
+- `/trigger_id` - Force legal ID on next THINK cycle
+
+All operations respect THINK/DO model: current segments always complete, decisions apply to future segments.
+
+### Intelligent Media Library Self-Organization
+
+Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
+
+**Desired Future Behavior:**
+- DJEngine automatically extracts base song name from intros/outros
+- Detects generic vs per-song assets
+- Creates ticklers for safe migration (file moves executed asynchronously)
+- Files moved into structured directories opportunistically (never during active THINK/DO)
+- Maintains backward compatibility
+- Zero downtime, zero manual labor
+
+**Implementation Notes:**
+- File operations are executed asynchronously via ticklers (never during THINK or DO)
+- Moves are opportunistic and never block scheduling or playback
+- Files should be moved atomically with fallback to original location if needed
+- DJ should maintain a mapping of old paths to new paths during transition
+
+**Outro Spelling Normalization:**
+- **Canonical name:** `_outro` (one "t")
+- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
+- **Future Cleanup:** When the media library self-organization feature runs, the system will:
+  - Detect any `*_outtro*.mp3` files
+  - Rename them to the canonical form `*_outro*.mp3`
+  - Move them into the standardized directory structure
 
 ---
 
-## 🔧 Stability & Performance
+## 2️⃣ DJ & Programming Intelligence
+
+Items related to rotation logic, IDs, intros, outros, ticklers, legal timing, and programming behavior. These matter only once audio is already correct.
 
 ### Ticklers: Deferred Improvement & Maintenance Tasks
-
-**Concept:**
 
 Ticklers are first-class architectural constructs in Retrowaves that represent non-critical, best-effort tasks for system improvement and maintenance. They enable the system to improve incrementally over time without ever blocking or interfering with core playout operations.
 
 **Purpose:**
-
 Ticklers allow Retrowaves to handle deferred work that enhances the system but is not required for immediate operation. Examples include loudness analysis for assets missing metadata, media library organization tasks, or gradual quality improvements. The system plays content immediately regardless of whether these improvements have been completed.
 
 **Execution Model:**
-
 Ticklers are created during THINK when the DJ engine identifies opportunities for improvement or detects missing metadata. They are scheduled for opportunistic execution but never block THINK or DO operations. Ticklers run asynchronously, can be interrupted at any time, and may be deferred if system resources are constrained. They are inherently interruptible and resumable, allowing the system to prioritize playout over maintenance tasks. Ticklers are persisted locally so that deferred improvements survive restarts, but their execution remains best-effort and non-blocking. Tickler execution occurs outside active playout threads and never shares timing-critical locks.
 
-**Distinction from Other Patterns:**
-
-Ticklers are explicitly not:
-- **Cron jobs:** Ticklers have no fixed schedule and execute opportunistically based on system state
-- **Background workers:** Ticklers are not separate processes or threads dedicated to maintenance; they integrate with the DJ engine's natural lifecycle
-- **Pipelines:** Ticklers do not process assets in bulk or require an ingest phase; they work incrementally on assets as they are encountered during normal operation
-
-**Canonical Example: Loudness Analysis**
-
-When the DJ engine encounters a song during THINK that lacks loudness metadata, it:
-1. Queues the asset for immediate playout at unity gain
-2. Creates a tickler to analyze the audio file and compute LUFS values
-3. Schedules the tickler for asynchronous execution
-4. On future plays, applies the cached loudness metadata
-
-The asset plays correctly on first encounter, and the system improves for subsequent plays. If tickler execution is delayed or interrupted, playout continues normally.
-
 **Guardrails:**
-
-**Ticklers MUST:**
-- Execute entirely outside the THINK/DO playout path
-- Be interruptible at any point without affecting playout
-- Work incrementally, improving the system one asset at a time
-- Cache results for future use (metadata, computed values, etc.)
-- Log their activities for observability
-- Be idempotent by design (duplicate execution is safe and acceptable)
-- Represent durable intent, not job progress or execution state (ticklers are not a job queue, scheduler, or workflow engine)
-
-**Ticklers MUST NOT:**
-- Block THINK operations
-- Block DO operations
-- Delay or prevent asset playback
-- Require completion before playout proceeds
-- Modify audio files in place (they may create metadata files)
-- Create dependencies between assets or require bulk processing
-- Execute during critical playout windows (can be deferred if needed)
-
-**Scope:**
-
-Ticklers are suitable for any deferred improvement task that enhances system quality but is not required for operation: loudness analysis, metadata extraction, library organization, quality metrics collection, and similar maintenance tasks. They are not suitable for time-critical operations, mandatory data processing, or anything that must complete before playout can proceed.
-
-**Architectural Invariant:**
-
-The THINK/DO execution model is inviolable. Audio timing and playout correctness must never depend on deferred or background work. All enhancements described in this document respect this fundamental constraint.
-
-## 📡 Broadcast-Grade Features
-
-**Note:** All features in this section operate within the THINK/DO model. Decisions occur during THINK; execution is queued for future segments. Current segments always complete without interruption.
-
-### Loudness Normalization (Ingest-Free, Tickler-Driven)
-
-**Purpose:**
-
-Ensure consistent perceived loudness across all audio assets (songs, intros, outros, station IDs, fallback audio) to match professional broadcast behavior, without requiring an ingest pipeline or blocking playout operations.
-
-**Architecture:**
-
-Loudness normalization operates entirely within the THINK/DO model. During THINK, the DJ engine may detect missing loudness metadata for an asset. If metadata is present, the DJ applies a static gain value to the AudioEvent. This gain remains constant for the entire duration of the segment during DO phase playout. If metadata is absent, the asset plays at unity gain with no delay or blocking.
-
-**Implementation via Ticklers:**
-
-Loudness analysis is implemented exclusively through DJ ticklers, never as a blocking operation. When the DJ encounters an asset without loudness metadata during THINK:
-
-1. Asset is queued and plays immediately at unity gain
-2. A loudness analysis tickler is scheduled for asynchronous execution
-3. The tickler runs outside the playout path, analyzing the audio file and computing LUFS (or ReplayGain) values
-4. Metadata is cached alongside the asset for future plays
-5. On subsequent plays, the DJ applies the cached gain value during THINK
-
-**Example:**
-
-- **First play:** Song `Artist - Title.mp3` has no loudness metadata → Queued with gain=1.0 → Plays at unity → Tickler scheduled
-- **Future plays:** Same song now has cached LUFS=-16.5 → DJ computes gain=+2.0dB during THINK → Queued with gain=2.0 → Plays at normalized level
-
-**Constraints:**
-
-- Gain is static per asset: Once computed, the gain value for an asset remains constant unless explicitly re-analyzed via a tickler (not adaptive or real-time)
-- Gain is constant per segment: The entire segment (song, intro, outro, etc.) plays at a single gain value
-- Metadata is optional: Playout never requires loudness metadata. Missing metadata never blocks or delays playback
-- No real-time DSP: All analysis happens asynchronously via ticklers
-- No encoder-level normalization: Gain is applied during playout, not encoding
-- No database dependency: Metadata is cached per-asset in the file system or alongside media files
-
-**Non-Goals:**
-
-- Compressor/limiter as loudness control (gain is static, not dynamic)
-- Adaptive gain riding (gain is constant for segment duration)
-- Rewriting audio files (gain is applied at playout time only)
-- Central database for metadata (per-asset caching only)
-- Required ingest pipeline (assets play immediately, analysis is optional background work)
+- **Ticklers MUST:**
+  - Execute entirely outside the THINK/DO playout path
+  - Be interruptible at any point without affecting playout
+  - Work incrementally, improving the system one asset at a time
+  - Cache results for future use (metadata, computed values, etc.)
+  - Log their activities for observability
+  - Be idempotent by design (duplicate execution is safe and acceptable)
+  - Represent durable intent, not job progress or execution state (ticklers are not a job queue, scheduler, or workflow engine)
+- **Ticklers MUST NOT:**
+  - Block THINK operations
+  - Block DO operations
+  - Delay or prevent asset playback
+  - Require completion before playout proceeds
+  - Modify audio files in place (they may create metadata files)
+  - Create dependencies between assets or require bulk processing
+  - Execute during critical playout windows (can be deferred if needed)
 
 ### "Now Playing" Metadata
 
-Add:
+Add metadata extraction and distribution:
 - Artist
 - Title
 - Album
@@ -200,30 +166,118 @@ Add:
 
 Push via:
 - Icecast metadata
-- Websocket
-- REST endpoint
+- WebSocket event channel
+- REST endpoint (`/now_playing`)
 
-### Emergency Alert / Override Mode
+### Smart Legal ID System
 
-Trigger an emergency mode that:
-- stops normal rotation (decision occurs during THINK, applies to next segment selection)
-- plays emergency audio sequence (queued during DO for future segments, current segment always completes)
-- sends alerts to clients
+Legal ID rules:
+- Must play top of hour
+- Must play exactly N times per hour
+- Scheduling decisions occur during THINK (next segment selection adjusts if song would push into top-of-hour slot, never delays current playback)
+- Current segments always complete before legal ID plays
+- Can merge with outros or intros
+
+### Scheduled & Scripted Segments
+
+Examples:
+- Daily weather
+- Hourly headline
+- Artist spotlight
+- "This day in history"
+- Local events
+- Pre-scripted monologues
+
+Tickler-based generation. Decisions occur during THINK; execution is queued for future segments. Current segments always complete.
+
+### More Advanced Cadence Logic
+
+Future DJ behaviors:
+- Mood arcs (morning energy vs late night calm)
+- Genre pairing and thematic blocks
+- "Story mode" breaks
+- Concert previews
+- "Remember this band?" trivia inserts
+
+### Ad Engine (Optional)
+
+Internal ad scheduler for:
+- Promos
+- Show liners
+- Repeating ad carts
+- Live reads (AI-generated)
+- Local sponsorships
+
+All scheduling decisions occur during THINK; execution is queued for future segments. Current segments always complete.
+
+### AI Song Facts Generator
+
+Extracts facts and band trivia automatically via ticklers (analysis work performed asynchronously, never blocks playout). Metadata cached for future use in talk segments or "Now Playing" displays. Decisions about using facts occur during THINK; execution is queued for future segments. Current segments always complete.
+
+### Multi-DJ Personalities
+
+- Morning DJ
+- Afternoon DJ
+- Overnight DJ
+
+Each with different intros/outros, cadence logic, and voice characteristics.
+
+---
+
+## 3️⃣ UX, UI & Nice-to-Have Enhancements
+
+Items such as dashboards, web UIs, visualizations, convenience controls, and non-critical automation helpers. These are explicitly last.
+
+### Web-Based Control Panel
+
+For:
+- Reviewing logs
+- Playlist history
+- Skipping songs (via API)
+- Forcing a legal ID (via API)
+- DJ persona configuration
+
+### Web Player for LAN Browsing
+
+Simple web interface:
+- Play button
+- Now playing
+- History
+- DJ avatar
+
+No need for Icecast or HLS unless you want to reach phones.
+
+### Real-Time Logs Dashboard
+
+Display:
+- THINK/DO transitions
+- Intent details
+- Rotation weights
+- Audio timing
+- Stream throughput
+
+### Discord or Slack Integration
+
+Send alerts:
+- "Station restarted"
+- "Silence detected"
+- "Rotation error"
+- "Song repeated too soon"
 
 ### Icecast/Shoutcast Compatibility
 
-**Why:** If a Retrowaves station instance should broadcast publicly and support infinite listeners.
+If a Retrowaves station instance should broadcast publicly and support infinite listeners.
 
 **Features:**
 - Multiple mountpoints
 - Listener stats
 - Artist/song metadata
-- ReplayGain or normalization per Icecast spec (tickler-driven, per Loudness Normalization section)
+- ReplayGain or normalization per Icecast spec (tickler-driven)
 - DJ metadata updates ("Now playing…")
 
 ### HLS Output (Apple HTTP Live Streaming)
 
-**Why:** If browser playback or mobile app playback is needed.
+If browser playback or mobile app playback is needed.
 
 **Benefits:**
 - Rewind
@@ -251,123 +305,66 @@ Record a rolling 24-hour version of the station via parallel write during DO pha
 - Troubleshooting
 - Fun playback
 
----
-
-## ⚙️ Operational Enhancements
-
-### Web-Based Control Panel
-
-For:
-- reviewing logs
-- playlist history
-- skipping songs
-- forcing a legal ID
-- DJ persona configuration
-
-### "Debug Stream" Mode
-
-Mirror the main stream to:
-- local WAV
-- GUI visualizer
-- waveform display
-- detailed timing logs
-
-For testing timing drift and DJ behavior.
-
 ### Persistent Analytics Tracking
 
 Track:
-- songs played per hour
-- talk time per day
-- legal ID compliance
-- song recurrence windows
+- Songs played per hour
+- Talk time per day
+- Legal ID compliance
+- Song recurrence windows
 
 Useful for tuning the DJ engine.
 
-### Radio Station API (HTTP/JSON)
+### ElevenLabs Integration (Full TTS)
 
-Provide:
-- `/now_playing`
-- `/next_up`
-- `/history`
-- `/listeners`
-- `/skip`
-- `/trigger_id`
+Enable the DJ to generate intros/outros/talk/break content using ElevenLabs voices.
 
-Could allow remote control via phone app.
+**Possible Features:**
+- Generate dynamic talk segments ("That was Fleetwood Mac… here's the weather")
+- Personalized intros/outros for specific songs
+- Time-based greetings ("Good morning Appalachia")
+- Emergency or breaking-news announcements
+- On-demand filler content via ticklers
 
-### Intelligent Media Library Self-Organization
+**Constraints:**
+- NEVER generated during DO
+- Only generated during THINK via ticklers
+- Must be cached MP3 before use
 
-**Future Goal:** Allow Retrowaves to gradually self-organize all intros/outros/IDs/talk files into a clean directory structure without requiring manual work.
+### Emotion/Mood Adaptive Voice
 
-**Current Status:**
-- We continue using Phase A filename-driven intros/outros exactly as they are.
+*(Not required for core operation)*
 
-**Desired Future Behavior:**
-- DJEngine automatically extracts base song name from intros/outros
-- Detects generic vs per-song assets
-- Creates ticklers for safe migration (file moves executed asynchronously)
-- Files moved into structured directories opportunistically (never during active THINK/DO)
-- Maintains backward compatibility
-- Zero downtime, zero manual labor
+DJ voice tone adapts to:
+- Time of day
+- Schedule blocks
+- Music genre changes
+- Audience vibe (if analytics are added)
 
-**Implementation Notes:**
-- This will be captured in the wishlist, and we will revisit after the core playout (audio + HTTP streaming + THINK/DO) is proven stable.
-- File operations are executed asynchronously via ticklers (never during THINK or DO)
-- Moves are opportunistic and never block scheduling or playback
-- Files should be moved atomically with fallback to original location if needed
-- DJ should maintain a mapping of old paths to new paths during transition
+### Local Voice Model / Offline TTS
 
-**Outro Spelling Normalization:**
-- **Canonical name:** `_outro` (one "t")
-- **Historical compatibility:** Files on disk may have `_outtro` (two "t"s) due to historical typos
-- **Phase 9 Asset Discovery:** Accepts both patterns:
-  - `*_outro*.mp3` (canonical)
-  - `*_outtro*.mp3` (historical typo)
-- **Internal normalization:** All `AudioEvent.type="outro"` normalize to the 1-T spelling regardless of filename
-- **Future Cleanup:** When the media library self-organization feature runs, the system will:
-  - Detect any `*_outtro*.mp3` files
-  - Rename them to the canonical form `*_outro*.mp3`
-  - Move them into the standardized directory structure
-  - Log: `Renamed Boogie_Woogie_Santa_Claus_outtro.mp3 → Boogie_Woogie_Santa_Claus_outro.mp3`
+Eliminate dependency on ElevenLabs entirely.
 
-### Multi-Station Platform Architecture
+Use:
+- Coqui TTS
+- Piper
+- VITS
 
-**Future Goal:** Enable running multiple radio stations simultaneously from a single Retrowaves codebase, where "Appalachia Radio" becomes one output stream instance among many.
+Offline operation, zero API cost.
 
-**Current Status:**
-- Retrowaves runs as a single station instance
-- All configuration, state, and media libraries are tied to one station
+### AI "Call-In" Show
 
-**Desired Future Behavior:**
-- Station instances are independently configurable
-- Each station has its own:
-  - Media library (songs, intros, outros, IDs)
-  - DJ engine with independent state
-  - Rotation manager with separate history
-  - Output streams (HTTP endpoints on different ports)
-  - Configuration files and state persistence
-- Ability to start/stop individual stations without affecting others
-- Shared codebase, isolated station data
-- Station-specific environment variables or config files
+Simulated callers and DJ responses.
 
-**Implementation Notes:**
-- This is a major architectural refactoring that would come after core stability
-- Would require:
-  - Station abstraction layer (StationManager or StationFactory)
-  - Isolated state directories per station
-  - Port/endpoint management for multiple HTTP streams
-  - Configuration management for multi-station scenarios
-  - Resource isolation (memory, CPU per station)
-- Backward compatibility: single-station mode should still work
-- Could enable scenarios like:
-  - Running multiple genre stations (Country, Jazz, Rock) simultaneously
-  - Test/production station instances
-  - Regional variations of the same station
+### "Retro Mode" (1980s Radio Filter)
+
+Vinyl crackle, tape hiss, jingles, station power-up sequence.
+
+Just for fun.
 
 ### Core/Service Separation & Business Model
 
-**Future Goal:** Separate Retrowaves core functionality from additional paid services, ensuring the core remains free and open while premium features (UI, convenience tools) become paid add-ons.
+Separate Retrowaves core functionality from additional paid services, ensuring the core remains free and open while premium features (UI, convenience tools) become paid add-ons.
 
 **Core Philosophy:**
 - **Retrowaves Core:** Free and always will be free
@@ -411,151 +408,6 @@ Could allow remote control via phone app.
   - LICENSE file in core repository
   - Clear attribution and contribution guidelines
   - Documentation explaining licensing model to users and contributors
-
-**Implementation Notes:**
-- This is a major architectural and business model decision that requires significant planning
-- Core API design must be done carefully to support both CLI and future UI needs
-- Documentation must clearly distinguish between free core features and paid premium features
-- **Open source license model must be properly defined and documented before launch**
-- This idea will need massive expansion when the time comes to implement it
-- Current focus: Ensure core architecture supports this separation (API-first design)
-
----
-
-## 🎨 User Experience & Monitoring
-
-### Web Player for LAN Browsing
-
-Simple web interface:
-- Play button
-- Now playing
-- History
-- DJ avatar
-
-No need for Icecast or HLS unless you want to reach phones.
-
-### Real-Time Logs Dashboard
-
-Display:
-- THINK/DO transitions
-- Intent details
-- Rotation weights
-- audio timing
-- stream throughput
-
-### Discord or Slack Integration
-
-Send alerts:
-- "Station restarted"
-- "Silence detected"
-- "Rotation error"
-- "Song repeated too soon"
-
----
-
-## 🤖 AI & Advanced Features
-
-### ElevenLabs Integration (Full TTS)
-
-**Future Goal:** Enable the DJ to generate intros/outros/talk/break content using ElevenLabs voices.
-
-**Possible Features:**
-- Generate dynamic talk segments ("That was Fleetwood Mac… here's the weather")
-- Personalized intros/outros for specific songs
-- Time-based greetings ("Good morning Appalachia")
-- Emergency or breaking-news announcements
-- On-demand filler content via ticklers
-
-**Constraints:**
-- NEVER generated during DO
-- Only generated during THINK via ticklers
-- Must be cached MP3 before use
-
-### Emotion/Mood Adaptive Voice
-
-*(Not required for core operation)*
-
-DJ voice tone adapts to:
-- time of day
-- schedule blocks
-- music genre changes
-- audience vibe (if analytics are added)
-
-### Local Voice Model / Offline TTS
-
-Eliminate dependency on ElevenLabs entirely.
-
-Use:
-- Coqui TTS
-- Piper
-- VITS
-
-Offline operation, zero API cost.
-
-### More Advanced Cadence Logic
-
-Future DJ behaviors:
-- Mood arcs (morning energy vs late night calm)
-- Genre pairing and thematic blocks
-- "Story mode" breaks
-- Concert previews
-- "Remember this band?" trivia inserts
-
-### Smart Legal ID System
-
-Legal ID rules:
-- must play top of hour
-- must play exactly N times per hour
-- scheduling decisions occur during THINK (next segment selection adjusts if song would push into top-of-hour slot, never delays current playback)
-- current segments always complete before legal ID plays
-- can merge with outros or intros
-
-### Scheduled & Scripted Segments
-
-Examples:
-- Daily weather
-- Hourly headline
-- Artist spotlight
-- "This day in history"
-- Local events
-- Pre-scripted monologues
-
-Tickler-based generation.
-
-### Ad Engine (Optional)
-
-Internal ad scheduler for:
-- promos
-- show liners
-- repeating ad carts
-- live reads (AI)
-- local sponsorships
-
----
-
-## 🌟 Stretch Goals (Fun / Experimental)
-
-### AI "Call-In" Show
-
-Simulated callers and DJ responses.
-
-### AI Song Facts Generator
-
-Extracts facts and band trivia automatically via ticklers (analysis work performed asynchronously, never blocks playout). Metadata cached for future use in talk segments or "Now Playing" displays. Decisions about using facts occur during THINK; execution is queued for future segments. Current segments always complete.
-
-### Multi-DJ Personalities
-
-- Morning DJ
-- Afternoon DJ
-- Overnight DJ
-
-Each with different intros/outros.
-
-### "Retro Mode" (1980s Radio Filter)
-
-Vinyl crackle, tape hiss, jingles, station power-up sequence.
-
-Just for fun.
 
 ---
 
@@ -717,7 +569,7 @@ Implement a pre-fill stage that builds up Tower's PCM buffer before starting nor
 **Files Modified:**
 - `station/broadcast_core/playout_engine.py` - Pre-fill implementation (+172 lines)
 - `station/tests/contracts/test_station_tower_pcm_bridge_contract.py` - Pre-fill tests (11 new tests)
-- `station/tests/contracts/test_playout_engine_contract.py` - PID + Pre-fill transition tests (4 new tests)
+- `station/tests/contracts/test_playout_engine_contract.py` - PID + Pre-Fill transition tests (4 new tests)
 
 **Documentation:**
 - Contract: `station/docs/contracts/STATION_TOWER_PCM_BRIDGE_CONTRACT.md` (C8)
@@ -902,40 +754,6 @@ The event stream delivers messages like:
   - Each message contains exactly one event as a complete JSON object
   - Messages are text-format JSON (not binary)
   - **Note:** `/tower/events/recent` endpoint was removed per contract - events are not stored, so recent event catch-up is not available
-
-#### What This Enables for OBS Without Hard Dependencies
-
-OBS would simply:
-
-1. Connect to WebSocket endpoint `ws://tower:8005/tower/events`
-2. When it sees:
-   - `{ "event_type": "station_stopping" }` → Switch to "Please Stand By"
-   - `{ "event_type": "segment_started", "type": "song" }` → Switch to your main scene
-
-This keeps Retrowaves:
-- **pure**
-- **platform-independent**
-- **deterministic**
-- **not tied to OBS's web socket API**
-- **safe from breaking changes in OBS**
-
-#### Technical Benefits
-
-- **Zero client assumptions:** Station doesn't need to know anything about OBS.
-- **Non-blocking:** THINK/DO logic remains untouched.
-- **Scalable:** Many clients can listen — OBS, web dashboards, scripts, plugins.
-- **Future-proof:** Works with:
-  - OBS
-  - Streamlabs
-  - Mobile apps
-  - Smart home dashboards
-  - Web UIs
-  - Discord bots
-- **Extremely easy to test:** You can connect to the event stream with:
-  ```bash
-  # Connect to WebSocket endpoint
-  wscat -c ws://localhost:8005/tower/events
-  ```
 
 #### Event Ingestion (Station → Tower)
 
