@@ -1028,7 +1028,8 @@ class TestStationEventReception:
         Test T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST to /tower/events/ingest.
         
         Per contract T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST.
-        Accepted event types: station_starting_up, station_shutting_down, new_song, dj_talking, now_playing.
+        Accepted event types: station_starting_up, station_shutting_down, dj_talking, now_playing.
+        NOTE: new_song removed - now_playing is the authoritative signal for segment state.
         """
         # Start HTTP server
         import random
@@ -1044,11 +1045,12 @@ class TestStationEventReception:
             conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
             
             test_event = {
-                "event_type": "new_song",
+                "event_type": "now_playing",
                 "timestamp": time.monotonic(),
                 "metadata": {
-                    "segment_id": "test_segment_1",
-                    "file_path": "/path/to/file.mp3"
+                    "segment_type": "song",
+                    "file_path": "/path/to/file.mp3",
+                    "started_at": time.time()
                 }
             }
             
@@ -1110,11 +1112,13 @@ class TestStationEventReception:
             
             # Test 1: Valid event should be accepted
             valid_event = {
-                "event_type": "new_song",
+                "event_type": "now_playing",
                 "timestamp": time.monotonic(),
                 "metadata": {
+                    "segment_type": "song",
                     "file_path": "/path/to/file.mp3",
                     "title": "Test Song",
+                    "started_at": time.time()
                     "artist": "Test Artist",
                     "album": "Test Album",
                     "duration": 180.0

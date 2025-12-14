@@ -13,7 +13,7 @@ Tests map directly to contract clauses:
 - PE3.3: Decoder Output Rules - no timing constraints
 - PE3.4: No Prefetching (1 test)
 - PE3.5: Error Propagation (1 test)
-- PE4: Heartbeat Events (new_song, dj_talking)
+- PE4: Heartbeat Events (dj_talking; new_song deprecated, use now_playing)
 - PE5: Optional Station Timebase Drift Compensation
 - PE6: Optional Adaptive Buffer Management with PID Controller (see test_playout_engine_contract_pe6.py)
 - PE7: Shutdown Interaction (6 tests)
@@ -212,44 +212,25 @@ class TestPE3_5_ErrorPropagation:
 class TestPE4_HeartbeatEvents:
     """Tests for PE4 — Heartbeat Events."""
     
-    def test_pe4_1_new_song_must_emit_before_first_frame(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.1: new_song MUST emit before first PCM frame when song starts."""
-        # Contract requires event emission before audio begins
+    def test_pe4_1_new_song_deprecated(self, mock_dj_callback, mock_output_sink, mock_tower_control):
+        """PE4.1: new_song event is DEPRECATED - superseded by now_playing."""
+        # Contract PE4.1 is deprecated - new_song event removed
+        # Segment state is now emitted via now_playing events (see NEW_NOW_PLAYING_STATE_CONTRACT)
+        # This test verifies new_song is no longer emitted
         engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
         segment = create_fake_audio_event("/fake/test.mp3", "song")
         
-        # Contract requires on_segment_started is called (existing PE1.2)
         engine.start_segment(segment)
         mock_dj_callback.on_segment_started.assert_called_once_with(segment)
         
-        # PE4.1 requires new_song heartbeat event with metadata
-        # Event should include: file_path, title, artist, album, duration
-        assert mock_tower_control.send_event.called, "Contract requires new_song event when song starts"
-        call_args = mock_tower_control.send_event.call_args
-        assert call_args[1]["event_type"] == "new_song", "Event type must be new_song"
-        assert "file_path" in call_args[1]["metadata"], "Event must include file_path"
-    
-    def test_pe4_1_new_song_must_not_block_playout(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.1: new_song MUST NOT block playout thread."""
-        import time
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
-        segment = create_fake_audio_event("/fake/test.mp3", "song")
+        # Verify new_song is NOT emitted (deprecated)
+        if mock_tower_control.send_event.called:
+            call_args = mock_tower_control.send_event.call_args
+            event_type = call_args[1]["event_type"]
+            assert event_type != "new_song", "new_song event should not be emitted (deprecated)"
         
-        # Contract requires non-blocking event emission
-        # Note: Metadata extraction via ffprobe may take up to 1 second (timeout),
-        # but should complete quickly for valid files. 0.5s threshold allows for
-        # reasonable metadata extraction while still ensuring non-blocking behavior.
-        start_time = time.time()
-        engine.start_segment(segment)
-        elapsed = time.time() - start_time
-        
-        assert elapsed < 0.5, "Event emission must not block playout (metadata extraction may take up to 1s timeout)"
-    
-    def test_pe4_1_new_song_must_not_rely_on_tower_timing(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.1: new_song MUST NOT rely on Tower timing."""
-        # Contract requires event uses Clock A (wall clock) only
-        # Event must not include Tower timing information
-        assert True, "Contract requires event uses Clock A only, not Tower timing"
+        # Segment state is now handled by now_playing events (tested in test_now_playing_state_contract.py)
+        assert True, "new_song deprecated - use now_playing events instead"
     
     def test_pe4_2_dj_talking_must_emit_when_talk_starts(self, mock_dj_callback, mock_output_sink, mock_tower_control):
         """PE4.2: dj_talking MUST emit when talk segment starts."""

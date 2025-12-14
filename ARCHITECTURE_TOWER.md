@@ -1241,7 +1241,7 @@ Tower implements a real-time event streaming system that receives heartbeat even
 - `station_overflow` - Station buffer overflow detected
 - `station_starting_up` - Station is starting up
 - `station_shutting_down` - Station is shutting down
-- `new_song` - New song has started (includes metadata: title, artist, duration)
+- `now_playing` - Authoritative segment state (includes metadata: segment_type, title, artist, duration_sec, etc.)
 - `dj_talking` - DJ has started talking
 
 **WebSocket Streaming:**

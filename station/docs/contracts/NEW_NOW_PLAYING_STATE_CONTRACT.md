@@ -2,7 +2,9 @@
 
 ## R. Purpose
 
-Defines the authoritative, read-only description of the currently active playout segment. This contract ensures that observers can query the system's current playout state without influencing playout behavior, timing, or decision-making.
+Defines the **authoritative, read-only** description of the currently active playout segment. This contract ensures that observers can query the system's current playout state without influencing playout behavior, timing, or decision-making.
+
+**AUTHORITY DECLARATION:** `now_playing` is the **sole authoritative signal** for segment state. All other segment-related events (e.g., `new_song`) are legacy or derived. Consumers **MUST** use `now_playing` events and filter by `segment_type` as needed.
 
 This contract exists to enable external systems (Tower, web clients, monitoring tools) to observe what is currently playing while maintaining strict separation between observation and control. NowPlayingState is purely observational and **MUST NOT** influence any aspect of playout timing, segment duration, decoder behavior, or DJ decision-making.
 

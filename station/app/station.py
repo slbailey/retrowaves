@@ -206,7 +206,7 @@ class Station:
         # Initialize output sink (Tower PCM socket)
         logger.info("Initializing Tower PCM sink...")
         tower_socket_path = os.getenv("TOWER_SOCKET_PATH", "/var/run/retrowaves/pcm.sock")
-        self.sink = TowerPCMSink(socket_path=tower_socket_path)
+        self.sink = TowerPCMSink(socket_path=tower_socket_path, tower_control=tower_control)
         logger.info(f"Tower PCM sink initialized (socket={tower_socket_path})")
         
         # Store tower_control for PlayoutEngine

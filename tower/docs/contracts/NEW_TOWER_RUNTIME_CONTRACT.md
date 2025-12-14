@@ -299,16 +299,17 @@ TowerRuntime **MUST** accept Station heartbeat events via HTTP POST to `/tower/e
 **Accepted event types:**
 - `station_starting_up` — Station is starting up
 - `station_shutting_down` — Station is shutting down
-- `new_song` — A new song (MP3) has started playing
+- `now_playing` — Authoritative signal for currently active playout segment (see NEW_NOW_PLAYING_STATE_CONTRACT)
 - `dj_talking` — DJ has started talking between songs
 
 **Event sending requirements:**
 - `station_starting_up` **MUST** be sent exactly once when Station starts up
 - `station_shutting_down` **MUST** be sent exactly once when Station shuts down
-- `new_song` **MUST** be sent every time a new song MP3 starts playing
-  - `new_song` events **MUST** include MP3 metadata (title, artist, duration) in the event content
-  - This metadata **MUST** be collected during the DJ THINK phase and stored with the intent
-  - Metadata is retrieved from the intent when the event is created during DO phase
+- `now_playing` **MUST** be sent when any segment starts playing (song, intro, outro, id, talk, fallback)
+  - `now_playing` events **MUST** include segment metadata (segment_type, title, artist, album, duration_sec, etc.)
+  - `now_playing` **MUST** be sent with empty metadata when segment finishes
+  - This is the authoritative signal for segment state - consumers should filter by `segment_type == "song"` to detect songs
+  - NOTE: `new_song` event deprecated - use `now_playing` instead
 - `dj_talking` **MUST** be sent when DJ starts talking, but only once even if multiple talking MP3 files are strung together
 - Station **MUST NOT** send multiple `station_starting_up` or `station_shutting_down` events
 - Station **MUST** track whether lifecycle events have been sent to prevent duplicates
@@ -350,12 +351,16 @@ Received events **MUST** conform to Station heartbeat event format:
   "tower_received_at": <float>,  // Tower wall-clock timestamp when received
   "metadata": {
     // Event-specific metadata (varies by event type)
-    // For "new_song" events:
-    //   "file_path": "<string>",  // Path to MP3 file
-    //   "title": "<string>",      // Song title (from MP3 metadata, collected during THINK phase, if available)
-    //   "artist": "<string>",      // Artist name (from MP3 metadata, collected during THINK phase, if available)
-    //   "album": "<string>",       // Album name (from MP3 metadata, collected during THINK phase, if available)
-    //   "duration": <float>,       // Duration in seconds (from MP3 metadata, collected during THINK phase, if available)
+    // For "now_playing" events (authoritative segment state):
+    //   "segment_type": "<string>",  // "song", "intro", "outro", "id", "talk", "fallback"
+    //   "started_at": <float>,        // Wall-clock timestamp when segment started
+    //   "file_path": "<string>",      // Path to MP3 file
+    //   "title": "<string>",          // Song title (from MP3 metadata, if available)
+    //   "artist": "<string>",         // Artist name (from MP3 metadata, if available)
+    //   "album": "<string>",          // Album name (from MP3 metadata, if available)
+    //   "year": <int>,                // Release year (from MP3 metadata, if available)
+    //   "duration_sec": <float>,      // Duration in seconds (from MP3 metadata, if available)
+    //   Empty metadata {} when segment finishes
     // For "dj_talking" events:
     //   (no metadata required)
     // For lifecycle events ("station_starting_up", "station_shutting_down"):
@@ -445,7 +450,7 @@ TowerRuntime **MUST** expose a WebSocket endpoint `/tower/events` that:
 - Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** store events for ordering enforcement
 
 **Query parameters (optional, supported during WS upgrade):**
-- `event_type`: Filter by event type (e.g., `?event_type=new_song`)
+- `event_type`: Filter by event type (e.g., `?event_type=now_playing`)
 
 #### T-EXPOSE1.2 — WebSocket Fanout
 TowerRuntime **MUST** maintain a registry of connected WebSocket clients.
@@ -496,7 +501,7 @@ Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** s
 #### T-EXPOSE7 — Event Filtering
 The WebSocket event endpoint **MAY** support filtering by:
 
-- Event type (e.g., only `new_song` events)
+- Event type (e.g., only `now_playing` events)
 - Other metadata fields (implementation-defined)
 
 Filtering parameters **MUST** be specified during WebSocket upgrade (via query parameters). Filtering **MUST** be fast (< 1ms) and **MUST NOT** block the audio tick loop.

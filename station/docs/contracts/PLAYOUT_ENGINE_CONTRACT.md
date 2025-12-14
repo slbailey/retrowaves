@@ -173,24 +173,21 @@ elapsed = time.monotonic() - segment_start
 
 PlayoutEngine **MUST** emit control-channel events for observability. These events are purely observational and **MUST NOT** influence playout behavior or timing decisions.
 
-### PE4.1 — New Song Event
+### PE4.1 — New Song Event (DEPRECATED)
 
-**MUST** emit `new_song` event when a song segment starts playing.
+**DEPRECATED:** The `new_song` event has been superseded by `now_playing` events (see `NEW_NOW_PLAYING_STATE_CONTRACT.md`).
 
-- Event **MUST** be emitted synchronously before audio begins
-- Event **MUST NOT** block playout thread
-- Event **MUST** include metadata:
-  - `file_path`: Path to the MP3 file
-  - `title`: Song title (from MP3 metadata, if available, otherwise None)
-  - `artist`: Artist name (from MP3 metadata, if available, otherwise None)
-  - `album`: Album name (from MP3 metadata, if available, otherwise None)
-  - `duration`: Duration in seconds (from MP3 metadata, if available, otherwise None)
-- MP3 metadata **MUST** be retrieved from the `AudioEvent.metadata` field, which was populated during the THINK phase
-- If metadata is not available in `AudioEvent.metadata`, it **MAY** be extracted during DO phase as a fallback (though this should not occur in normal operation)
-- Event **MUST** be emitted from the playout thread
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be emitted for every song that starts playing
+**AUTHORITY:** `now_playing` is the sole authoritative signal for segment state. Consumers **MUST** use `now_playing` events and filter by `segment_type == "song"` to detect new songs.
+
+**Legacy behavior (removed):**
+- ~~Event **MUST** be emitted when a song segment starts playing~~
+- ~~Event **MUST** include metadata: file_path, title, artist, album, duration~~
+
+**Migration:** All consumers should migrate to `now_playing` events, which provide:
+- Complete segment state for all segment types (not just songs)
+- Clear events when segments finish
+- Additional metadata (segment_type, started_at, year)
+- Authoritative state snapshot
 
 ### PE4.2 — DJ Talking Event
 

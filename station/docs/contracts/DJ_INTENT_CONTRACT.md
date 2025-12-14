@@ -73,7 +73,8 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 - DJIntent is a dataclass or similar immutable structure
 - All paths are validated during THINK phase
 - MP3 metadata for `next_song` is extracted during THINK phase and stored in `AudioEvent.metadata`
-- Metadata is retrieved from the intent when `new_song` events are created during DO phase
+- Metadata is retrieved from the intent when `now_playing` events are created during segment start
+  - NOTE: `new_song` event deprecated - `now_playing` is the authoritative signal
 - DO phase trusts that intent is valid and complete
 - Intent may contain empty lists (e.g., no IDs) but must be structurally complete
 

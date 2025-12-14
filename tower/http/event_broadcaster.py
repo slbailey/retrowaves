@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 ACCEPTED_EVENT_TYPES = {
     "station_starting_up",
     "station_shutting_down",
-    "new_song",
     "dj_talking",
-    "now_playing",  # Per NEW_NOW_PLAYING_STATE_CONTRACT E.2
+    "now_playing",  # Per NEW_NOW_PLAYING_STATE_CONTRACT E.2 - authoritative segment state
+    # Removed: superseded by now_playing authoritative state
 }
 
 

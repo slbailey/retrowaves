@@ -68,7 +68,8 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 - Not rely on Tower timing or state
 
 **Heartbeat events include:**
-- Content events (`new_song`, `dj_talking`) — emitted by PlayoutEngine
+- Content events (`dj_talking`, `now_playing`) — emitted by PlayoutEngine/NowPlayingStateManager
+  - NOTE: `new_song` deprecated - `now_playing` is the authoritative signal for segment state
 - THINK lifecycle events (`dj_think_started`, `dj_think_completed`) — emitted by DJEngine
 - Buffer health events (`station_underflow`, `station_overflow`) — emitted by OutputSink
 - Clock drift events (`decode_clock_skew`) — emitted by PlayoutEngine (if drift compensation enabled)
@@ -82,7 +83,8 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 
 **THINK/DO separation:**
 - THINK events (`dj_think_started`, `dj_think_completed`) are emitted during THINK phase
-- Content events (`new_song`, `dj_talking`) are emitted when segments start playing
+- Content events (`dj_talking`, `now_playing`) are emitted when segments start playing
+  - NOTE: `new_song` deprecated - use `now_playing` events and filter by `segment_type == "song"`
 - Events **MUST NOT** cross THINK/DO boundaries (THINK events don't influence DO, DO events don't influence THINK)
 
 ---

@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 
 from station.outputs.base_sink import BaseSink
+from station.outputs.tower_control import TowerControlClient
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,8 @@ class TowerPCMSink(BaseSink):
     """
     
     def __init__(self, socket_path: str = "/var/run/retrowaves/pcm.sock", 
-                 sample_rate: int = 48000, channels: int = 2, frame_size: int = 1024):
+                 sample_rate: int = 48000, channels: int = 2, frame_size: int = 1024,
+                 tower_control: Optional[TowerControlClient] = None):
         """
         Initialize Tower PCM sink.
         
@@ -66,6 +68,7 @@ class TowerPCMSink(BaseSink):
             sample_rate: Audio sample rate (default: 48000)
             channels: Number of audio channels (default: 2)
             frame_size: Samples per frame (default: 1024)
+            tower_control: Optional TowerControlClient for buffer status queries and event emission
         """
         self.socket_path = socket_path
         self.sample_rate = sample_rate
@@ -91,6 +94,14 @@ class TowerPCMSink(BaseSink):
         # Track last write time to detect track transitions (gaps > 1 second)
         self._last_write_time: Optional[float] = None
         self._track_transition_threshold = 1.0  # 1 second gap = track transition
+        
+        # OS3.1: Buffer health monitoring for underflow detection
+        # OS3.2: Buffer health monitoring for overflow detection
+        self._tower_control = tower_control
+        self._last_buffer_check_time = 0.0
+        self._buffer_check_interval = 0.1  # Check buffer status every 100ms (non-blocking)
+        self._last_buffer_depth: Optional[int] = None  # Track previous depth to detect transitions
+        self._last_buffer_at_capacity = False  # Track if buffer was at capacity to detect overflow transitions
         
         logger.info(f"TowerPCMSink initialized (socket={socket_path}, frame_size={frame_size} samples, frame_bytes={self.frame_bytes})")
     
@@ -126,6 +137,9 @@ class TowerPCMSink(BaseSink):
         except Exception as e:
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
+        
+        # OS3.1: Check buffer status periodically for underflow detection
+        self._check_buffer_health()
         
         # Send exactly ONE complete frame if available (no pacing - push immediately)
         if len(self._buffer) >= self.frame_bytes:
@@ -331,6 +345,9 @@ class TowerPCMSink(BaseSink):
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
+        # OS3.1: Check buffer status periodically for underflow detection
+        self._check_buffer_health()
+        
         # Extract and send complete 4096-byte frames from buffer
         # NEVER send partial frames - if <4096 remain, wait for next decode cycle
         # ARCHITECTURAL INVARIANT: Station pushes frames as fast as decoder produces them.
@@ -408,6 +425,79 @@ class TowerPCMSink(BaseSink):
                     self._socket = None
                 self._connection_start_time = None
                 return
+    
+    def _check_buffer_health(self) -> None:
+        """
+        OS3.1: Check Tower buffer status periodically and emit underflow event on transition.
+        OS3.2: Check Tower buffer status periodically and emit overflow event when overflow occurs.
+        
+        This method is called from the output thread during frame writes.
+        It checks buffer status at intervals (not every frame) to detect underflow and overflow transitions.
+        """
+        if not self._tower_control:
+            return
+        
+        # Rate limit buffer checks to avoid excessive HTTP requests
+        now = time.monotonic()
+        if now - self._last_buffer_check_time < self._buffer_check_interval:
+            return
+        
+        self._last_buffer_check_time = now
+        
+        # Query Tower's buffer status (non-blocking with short timeout)
+        try:
+            buffer_data = self._tower_control.get_buffer()
+            if buffer_data is None:
+                return
+            
+            # Extract buffer depth and capacity
+            buffer_depth = buffer_data.get("count", 0)
+            buffer_capacity = buffer_data.get("capacity", 0)
+            buffer_at_capacity = (buffer_capacity > 0 and buffer_depth >= buffer_capacity)
+            
+            # OS3.1: Detect transition to underflow (depth = 0)
+            # Only emit on transition from non-zero to zero, not continuously
+            if buffer_depth == 0 and self._last_buffer_depth is not None and self._last_buffer_depth > 0:
+                # Transition detected: buffer went from non-zero to zero
+                # Emit underflow event
+                try:
+                    self._tower_control.send_event(
+                        event_type="station_underflow",
+                        timestamp=time.monotonic(),
+                        metadata={
+                            "buffer_depth": buffer_depth,
+                            "frames_dropped": 0  # Not tracked, set to 0 per contract
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending station_underflow event: {e}")
+            
+            # OS3.2: Detect transition to overflow (buffer at capacity)
+            # Emit when buffer transitions to capacity (overflow condition detected)
+            # Only emit on transition, not continuously while at capacity
+            if buffer_at_capacity and not self._last_buffer_at_capacity:
+                # Transition detected: buffer reached capacity (overflow condition)
+                # When buffer is at capacity, frames are being dropped
+                # Emit overflow event with at least 1 frame dropped (overflow just occurred)
+                try:
+                    self._tower_control.send_event(
+                        event_type="station_overflow",
+                        timestamp=time.monotonic(),
+                        metadata={
+                            "buffer_depth": buffer_depth,
+                            "frames_dropped": 1  # At least 1 frame dropped when buffer reaches capacity
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending station_overflow event: {e}")
+            
+            # Update last known buffer state for transition detection
+            self._last_buffer_depth = buffer_depth
+            self._last_buffer_at_capacity = buffer_at_capacity
+            
+        except Exception as e:
+            # Non-blocking: silently ignore buffer check failures
+            logger.debug(f"Error checking buffer health: {e}")
     
     def close(self) -> None:
         """Close the socket connection to Tower."""

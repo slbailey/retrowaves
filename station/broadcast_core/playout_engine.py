@@ -381,30 +381,13 @@ class PlayoutEngine:
             self._segment_active = True
         
         # Emit appropriate event based on segment type
+        # Removed: superseded by now_playing authoritative state
+        # See NEW_NOW_PLAYING_STATE_CONTRACT.md for authoritative segment state
         if self._tower_control and not self._shutdown_requested:
             try:
                 if segment.type == "song":
-                    # Emit new_song event with MP3 metadata
-                    # Metadata should have been extracted during THINK phase and stored in AudioEvent
-                    # If not available, fall back to extracting it now (shouldn't happen in normal flow)
-                    if segment.metadata:
-                        metadata = segment.metadata
-                    else:
-                        logger.warning(f"Metadata not found for {segment.path}, extracting during DO phase (should be done in THINK)")
-                        metadata = _get_mp3_metadata(segment.path)
-                    
-                    self._tower_control.send_event(
-                        event_type="new_song",
-                        timestamp=time.monotonic(),
-                        metadata={
-                            "file_path": segment.path,
-                            "title": metadata.get("title") if metadata else None,
-                            "artist": metadata.get("artist") if metadata else None,
-                            "album": metadata.get("album") if metadata else None,
-                            "duration": metadata.get("duration") if metadata else None
-                        }
-                    )
                     # Reset talking sequence flag when a song starts
+                    # Segment state is now emitted via now_playing event (authoritative)
                     self._is_in_talking_sequence = False
                 elif segment.type in ("intro", "outro", "talk"):
                     # Emit dj_talking event when DJ talking segments start
@@ -716,7 +699,7 @@ class PlayoutEngine:
         - Decode program audio (segment file)
         - Touch the decoder
         - Advance file position
-        - Emit new_song event
+        - Segment state emitted via now_playing event (authoritative)
         - Make program audio audible
         - Change segment timing logic (elapsed = time.monotonic() - segment_start)
         - Reset or manipulate Clock A's internal next_frame_time
@@ -908,7 +891,7 @@ class PlayoutEngine:
                 
                 # C8: Write silence frame immediately (no sleep, no pacing, no decoder, no program audio)
                 # Pre-fill MUST NOT affect segment timing or Clock A timeline
-                # Pre-fill MUST NOT emit new_song or touch decoder
+                # Pre-fill MUST NOT emit events or touch decoder
                 try:
                     # Write silence frame directly (no gain applied, no mixer - it's silence)
                     self._output_sink.write(silence_frame)

@@ -218,12 +218,66 @@ class DJEngine:
                 logger.debug("[DJ] THINK: Terminal intent already exists, skipping duplicate creation")
                 return
             
+            # DJ4.1: Emit dj_think_started event before THINK logic begins
+            think_start_time = time.monotonic()
+            if self._tower_control:
+                try:
+                    self._tower_control.send_event(
+                        event_type="dj_think_started",
+                        timestamp=think_start_time,
+                        metadata={
+                            "current_segment": {
+                                "type": segment.type,
+                                "path": segment.path
+                            }
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending dj_think_started event: {e}")
+            
             logger.info("[DJ] THINK: Shutdown detected, preparing terminal intent...")
             self._handle_shutdown_think()
+            
+            # DJ4.2: Emit dj_think_completed event after THINK logic completes
+            if self._tower_control:
+                try:
+                    think_end_time = time.monotonic()
+                    think_duration_ms = (think_end_time - think_start_time) * 1000.0
+                    self._tower_control.send_event(
+                        event_type="dj_think_completed",
+                        timestamp=think_end_time,
+                        metadata={
+                            "think_duration_ms": think_duration_ms,
+                            "dj_intent": {
+                                "intent_id": self.current_intent.intent_id if self.current_intent else None,
+                                "is_terminal": self.current_intent.is_terminal if self.current_intent else None
+                            } if self.current_intent else None
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending dj_think_completed event: {e}")
+            
             return
         
         # Check for startup announcement (per DJ2.4, SL1.3)
         if self._is_startup:
+            # DJ4.1: Emit dj_think_started event before THINK logic begins
+            think_start_time = time.monotonic()
+            if self._tower_control:
+                try:
+                    self._tower_control.send_event(
+                        event_type="dj_think_started",
+                        timestamp=think_start_time,
+                        metadata={
+                            "current_segment": {
+                                "type": segment.type,
+                                "path": segment.path
+                            }
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending dj_think_started event: {e}")
+            
             # Startup THINK: May select startup announcement
             startup_announcement = self._select_startup_announcement()
             if startup_announcement:
@@ -233,8 +287,29 @@ class DJEngine:
                     is_terminal=False
                 )
                 logger.info(f"[DJ] THINK: Selected startup announcement - {startup_announcement.path}")
-                # Reset startup flag after first THINK
-                self._is_startup = False
+            
+            # DJ4.2: Emit dj_think_completed event after THINK logic completes
+            if self._tower_control:
+                try:
+                    think_end_time = time.monotonic()
+                    think_duration_ms = (think_end_time - think_start_time) * 1000.0
+                    self._tower_control.send_event(
+                        event_type="dj_think_completed",
+                        timestamp=think_end_time,
+                        metadata={
+                            "think_duration_ms": think_duration_ms,
+                            "dj_intent": {
+                                "intent_id": self.current_intent.intent_id if self.current_intent else None,
+                                "is_terminal": self.current_intent.is_terminal if self.current_intent else None
+                            } if self.current_intent else None
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"Error sending dj_think_completed event: {e}")
+            
+            # Reset startup flag after first THINK
+            self._is_startup = False
+            if startup_announcement:
                 return
         
         # Radio Industry Best Practice: Only SONGS trigger DJ THINK/DO.
@@ -264,6 +339,23 @@ class DJEngine:
                 else:
                     logger.warning("[DJ] THINK: Shutdown announcement started but no terminal intent exists - this should not happen")
                 return
+        
+        # DJ4.1: Emit dj_think_started event before THINK logic begins
+        think_start_time = time.monotonic()
+        if self._tower_control:
+            try:
+                self._tower_control.send_event(
+                    event_type="dj_think_started",
+                    timestamp=think_start_time,
+                    metadata={
+                        "current_segment": {
+                            "type": segment.type,
+                            "path": segment.path
+                        }
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error sending dj_think_started event: {e}")
         
         # Phase 9: Maybe rescan assets (only once per hour, non-blocking)
         self.asset_manager.maybe_rescan()
@@ -386,6 +478,25 @@ class DJEngine:
         logger.info(f"[DJ] THINK: DJIntent committed - intent_id={intent_id}, "
                    f"outro={outro is not None}, ids={len(station_ids) if station_ids else 0}, "
                    f"intro={intro is not None}, song={next_song.path if next_song else None}")
+        
+        # DJ4.2: Emit dj_think_completed event after THINK logic completes
+        if self._tower_control:
+            try:
+                think_end_time = time.monotonic()
+                think_duration_ms = (think_end_time - think_start_time) * 1000.0
+                self._tower_control.send_event(
+                    event_type="dj_think_completed",
+                    timestamp=think_end_time,
+                    metadata={
+                        "think_duration_ms": think_duration_ms,
+                        "dj_intent": {
+                            "intent_id": self.current_intent.intent_id if self.current_intent else None,
+                            "is_terminal": self.current_intent.is_terminal if self.current_intent else None
+                        } if self.current_intent else None
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error sending dj_think_completed event: {e}")
     
     def on_segment_finished(self, segment: AudioEvent) -> None:
         """
