@@ -190,3 +190,4 @@ class TestDJ4_1_ThinkStartedEvent:
         # State changes are allowed as part of normal THINK (creating intent), but
         # the event itself must not trigger additional state persistence events
         # The intent creation is part of THINK logic, not the event emission
+

@@ -167,3 +167,4 @@ class NowPlayingStateManager:
             except Exception as e:
                 # Contract E.5: Exposure failures MUST NOT affect playout behavior
                 logger.debug(f"[NOW_PLAYING] Listener callback error: {e}")
+

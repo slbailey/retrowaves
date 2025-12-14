@@ -393,3 +393,4 @@ This contract references and depends on:
 This contract exists to enable external systems to observe what is currently playing while maintaining strict architectural boundaries. By prohibiting state from influencing timing, decisions, or playout behavior, this contract ensures that "Now Playing" features remain purely observational and do not compromise Phase 1.0 invariants.
 
 The key insight is that observation and control must remain strictly separated. NowPlayingState provides a read-only window into the system's current playout state, but it must never become a timing surface or decision-making input. This separation allows fun, visible features (like "Now Playing" displays) while protecting the core playout timing and decision-making systems from external influence.
+

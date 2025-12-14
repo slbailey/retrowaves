@@ -300,3 +300,4 @@ class TestOS3_EventsDoNotAlterBufferBehavior:
         sink._check_buffer_health()
         elapsed = time.monotonic() - start_time
         assert elapsed < 0.1, "Event emission must not block buffer health check"
+

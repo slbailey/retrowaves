@@ -200,3 +200,4 @@ class TestDJ4_2_ThinkCompletedEvent:
         think_completed_calls_during_do = [c for c in mock_tower_control.send_event.call_args_list 
                                           if c[1].get("event_type") == "dj_think_completed"]
         assert len(think_completed_calls_during_do) == 0, "dj_think_completed must NOT be emitted during DO phase"
+
