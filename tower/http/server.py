@@ -769,7 +769,7 @@ class HTTPServer:
             self._event_clients[client_id] = {
                 'socket': client,
                 'event_type_filter': event_type_filter,
-                'last_send_time': time.time()
+                'last_activity_time': time.time()
             }
         
         # Keep connection alive and handle incoming frames (ping/pong, close)
@@ -793,11 +793,20 @@ class HTTPServer:
                         
                         buffer = buffer[consumed:]
                         
+                        # Update last_activity_time when data is received from client (any opcode)
+                        with self._event_clients_lock:
+                            if client_id in self._event_clients:
+                                self._event_clients[client_id]['last_activity_time'] = time.time()
+                        
                         if opcode == 0x8:  # Close frame
                             # Send close frame response
                             try:
                                 close_frame = create_close_frame()
                                 client.sendall(close_frame)
+                                # Update last_activity_time when frame is successfully sent
+                                with self._event_clients_lock:
+                                    if client_id in self._event_clients:
+                                        self._event_clients[client_id]['last_activity_time'] = time.time()
                             except Exception:
                                 pass
                             break
@@ -806,20 +815,31 @@ class HTTPServer:
                             try:
                                 pong_frame = encode_websocket_frame(payload, opcode=0xA)  # Pong
                                 client.sendall(pong_frame)
+                                # Update last_activity_time when frame is successfully sent
+                                with self._event_clients_lock:
+                                    if client_id in self._event_clients:
+                                        self._event_clients[client_id]['last_activity_time'] = time.time()
                             except Exception:
                                 pass
                         # Ignore other opcodes (text/binary from client)
                     
-                    # Check for slow client (per T-CLIENTS2)
+                    # Check for inactive client (per T-CLIENTS2)
+                    # Disconnect only if no activity (receive or send) for timeout period
                     with self._event_clients_lock:
                         if client_id in self._event_clients:
-                            last_send = self._event_clients[client_id]['last_send_time']
-                            if time.time() - last_send > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
-                                # Client is slow, disconnect
+                            last_activity = self._event_clients[client_id]['last_activity_time']
+                            if time.time() - last_activity > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
+                                # Client is inactive, disconnect
                                 break
                     
                 except socket.timeout:
-                    # Timeout is fine - check if we should disconnect slow client
+                    # Timeout is fine - check if we should disconnect inactive client
+                    with self._event_clients_lock:
+                        if client_id in self._event_clients:
+                            last_activity = self._event_clients[client_id]['last_activity_time']
+                            if time.time() - last_activity > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
+                                # Client is inactive, disconnect
+                                break
                     continue
                 except (OSError, BrokenPipeError, ConnectionError):
                     break
@@ -883,7 +903,8 @@ class HTTPServer:
                 
                 try:
                     client_sock.sendall(ws_frame)
-                    client_info['last_send_time'] = time.time()
+                    # Update last_activity_time when frame is successfully sent
+                    client_info['last_activity_time'] = time.time()
                 except (OSError, BrokenPipeError, ConnectionError):
                     dead_clients.append(client_id)
         
