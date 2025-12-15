@@ -93,6 +93,13 @@ FFmpegSupervisor **MUST** expose the MP3 output via:
 ### F9.1
 MP3 packetization is handled entirely by FFmpeg; no packetizer contract required.
 
+### F9.2 — Continuous MP3 Output Guarantee
+FFmpegSupervisor **MUST** guarantee continuous MP3 output when receiving continuous PCM input from EncoderManager.
+
+- When in **RUNNING** state and receiving continuous PCM frames per tick from EncoderManager (which guarantees continuous PCM output per S7.0A), FFmpegSupervisor **MUST** produce continuous MP3 frames without gaps
+- MP3 frame availability **MUST** follow PCM input cadence without intentional delays or gaps
+- This guarantee enables TowerRuntime to remain observational/pass-through (TR-TIMING3) by relying on the audio pipeline for continuous MP3 output
+
 ---
 
 ## X. Error Handling and Backpressure

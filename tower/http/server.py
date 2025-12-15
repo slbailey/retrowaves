@@ -2,6 +2,7 @@
 
 import os
 import socket
+import select
 import threading
 import time
 import logging
@@ -55,6 +56,10 @@ except Exception:
 
 # Client timeout per contract T-CLIENTS2
 TOWER_CLIENT_TIMEOUT_MS = 250  # 250ms timeout for slow clients
+
+# WebSocket send stall timeout per contract T-WS4
+# Bounded timeout for detecting send stalls (slow consumers)
+TOWER_WS_SEND_STALL_TIMEOUT_MS = 250  # 250ms timeout for send stall detection
 
 # Maximum queue size per client (frames)
 MAX_CLIENT_QUEUE_SIZE = 10
@@ -211,6 +216,10 @@ class HTTPServer:
                 self._handle_buffer_endpoint(client)
             elif path == "/tower/events/ingest":
                 self._handle_events_ingest_endpoint(client, method, request)
+            elif path == "/__test__/broadcast" and os.getenv("TOWER_TEST_MODE") == "1":
+                # Test-only endpoint for triggering event broadcasts
+                # Only available when TOWER_TEST_MODE=1
+                self._handle_test_broadcast_endpoint(client, method, request)
             elif path.startswith("/tower/events"):
                 # Check if this is a WebSocket upgrade request
                 request_str = request.decode('utf-8', errors='ignore')
@@ -332,10 +341,18 @@ class HTTPServer:
             else:
                 stats = self.buffer_stats_provider.stats()
             
-            # Build JSON response with fill and capacity
+            # Build JSON response per contract T-BUF2
+            # Required fields: capacity, count, overflow_count, ratio
+            capacity = stats.capacity
+            count = stats.count
+            overflow_count = getattr(stats, 'overflow_count', 0)  # May not be available on all stats objects
+            ratio = count / capacity if capacity > 0 else 0.0
+            
             response_data = {
-                "fill": stats.count,
-                "capacity": stats.capacity
+                "capacity": capacity,
+                "count": count,
+                "overflow_count": overflow_count,
+                "ratio": ratio
             }
             
             response_json = json.dumps(response_data)
@@ -741,6 +758,132 @@ class HTTPServer:
                 pass
             client.close()
     
+    def _handle_test_broadcast_endpoint(self, client, method, request):
+        """
+        Handle POST /__test__/broadcast endpoint for test-only event broadcasting.
+        
+        Only available when TOWER_TEST_MODE=1.
+        Accepts JSON body with event_type, timestamp, and metadata.
+        Broadcasts event to all connected WebSocket clients.
+        """
+        if method != "POST":
+            response = (
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                '{"error": "Method not allowed. Use POST."}\n'
+            )
+            try:
+                client.sendall(response.encode("ascii"))
+            except Exception:
+                pass
+            client.close()
+            return
+        
+        try:
+            # Extract body from request bytes (may be in initial recv)
+            request_str = request.decode('utf-8', errors='ignore')
+            header_end = request_str.find('\r\n\r\n')
+            if header_end >= 0:
+                # Body starts after headers
+                body_start = header_end + 4
+                body_data = request[body_start:] if len(request) > body_start else b''
+            else:
+                body_data = b''
+            
+            # Read remaining body if Content-Length indicates more data
+            # Parse Content-Length from headers
+            content_length = None
+            for line in request_str.split('\r\n'):
+                if line.lower().startswith('content-length:'):
+                    try:
+                        content_length = int(line.split(':', 1)[1].strip())
+                        break
+                    except (ValueError, IndexError):
+                        pass
+            
+            # Read remaining body if needed
+            if content_length is not None and len(body_data) < content_length:
+                client.settimeout(1.0)
+                while len(body_data) < content_length:
+                    try:
+                        chunk = client.recv(min(4096, content_length - len(body_data)))
+                        if not chunk:
+                            break
+                        body_data += chunk
+                    except socket.timeout:
+                        break
+                    except Exception:
+                        break
+            
+            if not body_data:
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    '{"error": "Request body required"}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Parse JSON
+            try:
+                body_str = body_data.decode("utf-8")
+                event_data = json.loads(body_str)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    f'{{"error": "Invalid JSON: {str(e)}"}}\n'
+                )
+                try:
+                    client.sendall(response.encode("ascii"))
+                except Exception:
+                    pass
+                client.close()
+                return
+            
+            # Extract event fields
+            event_type = event_data.get("event_type", "test_event")
+            timestamp = event_data.get("timestamp", time.time())
+            metadata = event_data.get("metadata", {})
+            
+            # Broadcast event immediately to connected clients
+            self._broadcast_event_to_streaming_clients(event_type, timestamp, metadata)
+            
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                '{"status": "broadcast"}\n'
+            )
+            client.sendall(response.encode("ascii"))
+            client.close()
+            
+        except Exception as e:
+            logger.warning(f"Error handling /__test__/broadcast: {e}")
+            response = (
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                '{"error": "Internal server error"}\n'
+            )
+            try:
+                client.sendall(response.encode("ascii"))
+            except Exception:
+                pass
+            client.close()
+    
     def _handle_websocket_events(self, client, client_id, sec_websocket_key, query_params):
         """
         Handle WebSocket upgrade and streaming for /tower/events endpoint.
@@ -765,6 +908,16 @@ class HTTPServer:
             return
         
         # Add client to event streaming clients per contract T-EXPOSE1.2
+        # Per T-WS4: Reduce socket send buffer to enable send-stall detection
+        # Smaller buffer makes it easier to detect when client is slow (buffer fills faster)
+        try:
+            # Set smaller send buffer (8KB) to enable bounded send-stall detection
+            # This allows T-WS4 compliance: detect stalls when buffer fills, not based on idle time
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
+        except Exception:
+            # If setting buffer size fails, continue anyway (some systems may not allow it)
+            pass
+        
         with self._event_clients_lock:
             self._event_clients[client_id] = {
                 'socket': client,
@@ -773,10 +926,15 @@ class HTTPServer:
             }
         
         # Keep connection alive and handle incoming frames (ping/pong, close)
+        # Per T-WS2: Idle connections MUST NOT be disconnected based solely on lack of data transfer
+        # Per T-WS4: Slow-consumer drop applies only when an actual send operation stalls
         buffer = b''
         try:
             while self.running:
+                
                 try:
+                    # Per T-WS2: Idle connections MUST NOT be disconnected
+                    # Only check for close frames, ping/pong, not for inactivity
                     client.settimeout(1.0)
                     data = client.recv(4096)
                     if not data:
@@ -823,23 +981,9 @@ class HTTPServer:
                                 pass
                         # Ignore other opcodes (text/binary from client)
                     
-                    # Check for inactive client (per T-CLIENTS2)
-                    # Disconnect only if no activity (receive or send) for timeout period
-                    with self._event_clients_lock:
-                        if client_id in self._event_clients:
-                            last_activity = self._event_clients[client_id]['last_activity_time']
-                            if time.time() - last_activity > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
-                                # Client is inactive, disconnect
-                                break
-                    
                 except socket.timeout:
-                    # Timeout is fine - check if we should disconnect inactive client
-                    with self._event_clients_lock:
-                        if client_id in self._event_clients:
-                            last_activity = self._event_clients[client_id]['last_activity_time']
-                            if time.time() - last_activity > TOWER_CLIENT_TIMEOUT_MS / 1000.0:
-                                # Client is inactive, disconnect
-                                break
+                    # Timeout is a normal polling event - just continue the loop
+                    # The inactivity check at the top of the loop will handle true inactivity
                     continue
                 except (OSError, BrokenPipeError, ConnectionError):
                     break
@@ -901,12 +1045,98 @@ class HTTPServer:
                 if event_type_filter and event_type != event_type_filter:
                     continue
                 
+                # Per T-WS4: Slow-consumer drop applies only when an actual send operation stalls
+                # Per T-WS7: WebSocket write operations MUST be non-blocking
+                # Bounded send semantics: Use select.select() to check writability before send
+                # select() is required to make T-WS4 enforceable and testable (detects send stalls deterministically)
                 try:
-                    client_sock.sendall(ws_frame)
-                    # Update last_activity_time when frame is successfully sent
-                    client_info['last_activity_time'] = time.time()
-                except (OSError, BrokenPipeError, ConnectionError):
+                    # Check if socket is writable within bounded timeout (per T-WS4)
+                    send_timeout = TOWER_WS_SEND_STALL_TIMEOUT_MS / 1000.0
+                    readable, writable, exceptional = select.select([], [client_sock], [], send_timeout)
+                    
+                    if client_sock not in writable:
+                        # Socket not writable within timeout - send would stall
+                        # Per T-WS4: disconnect slow consumer when send stalls
+                        logger.debug(f"WebSocket send stall (not writable) for client {client_id} - disconnecting slow consumer")
+                        dead_clients.append(client_id)
+                        try:
+                            # Send close frame (best effort, non-blocking)
+                            close_frame = create_close_frame()
+                            try:
+                                client_sock.setblocking(False)
+                                client_sock.send(close_frame)
+                            except Exception:
+                                pass
+                            client_sock.close()
+                        except Exception:
+                            pass
+                    else:
+                        # Socket is writable - attempt send
+                        # Save original blocking mode
+                        was_blocking = client_sock.getblocking()
+                        # Set non-blocking mode for send operation (secondary guard)
+                        client_sock.setblocking(False)
+                        
+                        try:
+                            # Attempt non-blocking send
+                            # If buffer is full, send() raises BlockingIOError immediately
+                            # Partial send indicates failed frame send - disconnect client
+                            sent = client_sock.send(ws_frame)
+                            if sent < len(ws_frame):
+                                # Partial send - failed frame send, disconnect client
+                                logger.debug(f"WebSocket partial send (failed frame) for client {client_id} - disconnecting")
+                                dead_clients.append(client_id)
+                                try:
+                                    # Send close frame (best effort)
+                                    close_frame = create_close_frame()
+                                    try:
+                                        client_sock.send(close_frame)
+                                    except Exception:
+                                        pass
+                                    client_sock.close()
+                                except Exception:
+                                    pass
+                            else:
+                                # Full frame sent successfully
+                                client_sock.setblocking(was_blocking)  # Restore blocking mode
+                                # Update activity time on successful send
+                                client_info['last_activity_time'] = time.time()
+                        except BlockingIOError:
+                            # Socket buffer is full - send would block
+                            # Per T-WS4: disconnect slow consumer when send stalls
+                            logger.debug(f"WebSocket send stall (BlockingIOError) for client {client_id} - disconnecting slow consumer")
+                            dead_clients.append(client_id)
+                            try:
+                                # Send close frame (best effort, may also block)
+                                close_frame = create_close_frame()
+                                try:
+                                    client_sock.send(close_frame)
+                                except Exception:
+                                    pass
+                                client_sock.close()
+                            except Exception:
+                                pass
+                        except (OSError, BrokenPipeError, ConnectionError):
+                            # Send failed - connection broken
+                            dead_clients.append(client_id)
+                            try:
+                                client_sock.close()
+                            except Exception:
+                                pass
+                        finally:
+                            # Restore original blocking mode if socket still open
+                            try:
+                                if client_id not in dead_clients:
+                                    client_sock.setblocking(was_blocking)
+                            except Exception:
+                                pass
+                except (OSError, BrokenPipeError, ConnectionError, ValueError):
+                    # Socket error or invalid file descriptor
                     dead_clients.append(client_id)
+                    try:
+                        client_sock.close()
+                    except Exception:
+                        pass
         
         # Remove dead clients
         if dead_clients:

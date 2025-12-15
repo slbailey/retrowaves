@@ -79,8 +79,8 @@ TowerRuntime **MUST** broadcast MP3 frames immediately as they become available 
 ### TR-TIMING2 — No Independent MP3 Clock
 TowerRuntime **MUST NOT** create or maintain its own timing interval for MP3 output. Timing **MUST** be derived solely from upstream PCM cadence via: AudioPump → EncoderManager → FFmpegSupervisor → MP3 frame availability.
 
-### TR-TIMING3 — Bounded Wait
-If no MP3 frame becomes available within a bounded timeout (≤250ms), the broadcast loop **MUST** output a fallback MP3 frame (silence or tone) to prevent stalling.
+### TR-TIMING3 — No MP3 Synthesis
+TowerRuntime **MUST NOT** synthesize MP3 frames. Continuous MP3 output is guaranteed by the audio pipeline (EncoderManager → FFmpegSupervisor).
 
 ### TR-TIMING4 — Zero Drift Guarantee
 Broadcast timing **MUST** follow encoder-produced MP3 frames directly. Timing drift between PCM cadence and MP3 output **MUST** be impossible by design.
@@ -229,11 +229,12 @@ Startup order **MUST** be:
 1. Construct buffers
 2. Construct FallbackProvider
 3. Construct EncoderManager
-4. Construct AudioPump
-5. Initialize event broadcaster (no storage or buffering; real-time delivery only)
-6. Start FFmpegSupervisor
-7. Start HTTP server (including event endpoints)
-8. Start the frame-driven broadcast loop which retrieves MP3 frames from EncoderManager as they become available.
+4. Start PCM Ingestion (must be ready to accept frames before AudioPump begins ticking, per I51)
+5. Construct AudioPump
+6. Initialize event broadcaster (no storage or buffering; real-time delivery only)
+7. Start FFmpegSupervisor
+8. Start HTTP server (including event endpoints)
+9. Start the frame-driven broadcast loop which retrieves MP3 frames from EncoderManager as they become available.
 
 ### T-ORDER2
 Shutdown **MUST** be reverse order.
@@ -459,7 +460,7 @@ When a new event arrives, TowerRuntime **MUST** broadcast it to all connected cl
 
 Slow or stalled WS clients **MUST** be dropped without impacting other clients.
 
-WebSocket client handling **MUST** follow the same rules as MP3 stream clients (T-CLIENTS1–4): non-blocking writes, >250ms disconnect threshold, thread-safe registry, socket send validation.
+WebSocket client handling **MUST** follow T-WS* requirements (see T-WS section below).
 
 #### T-EXPOSE1.7 — Immediate Flush Requirement
 When a new event is received, and clients are connected to `/tower/events`, TowerRuntime **MUST** send the event to all connected WebSocket clients immediately upon receipt, with no batching or intentional delay.
@@ -485,12 +486,7 @@ Event delivery **MUST** complete quickly (< 10ms typical, < 100ms maximum).
 
 
 #### T-EXPOSE5 — Client Handling
-Event endpoints **MUST** follow the same client handling rules as `/stream`:
-
-- Writes **MUST** be non-blocking (per T-CLIENTS1)
-- Slow clients **MUST** be disconnected after >250ms (per T-CLIENTS2)
-- Client registry **MUST** be thread-safe (per T-CLIENTS3)
-- Socket send return values **MUST** be validated (per T-CLIENTS4)
+Event endpoints **MUST** follow T-WS* requirements (see T-WS section below).
 
 #### T-EXPOSE6 — Event Ordering
 Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** store events for ordering enforcement.
@@ -523,6 +519,62 @@ WebSocket event endpoints **MUST NOT** depend on Station timing:
 - Endpoints **MUST NOT** block if no events are available
 - Endpoints **MUST** send events immediately as they become available (or send empty/keepalive if no events)
 - Endpoints **MUST NOT** use Station timing to influence Tower behavior
+
+---
+
+## T-WS — WebSocket Transport Requirements
+
+### T-WS1 — RFC6455 Compliance
+TowerRuntime **MUST** implement WebSocket connections in compliance with RFC6455.
+
+- WebSocket upgrade handshake **MUST** follow RFC6455
+- Frame format **MUST** comply with RFC6455
+- Close handshake **MUST** follow RFC6455
+
+### T-WS2 — Idle Connections
+TowerRuntime **MUST** allow WebSocket connections to remain idle (no data frames sent) for extended periods.
+
+- Idle connections **MUST NOT** be disconnected based solely on lack of data transfer
+- Idle connections **MAY** remain open indefinitely as long as the connection is healthy
+- Idle timeout **MUST** be configurable with a default of ≥120 seconds, or **MAY** be disabled
+
+### T-WS3 — Activity Definition
+Activity on a WebSocket connection **MUST** be defined as any WebSocket frame (control or data) sent or received.
+
+- Ping frames (sent or received) **MUST** be considered activity
+- Pong frames (sent or received) **MUST** be considered activity
+- Data frames (sent or received) **MUST** be considered activity
+- Close frames **MUST** be considered activity
+
+### T-WS4 — Slow-Consumer Drop Semantics
+Slow-consumer detection and disconnection **MUST** apply only when an actual send operation stalls.
+
+- A client **MUST** be considered slow only when a non-blocking send operation fails or indicates the socket buffer is full
+- A client **MUST NOT** be disconnected based solely on connection age or idle time
+- A client **MUST** be disconnected if a send operation cannot complete within a bounded timeout (implementation-defined, typically ≤250ms for send operations)
+- Slow-consumer drop **MUST NOT** affect other clients
+- Send stall detection **MUST** be based on OS-level socket writability (e.g., select/poll), not elapsed time or mocked send behavior
+
+### T-WS5 — Ping/Pong Support
+TowerRuntime **MUST** respond to ping frames from clients with pong frames per RFC6455.
+
+- TowerRuntime **MUST** respond to incoming ping frames with pong frames (RFC6455 requirement)
+- TowerRuntime **MAY** send periodic ping frames to clients for connection liveness (optional)
+- Ping/pong frames **MUST NOT** be considered data frames for event delivery purposes
+
+### T-WS6 — Thread-Safe Registry
+The WebSocket client registry **MUST** be thread-safe.
+
+- Concurrent registration and removal **MUST** be safe
+- Concurrent broadcast operations **MUST** be safe
+- Registry operations **MUST NOT** block event ingestion or audio processing
+
+### T-WS7 — Non-Blocking Writes
+WebSocket write operations **MUST** be non-blocking.
+
+- Send operations **MUST** use non-blocking I/O
+- Write failures **MUST** be handled gracefully without blocking
+- Slow clients **MUST** be detected via send operation failures, not connection age
 
 ---
 
@@ -565,14 +617,25 @@ If log file write operations fail, TowerRuntime **MUST** continue operating norm
 
 ## Required Tests
 
-This contract requires the following logging compliance tests:
+This contract requires the following tests:
 
+### Logging Compliance Tests
 - LOG1 — Log File Location
 - LOG2 — Non-Blocking Logging
 - LOG3 — Rotation Tolerance
 - LOG4 — Failure Behavior
 
 See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
+
+### WebSocket Transport Tests
+- T-WS1 — RFC6455 Compliance: Verify WebSocket upgrade handshake, frame format, and close handshake comply with RFC6455
+- T-WS2 — Idle Connection Survival: Verify WebSocket connections remain open when idle (no data frames) for extended periods (≥120 seconds default)
+- T-WS3 — Ping/Pong Handling: Verify TowerRuntime responds to ping frames with pong frames per RFC6455, and ping/pong frames are considered activity
+- T-WS4 — Slow-Consumer Drop-on-Send-Stall: Verify clients are disconnected only when an actual send operation stalls (socket buffer full or send timeout), not based on connection age or idle time
+
+### Buffer Endpoint Tests
+- T-BUF1 — Endpoint Path: Verify the buffer endpoint is accessible at `/tower/buffer` (not `/tower/pcm-buffer-status` or other paths)
+- T-BUF2 — Response Schema: Verify the response JSON contains exactly the fields specified in T-BUF2: `capacity`, `count`, `overflow_count`, and `ratio`
 
 ---
 

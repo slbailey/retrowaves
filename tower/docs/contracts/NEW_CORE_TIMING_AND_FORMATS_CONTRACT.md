@@ -177,13 +177,13 @@ PCM input buffers **MUST** be sized in whole multiples of PCM frames.
 When queried, buffers **MUST** return fill level in units of frames or bytes.
 
 ### C6.4
-`TowerRuntime`'s `/tower/pcm-buffer-status` endpoint **MUST** expose:
+`TowerRuntime`'s `/tower/buffer` endpoint **MUST** expose:
 
 - Total capacity
 - Current fill amount
 - Fill ratio
 
-> **Note:** This supports upstream backpressure.
+> **Note:** This supports upstream backpressure. The endpoint path `/tower/buffer` is canonical per T-BUF1 in `NEW_TOWER_RUNTIME_CONTRACT.md`.
 
 ---
 
