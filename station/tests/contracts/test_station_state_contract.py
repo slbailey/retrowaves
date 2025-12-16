@@ -52,8 +52,6 @@ skip_if_no_station = pytest.mark.skipif(
 class TestA_StationStateQuery:
     """Category A: Station State Query Tests (S.1, S.2, Q.1-Q.4)."""
     
-    @pytest.mark.integration
-    @skip_if_no_station
     def test_a1_state_endpoint_exists(self):
         """
         A.1: /station/state endpoint MUST exist and return valid JSON.
@@ -64,9 +62,10 @@ class TestA_StationStateQuery:
         - MUST be idempotent
         - MUST be non-blocking
         - MUST return state in consistent format (JSON)
+        
+        NOTE: This test always runs (not skipped) to verify the endpoint is implemented.
+        It will fail if Station HTTP server is not running, which indicates missing implementation.
         """
-        # NOTE: This test will FAIL until /station/state endpoint is implemented
-        # Expected failure: 404 Not Found or connection refused
         
         try:
             conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)

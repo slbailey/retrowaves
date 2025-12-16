@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -89,6 +90,8 @@ class Station:
         self.dj: Optional[DJEngine] = None
         self.engine: Optional[PlayoutEngine] = None
         self.sink: Optional[TowerPCMSink] = None
+        self.http_server: Optional[object] = None  # HTTP server for /station/state endpoint
+        self.http_server_thread: Optional[threading.Thread] = None
         self.tower_control: Optional[TowerControlClient] = None
         self.station_state_manager: Optional[StationStateManager] = None
         
@@ -226,14 +229,35 @@ class Station:
         logger.info("Initializing StationStateManager...")
         self.station_state_manager = StationStateManager()
         
-        # Register with HTTP server (if HTTP streaming is used)
+        # Start HTTP server for /station/state endpoint (per STATION_STATE_CONTRACT Q.1)
+        # This is independent of HTTP streaming - always available for state queries
         try:
-            from station.app.http_server import set_station_state_manager
+            from station.app.http_server import set_station_state_manager, ThreadingHTTPServer, create_handler_class
+            from station.outputs.http_connection_manager import HTTPConnectionManager
+            
+            # Register state manager
             set_station_state_manager(self.station_state_manager)
-            logger.info("StationStateManager registered with HTTP server")
-        except ImportError:
-            # HTTP server may not be available (e.g., if not using HTTP streaming)
-            logger.debug("HTTP server not available, skipping station state endpoint registration")
+            
+            # Start minimal HTTP server for /station/state endpoint
+            # Use a dummy connection manager (not used for state endpoint)
+            dummy_connection_manager = HTTPConnectionManager()
+            handler_class = create_handler_class(dummy_connection_manager)
+            
+            # Get port from environment or use default 8000
+            http_port = int(os.getenv("STATION_HTTP_PORT", "8000"))
+            http_host = os.getenv("STATION_HTTP_HOST", "0.0.0.0")
+            
+            self.http_server = ThreadingHTTPServer((http_host, http_port), handler_class)
+            self.http_server_thread = threading.Thread(
+                target=self.http_server.serve_forever,
+                daemon=True
+            )
+            self.http_server_thread.start()
+            logger.info(f"Station HTTP server started on {http_host}:{http_port} (for /station/state endpoint)")
+        except Exception as e:
+            logger.warning(f"Failed to start Station HTTP server: {e}. /station/state endpoint will not be available.")
+            self.http_server = None
+            self.http_server_thread = None
         
         # Pass startup state tracker to DJEngine for DO phase guards
         self.dj._station_startup_state_getter = lambda: self._startup_state
@@ -578,6 +602,20 @@ class Station:
             logger.info("[SHUTDOWN] PHASE 2: Terminal playout complete and engine stopped, closing Tower PCM sink...")
             self.sink.close()
             logger.info("[SHUTDOWN] PHASE 2: Tower PCM sink closed (audio output terminated)")
+        
+        # Stop HTTP server for /station/state endpoint
+        if self.http_server:
+            logger.info("Stopping Station HTTP server...")
+            try:
+                self.http_server.shutdown()
+                if self.http_server_thread:
+                    self.http_server_thread.join(timeout=2.0)
+                logger.info("Station HTTP server stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping HTTP server: {e}")
+            finally:
+                self.http_server = None
+                self.http_server_thread = None
         
         logger.info("=== Station stopped ===")
     
