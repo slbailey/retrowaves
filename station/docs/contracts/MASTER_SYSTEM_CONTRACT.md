@@ -68,11 +68,13 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 - Not rely on Tower timing or state
 
 **Heartbeat events include:**
-- Content events (`dj_talking`, `now_playing`) — emitted by PlayoutEngine/NowPlayingStateManager
-  - NOTE: `new_song` deprecated - `now_playing` is the authoritative signal for segment state
+- Lifecycle events (`station_startup`, `station_shutdown`) — emitted by Station
+- Content events (`segment_playing`, `song_playing`) — emitted by PlayoutEngine
 - THINK lifecycle events (`dj_think_started`, `dj_think_completed`) — emitted by DJEngine
 - Buffer health events (`station_underflow`, `station_overflow`) — emitted by OutputSink
 - Clock drift events (`decode_clock_skew`) — emitted by PlayoutEngine (if drift compensation enabled)
+
+**DEPRECATED:** `now_playing` events **MUST NOT** be emitted. This event pattern (start + clear semantics) is completely deprecated. Use stateful querying via Station State Contract and edge-triggered events (`song_playing`, `segment_playing`, `station_startup`, `station_shutdown`) instead.
 
 **Event emission rules:**
 - Events **MUST** be emitted at correct lifecycle boundaries
@@ -80,12 +82,137 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 - Events **MUST NOT** modify queue, rotation history, or any system state
 - Events **MUST** be purely observational (no control logic)
 - Events **MUST** include required metadata (timestamps, segment_id, etc.)
+- Events **MUST** be edge-triggered transitions only (fire ONCE per transition)
+- Events **MUST NOT** fire "end" or "clear" events
 
 **THINK/DO separation:**
 - THINK events (`dj_think_started`, `dj_think_completed`) are emitted during THINK phase
-- Content events (`dj_talking`, `now_playing`) are emitted when segments start playing
-  - NOTE: `new_song` deprecated - use `now_playing` events and filter by `segment_type == "song"`
+- Content events (`segment_playing`, `song_playing`) are emitted when segments start playing
 - Events **MUST NOT** cross THINK/DO boundaries (THINK events don't influence DO, DO events don't influence THINK)
+
+### E0.8 — Events vs State: Non-Overlapping Responsibilities
+
+**Events are EDGE-TRIGGERED transitions only. State is LEVEL-TRIGGERED and queryable.**
+
+Events and state have completely separate, non-overlapping responsibilities:
+
+- **Events** represent edge-triggered transitions that fire ONCE per state change
+- **State** represents level-triggered, queryable current truth (see Station State Contract)
+- **No overlap**: Events do NOT represent state; state is NOT represented by events
+- **No inference**: Absence of events NEVER implies absence of state
+- **Explicit querying**: Current state MUST be queried via Station State Contract; it cannot be inferred from events
+- **One-way events**: Events are Station → Tower (one-way, observational)
+- **Tower statelessness**: Tower does NOT infer state from events; Tower remains stateless and non-influential
+
+**Event Semantics (Edge-Triggered):**
+- Events fire exactly ONCE when a state transition occurs (e.g., `song_playing` fires when song segment starts)
+- Events **MUST NOT** fire "end", "clear", or empty-metadata events
+- Events represent transitions only, not current state
+- Events are lost if Tower is disconnected; state queries provide authoritative truth
+- Events are idempotent-safe on restart; state queries provide current truth after restart
+- Events **MUST NOT** be used to determine what is currently playing
+
+**State Semantics (Level-Triggered):**
+- State is always queryable via Station State Contract at any moment
+- State reflects current operational truth at the moment of query
+- State updates synchronously with segment lifecycle events
+- State is consistent across all query mechanisms
+- State queries are authoritative; events are observational transitions only
+
+**Content Plane Invariant:**
+**There is no such thing as "nothing is playing" in the content plane. Absence is represented ONLY via lifecycle or error states.**
+
+- When Station is operational (RUNNING state), there is ALWAYS content playing or about to play
+- Fallback content is a STATE, not an absence
+- Empty or cleared state does NOT represent "nothing playing" — it represents a lifecycle transition or error condition
+- Consumers **MUST NOT** infer absence of content from state queries; absence is a lifecycle state (startup, shutdown, error)
+
+### E0.9 — System-Wide Event Definitions
+
+**All system-wide events are edge-triggered transitions only. There are NO "clear", "end", or empty-metadata events.**
+
+The following events represent the complete set of edge-triggered transitions in the system:
+
+#### E0.9.1 — `station_startup`
+
+**When it fires:**
+- Fires exactly ONCE when `Station.start()` completes and playout begins
+- Fires synchronously before the first segment (startup announcement or first song) starts
+- Fires before any content events (`song_playing`, `segment_playing`)
+
+**Metadata requirements:**
+- Metadata **MUST** be empty object `{}`
+- No audio metadata is required or permitted
+
+**Idempotency guarantees:**
+- Event is idempotent-safe: may be re-emitted on Station restart
+- Multiple startups result in multiple events (each restart is a distinct transition)
+- Event represents the transition from non-operational to operational state
+
+#### E0.9.2 — `song_playing`
+
+**When it fires:**
+- Fires exactly ONCE when a song segment starts playing
+- Fires synchronously when `on_segment_started` is emitted with `segment_type="song"`
+- Fires before audio playback begins for the song segment
+
+**Metadata requirements:**
+- Metadata **MUST** include full AudioEvent metadata when audio is active
+- Required fields: `segment_type: "song"`, `started_at` (wall-clock timestamp)
+- Optional fields (populated when available): `title`, `artist`, `album`, `year`, `duration_sec`, `file_path`
+- Metadata **MUST NOT** be empty; if metadata is unavailable, fallback metadata **MUST** be provided (e.g., empty strings for optional fields)
+
+**Idempotency guarantees:**
+- Event is idempotent-safe: may be re-emitted on Station restart
+- Each song segment start is a distinct transition; same song playing twice results in two events
+- Event represents the transition to song content state
+
+#### E0.9.3 — `segment_playing`
+
+**DEPRECATED:** The `dj_talking` event is COMPLETELY DEPRECATED and MUST NOT be emitted. Use `segment_playing` with appropriate metadata instead.
+
+**When it fires:**
+- Fires exactly ONCE per non-song segment start
+- Fires synchronously when `on_segment_started` is emitted with `segment_type` not equal to `"song"`
+- Fires before audio playback begins for the segment
+- Represents transition to non-song content state (station IDs, DJ talk, promos, radio dramas, album segments, etc.)
+
+**Metadata requirements:**
+- **MUST** include required metadata: `segment_class`, `segment_role`, `production_type` (see EVENT_INVENTORY.md for complete metadata schema)
+- **MUST** include optional metadata when available: `file_path`, `duration_sec`, `series_id`, `episode_id`, `part_number`, `total_parts`, `legal`
+
+**Idempotency guarantees:**
+- Event is idempotent-safe: may be re-emitted on Station restart
+- Each segment start is a distinct transition
+- Event represents the transition to non-song content state
+
+#### E0.9.4 — `station_shutdown`
+
+**When it fires:**
+- Fires exactly ONCE when terminal playout completes (or timeout occurs)
+- Fires synchronously after the last segment finishes (or timeout)
+- Fires before Station enters SHUTTING_DOWN state and performs final cleanup
+- Fires before process exit
+
+**Metadata requirements:**
+- Metadata **MUST** be empty object `{}`
+- No audio metadata is required or permitted
+
+**Idempotency guarantees:**
+- Event is idempotent-safe: may be re-emitted on Station restart
+- Each shutdown is a distinct transition; event fires once per shutdown
+- Event represents the transition from operational to non-operational state
+
+#### E0.9.5 — Deprecated Events
+
+**`now_playing` event is COMPLETELY DEPRECATED and MUST NOT be emitted.**
+
+- **FORBIDDEN**: Emitting `now_playing` events with any metadata (including empty metadata)
+- **FORBIDDEN**: Using `now_playing` events to represent current state
+- **FORBIDDEN**: Inferring state from `now_playing` event presence or absence
+- **REQUIRED**: Use stateful querying via Station State Contract for current state
+- **REQUIRED**: Use edge-triggered events (`song_playing`, `segment_playing`, `station_startup`, `station_shutdown`) for transitions
+- Consumers **MUST NOT** rely on `now_playing` events; all consumers MUST migrate to stateful querying
 
 ---
 

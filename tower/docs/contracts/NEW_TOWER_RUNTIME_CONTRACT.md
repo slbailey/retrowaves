@@ -11,6 +11,13 @@
 
 TowerRuntime does not decide audio content; it passes through what it receives from the encoder pipeline. TowerRuntime does not use Station events to influence timing or behavior; events are purely observational.
 
+**Tower Statelessness:**
+- Tower **MUST** remain stateless with respect to Station state
+- Tower **MUST NOT** query, cache, or reconstruct Station state
+- Tower **MUST NOT** infer state from events or event absence
+- Events are edge-triggered transitions only, not authoritative state
+- Tower forwards events to WebSocket clients but does not interpret or track state
+
 ---
 
 ## S. HTTP Stream Endpoint
@@ -297,23 +304,34 @@ TowerRuntime **MUST** accept Station heartbeat events and expose them via WebSoc
 #### T-EVENTS1 — Event Acceptance
 TowerRuntime **MUST** accept Station heartbeat events via HTTP POST to `/tower/events/ingest` (or equivalent internal interface).
 
-**Accepted event types:**
-- `station_starting_up` — Station is starting up
-- `station_shutting_down` — Station is shutting down
-- `now_playing` — Authoritative signal for currently active playout segment (see NEW_NOW_PLAYING_STATE_CONTRACT)
-- `dj_talking` — DJ has started talking between songs
+**Accepted event types (ONLY these four):**
+- `station_startup` — Station has started up and playout has begun
+- `station_shutdown` — Station is shutting down after terminal playout completes
+- `song_playing` — Song segment has started playing (edge-triggered transition)
+- `segment_playing` — Non-song segment has started playing (edge-triggered transition)
+
+**DEPRECATED event types (MUST be explicitly rejected):**
+- `station_starting_up` — **DEPRECATED** - TowerRuntime **MUST** reject with validation error
+- `station_shutting_down` — **DEPRECATED** - TowerRuntime **MUST** reject with validation error
+- `now_playing` — **DEPRECATED** - TowerRuntime **MUST** reject with validation error
+- `dj_talking` — **DEPRECATED** - TowerRuntime **MUST** reject with validation error (use `segment_playing` instead)
+- Any other event type not listed in accepted event types — **FORBIDDEN** - TowerRuntime **MUST** reject with validation error
 
 **Event sending requirements:**
-- `station_starting_up` **MUST** be sent exactly once when Station starts up
-- `station_shutting_down` **MUST** be sent exactly once when Station shuts down
-- `now_playing` **MUST** be sent when any segment starts playing (song, intro, outro, id, talk, fallback)
-  - `now_playing` events **MUST** include segment metadata (segment_type, title, artist, album, duration_sec, etc.)
-  - `now_playing` **MUST** be sent with empty metadata when segment finishes
-  - This is the authoritative signal for segment state - consumers should filter by `segment_type == "song"` to detect songs
-  - NOTE: `new_song` event deprecated - use `now_playing` instead
-- `dj_talking` **MUST** be sent when DJ starts talking, but only once even if multiple talking MP3 files are strung together
-- Station **MUST NOT** send multiple `station_starting_up` or `station_shutting_down` events
+- `station_startup` **MUST** be sent exactly once when Station.start() completes and playout begins
+- `station_shutdown` **MUST** be sent exactly once when terminal playout completes (or timeout), before shutdown
+- `song_playing` **MUST** be sent when a song segment starts playing (on_segment_started with segment_type="song")
+  - `song_playing` events **MUST** include full AudioEvent metadata when available (title, artist, album, year, duration_sec, file_path)
+  - `song_playing` **MUST** be sent synchronously before audio begins
+  - This is an edge-triggered transition event - events represent transitions, not current state
+- `segment_playing` **MUST** be sent when a non-song segment starts playing (on_segment_started with segment_type not equal to "song")
+  - `segment_playing` events **MUST** include required metadata: `segment_class`, `segment_role`, `production_type` (see EVENT_INVENTORY.md for metadata schema)
+  - `segment_playing` **MUST** be sent synchronously before audio begins
+  - This is an edge-triggered transition event - events represent transitions, not current state
+  - Tower **MUST** treat all metadata as opaque and **MUST NOT** interpret or validate metadata fields
+- Station **MUST NOT** send multiple `station_startup` or `station_shutdown` events
 - Station **MUST** track whether lifecycle events have been sent to prevent duplicates
+- Station **MUST NOT** send "end" or "clear" events - events represent transitions only, not state
 
 #### T-EVENTS1.4 — Event Ingestion Access Control
 TowerRuntime **MUST** expose `/tower/events/ingest` only to trusted internal systems.
@@ -352,8 +370,8 @@ Received events **MUST** conform to Station heartbeat event format:
   "tower_received_at": <float>,  // Tower wall-clock timestamp when received
   "metadata": {
     // Event-specific metadata (varies by event type)
-    // For "now_playing" events (authoritative segment state):
-    //   "segment_type": "<string>",  // "song", "intro", "outro", "id", "talk", "fallback"
+    // For "song_playing" events:
+    //   "segment_type": "<string>",  // "song"
     //   "started_at": <float>,        // Wall-clock timestamp when segment started
     //   "file_path": "<string>",      // Path to MP3 file
     //   "title": "<string>",          // Song title (from MP3 metadata, if available)
@@ -361,14 +379,28 @@ Received events **MUST** conform to Station heartbeat event format:
     //   "album": "<string>",          // Album name (from MP3 metadata, if available)
     //   "year": <int>,                // Release year (from MP3 metadata, if available)
     //   "duration_sec": <float>,      // Duration in seconds (from MP3 metadata, if available)
-    //   Empty metadata {} when segment finishes
-    // For "dj_talking" events:
-    //   (no metadata required)
-    // For lifecycle events ("station_starting_up", "station_shutting_down"):
+    // For "segment_playing" events:
+    //   "segment_class": "<string>",  // Required: segment_class enum (station_id, dj_talk, promo, imaging, radio_drama, album_segment, emergency, special)
+    //   "segment_role": "<string>",    // Required: segment_role enum (intro, outro, interstitial, top_of_hour, legal, transition, standalone)
+    //   "production_type": "<string>", // Required: production_type enum (live_dj, voice_tracked, produced, system)
+    //   "file_path": "<string>",      // Optional: Absolute path to audio file
+    //   "duration_sec": <float>,      // Optional: Duration in seconds
+    //   "series_id": "<string>",      // Optional: Series identifier
+    //   "episode_id": "<string>",      // Optional: Episode identifier
+    //   "part_number": <int>,         // Optional: Part number within multi-part segment
+    //   "total_parts": <int>,          // Optional: Total number of parts
+    //   "legal": <boolean>            // Optional: Whether segment satisfies legal ID requirements
+    // For lifecycle events ("station_startup", "station_shutdown"):
     //   (no metadata required)
   }
 }
 ```
+
+**Event Format Semantics:**
+- Events **MUST** represent edge-triggered transitions only
+- Events **MUST NOT** represent current state or authoritative truth
+- Events **MUST NOT** include empty metadata to signal "end of segment" or "no content"
+- Events **MUST NOT** be used to infer "current playing" state
 
 #### T-EVENTS3.4 — Event Content Integrity
 TowerRuntime **MUST NOT** modify the semantic meaning of events received from Station.
@@ -402,10 +434,11 @@ Events **MUST** be purely observational. Tower **MUST NOT**:
 - Use events to adjust PCM buffer behavior
 - Use events to influence encoder cadence
 - Use events to modify broadcast timing
+- React to absence of events (e.g., infer silence or fallback from lack of events)
 
 Events are for observability only (monitoring, debugging, health checks).
 
-**Exception:** The `station_shutting_down` event **MAY** be used to suppress PCM loss warnings. When Tower receives a `station_shutting_down` event, it **MUST** suppress PCM loss detection warnings until a `station_starting_up` event is received. This prevents false alarms during expected shutdown periods.
+**Exception:** The `station_shutdown` event **MAY** be used to suppress PCM loss warnings. When Tower receives a `station_shutdown` event, it **MUST** suppress PCM loss detection warnings until a `station_startup` event is received. This prevents false alarms during expected shutdown periods.
 
 #### T-EVENTS6 — Non-Blocking Reception
 Event reception **MUST** be non-blocking.
@@ -420,10 +453,70 @@ Event delivery **MUST** complete quickly (< 1ms typical, < 10ms maximum).
 #### T-EVENTS7 — Event Validation
 TowerRuntime **MUST** validate received events:
 
-- Event type **MUST** be one of the accepted types
+- Event type **MUST** be exactly one of: `station_startup`, `station_shutdown`, `song_playing`, `segment_playing`
 - Event **MUST** include required fields (`event_type`, `timestamp`, `metadata`)
+- **DEPRECATED event types MUST be explicitly rejected**: TowerRuntime **MUST** reject the following with validation error (logged but not stored):
+  - `now_playing` — **REJECTED** (deprecated)
+  - `station_starting_up` — **REJECTED** (deprecated, use `station_startup`)
+  - `station_shutting_down` — **REJECTED** (deprecated, use `station_shutdown`)
+  - `dj_talking` — **REJECTED** (deprecated, use `segment_playing`)
+  - Any other event type not in the accepted list — **REJECTED**
+- TowerRuntime **MUST** treat all metadata as opaque and **MUST NOT** interpret or validate metadata fields
 - Invalid events **MUST** be silently dropped (logged but not stored)
 - Validation **MUST** be fast (< 1ms) and non-blocking
+- Rejection of deprecated events **MUST** be logged for observability
+
+#### T-EVENTS8 — State Inference and Query Prohibition
+TowerRuntime **MUST NOT** infer, track, query, cache, or reconstruct Station state.
+
+**Explicit Prohibitions:**
+- Tower **MUST NOT** query Station state (no HTTP requests to Station state endpoints)
+- Tower **MUST NOT** cache or store Station state internally
+- Tower **MUST NOT** reconstruct Station state from event history
+- Tower **MUST NOT** track "current playing" state based on events
+- Tower **MUST NOT** assume absence of events implies absence of state
+- Tower **MUST NOT** infer silence or fallback from lack of events
+- Tower **MUST NOT** derive "current playing" from events
+- Tower **MUST** treat events as one-way, observational transitions only
+- Events remain purely observational and do not represent current truth
+
+**Event Semantics:**
+- Events represent edge-triggered transitions, not state
+- Events are observational announcements only
+- Tower **MUST NOT** use events to determine what is currently playing
+- Tower **MUST NOT** react to absence of events
+
+#### T-EVENTS9 — Explicit State Prohibitions
+TowerRuntime **MUST** remain stateless with respect to Station state. The following behaviors are **EXPLICITLY FORBIDDEN**:
+
+**Tower MUST NOT Query Station State:**
+- Tower **MUST NOT** make HTTP requests to Station state endpoints
+- Tower **MUST NOT** query Station state via any mechanism
+- Tower **MUST NOT** poll Station for current state
+- Tower **MUST NOT** maintain connections to Station state APIs
+
+**Tower MUST NOT Cache or Reconstruct State:**
+- Tower **MUST NOT** cache Station state internally
+- Tower **MUST NOT** store Station state in memory or on disk
+- Tower **MUST NOT** reconstruct Station state from event history
+- Tower **MUST NOT** maintain any internal representation of "current playing" state
+- Tower **MUST NOT** track state transitions internally
+
+**Tower MUST NOT Infer State from Events:**
+- Tower **MUST NOT** derive "current playing" from events
+- Tower **MUST NOT** infer silence from absence of events
+- Tower **MUST NOT** infer fallback from absence of events
+- Tower **MUST NOT** assume absence of events implies any particular state
+- Tower **MUST NOT** use event history to determine current state
+
+**Tower MUST NOT React to Event Absence:**
+- Tower **MUST NOT** react to lack of events
+- Tower **MUST NOT** infer behavior from missing events
+- Tower **MUST NOT** use event presence or absence to make decisions
+- Tower **MUST** treat events as one-way, observational transitions only
+
+**Rationale:**
+Tower is stateless and observational. Events are announcements of transitions, not authoritative state. Tower forwards events to WebSocket clients but does not interpret, cache, or query state. Current state must be queried directly from Station via Station State Contract, not inferred from events.
 
 ---
 
@@ -451,7 +544,7 @@ TowerRuntime **MUST** expose a WebSocket endpoint `/tower/events` that:
 - Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** store events for ordering enforcement
 
 **Query parameters (optional, supported during WS upgrade):**
-- `event_type`: Filter by event type (e.g., `?event_type=now_playing`)
+- `event_type`: Filter by event type (e.g., `?event_type=song_playing` or `?event_type=dj_talking`)
 
 #### T-EXPOSE1.2 — WebSocket Fanout
 TowerRuntime **MUST** maintain a registry of connected WebSocket clients.
@@ -497,7 +590,7 @@ Events **SHOULD** be delivered in arrival order, but TowerRuntime **MUST NOT** s
 #### T-EXPOSE7 — Event Filtering
 The WebSocket event endpoint **MAY** support filtering by:
 
-- Event type (e.g., only `now_playing` events)
+- Event type (e.g., only `song_playing` events or only `segment_playing` events)
 - Other metadata fields (implementation-defined)
 
 Filtering parameters **MUST** be specified during WebSocket upgrade (via query parameters). Filtering **MUST** be fast (< 1ms) and **MUST NOT** block the audio tick loop.

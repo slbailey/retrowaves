@@ -13,7 +13,7 @@ Tests map directly to contract clauses:
 - PE3.3: Decoder Output Rules - no timing constraints
 - PE3.4: No Prefetching (1 test)
 - PE3.5: Error Propagation (1 test)
-- PE4: Heartbeat Events (dj_talking; new_song deprecated, use now_playing)
+- PE4: Heartbeat Events (segment_playing for non-song segments; song_playing for songs)
 - PE5: Optional Station Timebase Drift Compensation
 - PE6: Optional Adaptive Buffer Management with PID Controller (see test_playout_engine_contract_pe6.py)
 - PE7: Shutdown Interaction (6 tests)
@@ -212,83 +212,20 @@ class TestPE3_5_ErrorPropagation:
 class TestPE4_HeartbeatEvents:
     """Tests for PE4 — Heartbeat Events."""
     
-    def test_pe4_1_new_song_deprecated(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.1: new_song event is DEPRECATED - superseded by now_playing."""
-        # Contract PE4.1 is deprecated - new_song event removed
-        # Segment state is now emitted via now_playing events (see NEW_NOW_PLAYING_STATE_CONTRACT)
-        # This test verifies new_song is no longer emitted
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
-        segment = create_fake_audio_event("/fake/test.mp3", "song")
-        
-        engine.start_segment(segment)
-        mock_dj_callback.on_segment_started.assert_called_once_with(segment)
-        
-        # Verify new_song is NOT emitted (deprecated)
-        if mock_tower_control.send_event.called:
-            call_args = mock_tower_control.send_event.call_args
-            event_type = call_args[1]["event_type"]
-            assert event_type != "new_song", "new_song event should not be emitted (deprecated)"
-        
-        # Segment state is now handled by now_playing events (tested in test_now_playing_state_contract.py)
-        assert True, "new_song deprecated - use now_playing events instead"
+    # DELETED: test_pe4_1_new_song_deprecated
+    # REASON: This test referenced deprecated "now_playing" events.
+    # Per NEW_TOWER_RUNTIME_CONTRACT.md and STATION_STATE_CONTRACT.md:
+    # - now_playing is FORBIDDEN
+    # - song_playing is the ONLY song-related event
+    # - State is queryable via /station/state endpoint
+    # New tests for event emission are in test_station_event_emission.py
     
-    def test_pe4_2_dj_talking_must_emit_when_talk_starts(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.2: dj_talking MUST emit when talk segment starts."""
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
-        segment = create_fake_audio_event("/fake/talk1.mp3", "talk")
-        
-        engine.start_segment(segment)
-        
-        # PE4.2 requires dj_talking heartbeat event
-        assert mock_tower_control.send_event.called, "Contract requires dj_talking event when talk starts"
-        call_args = mock_tower_control.send_event.call_args
-        assert call_args[1]["event_type"] == "dj_talking", "Event type must be dj_talking"
-    
-    def test_pe4_2_dj_talking_must_emit_only_once_for_consecutive_talk_files(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.2: dj_talking MUST emit only once even if multiple talk files are strung together."""
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
-        talk1 = create_fake_audio_event("/fake/talk1.mp3", "talk")
-        talk2 = create_fake_audio_event("/fake/talk2.mp3", "talk")
-        talk3 = create_fake_audio_event("/fake/talk3.mp3", "talk")
-        
-        # Start first talk segment
-        engine.start_segment(talk1)
-        engine.finish_segment(talk1)
-        
-        # Start second talk segment (should NOT emit another dj_talking event)
-        engine.start_segment(talk2)
-        engine.finish_segment(talk2)
-        
-        # Start third talk segment (should NOT emit another dj_talking event)
-        engine.start_segment(talk3)
-        
-        # Should have only one dj_talking event
-        dj_talking_calls = [call for call in mock_tower_control.send_event.call_args_list 
-                           if call[1]["event_type"] == "dj_talking"]
-        assert len(dj_talking_calls) == 1, "Contract requires only one dj_talking event for consecutive talk files"
-    
-    def test_pe4_2_dj_talking_resets_after_song(self, mock_dj_callback, mock_output_sink, mock_tower_control):
-        """PE4.2: dj_talking flag MUST reset after a song starts, allowing new dj_talking event."""
-        engine = PlayoutEngine(dj_callback=mock_dj_callback, output_sink=mock_output_sink, tower_control=mock_tower_control)
-        talk1 = create_fake_audio_event("/fake/talk1.mp3", "talk")
-        song = create_fake_audio_event("/fake/song.mp3", "song")
-        talk2 = create_fake_audio_event("/fake/talk2.mp3", "talk")
-        
-        # Start first talk segment
-        engine.start_segment(talk1)
-        engine.finish_segment(talk1)
-        
-        # Start song (should reset talking sequence flag)
-        engine.start_segment(song)
-        engine.finish_segment(song)
-        
-        # Start second talk segment (should emit dj_talking again)
-        engine.start_segment(talk2)
-        
-        # Should have two dj_talking events (one before song, one after)
-        dj_talking_calls = [call for call in mock_tower_control.send_event.call_args_list 
-                           if call[1]["event_type"] == "dj_talking"]
-        assert len(dj_talking_calls) == 2, "Contract requires dj_talking to reset after song, allowing new event"
+    # DELETED: test_pe4_2_dj_talking_* tests
+    # REASON: dj_talking is COMPLETELY DEPRECATED per EVENT_INVENTORY.md and NEW_TOWER_RUNTIME_CONTRACT.md
+    # - dj_talking MUST NOT be emitted
+    # - Use segment_playing with segment_class="dj_talk" instead
+    # - Tower MUST reject dj_talking events with 400 Bad Request
+    # New tests for segment_playing are in test_segment_playing_metadata_contract.py
     
     def test_pe4_3_all_heartbeat_events_must_be_non_blocking(self, mock_dj_callback, mock_output_sink, mock_tower_control):
         """PE4.3: All heartbeat events MUST be non-blocking."""

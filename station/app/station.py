@@ -15,7 +15,7 @@ from station.outputs.factory import create_output_sink
 from station.outputs.tower_pcm_sink import TowerPCMSink
 from station.outputs.tower_control import TowerControlClient
 from station.state.dj_state_store import DJStateStore
-from station.state.now_playing_state import NowPlayingStateManager
+from station.state.station_state import StationStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class Station:
         self.engine: Optional[PlayoutEngine] = None
         self.sink: Optional[TowerPCMSink] = None
         self.tower_control: Optional[TowerControlClient] = None
-        self.now_playing_manager: Optional[NowPlayingStateManager] = None
+        self.station_state_manager: Optional[StationStateManager] = None
         
         # Runtime state
         self.running = False
@@ -108,8 +108,8 @@ class Station:
         # Per contract: Lifecycle events MUST be sent exactly once
         # Station MUST track whether lifecycle events have been sent to prevent duplicates
         self._lifecycle_state = {
-            "station_starting_up": False,
-            "station_shutting_down": False
+            "station_startup": False,
+            "station_shutdown": False
         }
         
         # Max-wait timeout for long segments (per SL2.2.5)
@@ -222,50 +222,18 @@ class Station:
         # Set playout engine reference in DJ
         self.dj.set_playout_engine(self.engine)
         
-        # Initialize NowPlayingStateManager (per NEW_NOW_PLAYING_STATE_CONTRACT)
-        logger.info("Initializing NowPlayingStateManager...")
-        self.now_playing_manager = NowPlayingStateManager()
+        # Initialize StationStateManager (per STATION_STATE_CONTRACT)
+        logger.info("Initializing StationStateManager...")
+        self.station_state_manager = StationStateManager()
         
         # Register with HTTP server (if HTTP streaming is used)
         try:
-            from station.app.http_server import set_now_playing_manager
-            set_now_playing_manager(self.now_playing_manager)
-            logger.info("NowPlayingStateManager registered with HTTP server")
+            from station.app.http_server import set_station_state_manager
+            set_station_state_manager(self.station_state_manager)
+            logger.info("StationStateManager registered with HTTP server")
         except ImportError:
             # HTTP server may not be available (e.g., if not using HTTP streaming)
-            logger.debug("HTTP server not available, skipping now_playing endpoint registration")
-        
-        # Add WebSocket event listener (send events via TowerControlClient)
-        if self.tower_control:
-            def send_now_playing_event(state):
-                """Send now_playing event to Tower (for WebSocket broadcasting)."""
-                if state is None:
-                    # State cleared - send empty event
-                    self.tower_control.send_event(
-                        event_type="now_playing",
-                        timestamp=time.monotonic(),
-                        metadata={}
-                    )
-                else:
-                    # State created - send state data
-                    self.tower_control.send_event(
-                        event_type="now_playing",
-                        timestamp=time.monotonic(),
-                        metadata={
-                            "segment_type": state.segment_type,
-                            "started_at": state.started_at,
-                            "title": state.title,
-                            "artist": state.artist,
-                            "album": state.album,
-                            "year": state.year,
-                            "duration_sec": state.duration_sec,
-                            "file_path": state.file_path
-                        }
-                    )
-            self.now_playing_manager.add_listener(send_now_playing_event)
-            logger.info("NowPlayingStateManager WebSocket events enabled")
-        else:
-            logger.info("NowPlayingStateManager initialized (no TowerControlClient for events)")
+            logger.debug("HTTP server not available, skipping station state endpoint registration")
         
         # Pass startup state tracker to DJEngine for DO phase guards
         self.dj._station_startup_state_getter = lambda: self._startup_state
@@ -296,9 +264,6 @@ class Station:
                 self._startup_state = STARTUP_STATE_DO_ENQUEUE
             # Call original callback (which will handle DO execution)
             original_on_segment_finished(segment)
-            # Update NowPlayingState (per NEW_NOW_PLAYING_STATE_CONTRACT U.3)
-            if self.now_playing_manager:
-                self.now_playing_manager.on_segment_finished()
         self.dj.on_segment_finished = wrapped_on_segment_finished
         
         # Wrap on_segment_started to track THINK completion during startup
@@ -313,10 +278,16 @@ class Station:
                 logger.info(f"[STARTUP] THINK completed during startup announcement")
                 logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_THINK_COMPLETE}")
                 self._startup_state = STARTUP_STATE_THINK_COMPLETE
-            # Update NowPlayingState (per NEW_NOW_PLAYING_STATE_CONTRACT U.1)
-            # This is called from PlayoutEngine.start_segment() when segment actually starts
-            if self.now_playing_manager:
-                self.now_playing_manager.on_segment_started(segment)
+            # Update StationState (per STATION_STATE_CONTRACT R.3)
+            # State updates happen ONLY via lifecycle hooks
+            if self.station_state_manager:
+                # Check if this is a terminal segment (shutdown announcement)
+                if hasattr(segment, 'is_terminal') and segment.is_terminal:
+                    # Terminal segment (shutdown announcement) - update to SHUTTING_DOWN
+                    self.station_state_manager.on_shutdown(segment)
+                else:
+                    # Normal segment - update state based on segment type
+                    self.station_state_manager.on_segment_started(segment)
         self.dj.on_segment_started = wrapped_on_segment_started
         
         logger.info("PlayoutEngine initialized")
@@ -358,11 +329,20 @@ class Station:
             self.engine.queue_audio([startup_announcement])
             logger.info("[STARTUP] Startup announcement injected as active segment (no intent_id)")
             
+            # Update station state: STARTING_UP with startup announcement
+            if self.station_state_manager:
+                self.station_state_manager.on_startup(startup_announcement)
+            
             # Clear intent - when startup announcement starts, THINK will prepare first song intent
             self.dj.current_intent = None
         else:
             # SS2.2: No announcement - skip to STARTUP_DO_ENQUEUE
             logger.info("[STARTUP] Startup announcement skipped (pool empty or not selected)")
+            
+            # Update station state: STARTING_UP without startup announcement
+            if self.station_state_manager:
+                self.station_state_manager.on_startup(None)
+            
             if self.dj.current_intent:
                 logger.warning("[STARTUP] THINK created intent without startup announcement - clearing")
                 self.dj.current_intent = None
@@ -392,17 +372,17 @@ class Station:
         # SL1.3: Send lifecycle event BEFORE starting playout
         # Per SL1.3: Lifecycle event MUST be sent before playout begins to guarantee
         # that THINK events cannot fire before the lifecycle notification is transmitted
-        # Per T-EVENTS1: station_starting_up event MUST be sent exactly once
-        if self.tower_control and not self._lifecycle_state["station_starting_up"]:
+        # Per T-EVENTS1: station_startup event MUST be sent exactly once
+        if self.tower_control and not self._lifecycle_state["station_startup"]:
             if self.tower_control.send_event(
-                event_type="station_starting_up",
+                event_type="station_startup",
                 timestamp=time.monotonic(),
                 metadata={}
             ):
-                self._lifecycle_state["station_starting_up"] = True
-                logger.info("Sent station_starting_up event to Tower")
-        elif self._lifecycle_state["station_starting_up"]:
-            logger.debug("station_starting_up event already sent, skipping duplicate")
+                self._lifecycle_state["station_startup"] = True
+                logger.info("Sent station_startup event to Tower")
+        elif self._lifecycle_state["station_startup"]:
+            logger.debug("station_startup event already sent, skipping duplicate")
         
         # SL1.4: Start playout loop AFTER lifecycle event is sent (non-blocking - runs in background thread)
         # Per SL1.4: Startup MUST not block playout once initiated
@@ -446,11 +426,6 @@ class Station:
         logger.info("=== Station shutting down ===")
         self._shutdown_initiated = True
         
-        # Per NEW_NOW_PLAYING_STATE_CONTRACT U.3: Clear state on restart/shutdown
-        if self.now_playing_manager:
-            self.now_playing_manager.clear_state()
-            logger.debug("[NOW_PLAYING] State cleared on shutdown")
-        
         # SL2.2.1: PHASE 1 - Enter DRAINING state immediately
         logger.info("[SHUTDOWN] PHASE 1: Entering DRAINING state")
         self._set_lifecycle_state("DRAINING")
@@ -482,26 +457,26 @@ class Station:
             if self.engine._terminal_playout_complete:
                 logger.info("[SHUTDOWN] PHASE 1: Terminal playout complete - current song finished, shutdown announcement played (if any)")
                 
-                # Per T-EVENTS1: Send station_shutting_down event to Tower AFTER shutdown announcement finishes (only once)
+                # Per T-EVENTS1: Send station_shutdown event to Tower AFTER shutdown announcement finishes (only once)
                 # This event MUST be sent after terminal playout completes, not when shutdown is initiated
-                if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+                if self.tower_control and not self._lifecycle_state["station_shutdown"]:
                     try:
                         success = self.tower_control.send_event(
-                            event_type="station_shutting_down",
+                            event_type="station_shutdown",
                             timestamp=time.monotonic(),
                             metadata={}
                         )
                         if success:
-                            self._lifecycle_state["station_shutting_down"] = True
-                            logger.info("Sent station_shutting_down event to Tower (after shutdown announcement finished)")
+                            self._lifecycle_state["station_shutdown"] = True
+                            logger.info("Sent station_shutdown event to Tower (after shutdown announcement finished)")
                         else:
-                            logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                            logger.warning("Failed to send station_shutdown event to Tower (Tower may be unavailable)")
                     except Exception as e:
-                        logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
-                elif self._lifecycle_state["station_shutting_down"]:
-                    logger.debug("station_shutting_down event already sent, skipping duplicate")
+                        logger.error(f"Error sending station_shutdown event: {e}", exc_info=True)
+                elif self._lifecycle_state["station_shutdown"]:
+                    logger.debug("station_shutdown event already sent, skipping duplicate")
                 elif not self.tower_control:
-                    logger.warning("Tower control client not available, cannot send station_shutting_down event")
+                    logger.warning("Tower control client not available, cannot send station_shutdown event")
                 
                 logger.info("[SHUTDOWN] PHASE 1: Transitioning to PHASE 2 (hard shutdown)")
             else:
@@ -512,51 +487,58 @@ class Station:
                 else:
                     logger.warning(f"[SHUTDOWN] PHASE 1: Timeout ({max_wait}s) exceeded waiting for terminal playout, forcing transition to PHASE 2")
                 
-                # Per T-EVENTS1: Send station_shutting_down event even if terminal playout didn't complete normally
+                # Per T-EVENTS1: Send station_shutdown event even if terminal playout didn't complete normally
                 # This ensures the event is always sent, even in timeout/error cases
-                if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+                if self.tower_control and not self._lifecycle_state["station_shutdown"]:
                     try:
                         success = self.tower_control.send_event(
-                            event_type="station_shutting_down",
+                            event_type="station_shutdown",
                             timestamp=time.monotonic(),
                             metadata={}
                         )
                         if success:
-                            self._lifecycle_state["station_shutting_down"] = True
-                            logger.info("Sent station_shutting_down event to Tower (timeout/error case)")
+                            self._lifecycle_state["station_shutdown"] = True
+                            logger.info("Sent station_shutdown event to Tower (timeout/error case)")
                         else:
-                            logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                            logger.warning("Failed to send station_shutdown event to Tower (Tower may be unavailable)")
                     except Exception as e:
-                        logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
-                elif self._lifecycle_state["station_shutting_down"]:
-                    logger.debug("station_shutting_down event already sent, skipping duplicate")
+                        logger.error(f"Error sending station_shutdown event: {e}", exc_info=True)
+                elif self._lifecycle_state["station_shutdown"]:
+                    logger.debug("station_shutdown event already sent, skipping duplicate")
                 elif not self.tower_control:
-                    logger.warning("Tower control client not available, cannot send station_shutting_down event")
+                    logger.warning("Tower control client not available, cannot send station_shutdown event")
         else:
             # Engine is None - send event immediately since there's no playout to wait for
-            if self.tower_control and not self._lifecycle_state["station_shutting_down"]:
+            if self.tower_control and not self._lifecycle_state["station_shutdown"]:
                 try:
                     success = self.tower_control.send_event(
-                        event_type="station_shutting_down",
+                        event_type="station_shutdown",
                         timestamp=time.monotonic(),
                         metadata={}
                     )
                     if success:
-                        self._lifecycle_state["station_shutting_down"] = True
-                        logger.info("Sent station_shutting_down event to Tower (no engine)")
+                        self._lifecycle_state["station_shutdown"] = True
+                        logger.info("Sent station_shutdown event to Tower (no engine)")
                     else:
-                        logger.warning("Failed to send station_shutting_down event to Tower (Tower may be unavailable)")
+                        logger.warning("Failed to send station_shutdown event to Tower (Tower may be unavailable)")
                 except Exception as e:
-                    logger.error(f"Error sending station_shutting_down event: {e}", exc_info=True)
-            elif self._lifecycle_state["station_shutting_down"]:
-                logger.debug("station_shutting_down event already sent, skipping duplicate")
+                    logger.error(f"Error sending station_shutdown event: {e}", exc_info=True)
+            elif self._lifecycle_state["station_shutdown"]:
+                logger.debug("station_shutdown event already sent, skipping duplicate")
             elif not self.tower_control:
-                logger.warning("Tower control client not available, cannot send station_shutting_down event")
+                logger.warning("Tower control client not available, cannot send station_shutdown event")
         
         # SL2.3: PHASE 2 - Enter SHUTTING_DOWN state
         logger.info("[SHUTDOWN] PHASE 2: Entering SHUTTING_DOWN state")
         self._set_lifecycle_state("SHUTTING_DOWN")
         self.running = False
+        
+        # Update station state to SHUTTING_DOWN (if not already updated by shutdown announcement)
+        if self.station_state_manager:
+            current_state = self.station_state_manager.get_state()
+            if current_state is None or current_state.station_state != "SHUTTING_DOWN":
+                # No shutdown announcement was played, update state now
+                self.station_state_manager.on_shutdown(None)
         
         # SL2.3.2: No THINK or DO events MAY fire after SHUTTING_DOWN begins
         if self.engine:

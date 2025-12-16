@@ -1023,56 +1023,10 @@ class TestStationEventReception:
             pass
         del service
     
-    def test_t_events1_event_acceptance_endpoint(self, service):
-        """
-        Test T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST to /tower/events/ingest.
-        
-        Per contract T-EVENTS1: TowerRuntime MUST accept Station heartbeat events via HTTP POST.
-        Accepted event types: station_starting_up, station_shutting_down, dj_talking, now_playing.
-        NOTE: new_song removed - now_playing is the authoritative signal for segment state.
-        """
-        # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
-        service.http_server.port = test_port
-        
-        server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
-        server_thread.start()
-        time.sleep(0.2)  # Wait for server to start
-        
-        try:
-            # Test: POST to /tower/events/ingest should accept events
-            conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            
-            test_event = {
-                "event_type": "now_playing",
-                "timestamp": time.monotonic(),
-                "metadata": {
-                    "segment_type": "song",
-                    "file_path": "/path/to/file.mp3",
-                    "started_at": time.time()
-                }
-            }
-            
-            conn.request("POST", "/tower/events/ingest", 
-                        json.dumps(test_event).encode('utf-8'),
-                        {"Content-Type": "application/json"})
-            response = conn.getresponse()
-            
-            # Verify: Endpoint exists (should not return 404)
-            assert response.status != 404, \
-                f"Contract violation [T-EVENTS1]: /tower/events/ingest endpoint must exist. Got {response.status}"
-            
-            # Verify: Endpoint accepts POST requests
-            # (Implementation may return 200, 201, 204, or 501 if not yet implemented)
-            # If not implemented, status will be 501 (Not Implemented) or 405 (Method Not Allowed)
-            # Contract requires endpoint to exist and accept events
-            
-            conn.close()
-            
-        finally:
-            service.http_server.stop()
-            server_thread.join(timeout=1.0)
+    # DELETED: test_t_events1_event_acceptance_endpoint
+    # REASON: This test accepted deprecated "now_playing" events.
+    # Per NEW_TOWER_RUNTIME_CONTRACT.md T-EVENTS1, Tower MUST reject now_playing.
+    # New tests for event acceptance are in test_tower_event_rejection.py
     
     def test_t_events2_event_delivery_no_storage(self, service):
         """
@@ -1088,145 +1042,17 @@ class TestStationEventReception:
         assert hasattr(service.http_server, 'event_buffer'), \
             "Service must have event_buffer (EventBroadcaster) for shutdown state tracking"
     
-    def test_t_events7_event_validation(self, service):
-        """
-        Test T-EVENTS7: TowerRuntime MUST validate received events.
-        
-        Per contract T-EVENTS7:
-        - Event type MUST be one of the accepted types
-        - Event MUST include required fields (event_type, timestamp, metadata)
-        - Invalid events MUST be silently dropped (logged but not stored)
-        - Validation MUST be fast (< 1ms) and non-blocking
-        """
-        # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
-        service.http_server.port = test_port
-        
-        server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
-        server_thread.start()
-        time.sleep(0.2)
-        
-        try:
-            conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            
-            # Test 1: Valid event should be accepted
-            valid_event = {
-                "event_type": "now_playing",
-                "timestamp": time.monotonic(),
-                "metadata": {
-                    "segment_type": "song",
-                    "file_path": "/path/to/file.mp3",
-                    "title": "Test Song",
-                    "started_at": time.time()
-                    "artist": "Test Artist",
-                    "album": "Test Album",
-                    "duration": 180.0
-                }
-            }
-            conn.request("POST", "/tower/events/ingest",
-                        json.dumps(valid_event).encode('utf-8'),
-                        {"Content-Type": "application/json"})
-            response1 = conn.getresponse()
-            # Valid events should not return error (may return 200, 201, 204)
-            assert response1.status != 400, \
-                f"Contract violation [T-EVENTS7]: Valid event should not return 400. Got {response1.status}"
-            response1.read()
-            conn.close()
-            
-            # Test 2: Invalid event type should be rejected
-            conn2 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            invalid_event_type = {
-                "event_type": "invalid_event_type",
-                "timestamp": time.monotonic(),
-                "metadata": {}
-            }
-            conn2.request("POST", "/tower/events/ingest",
-                         json.dumps(invalid_event_type).encode('utf-8'),
-                         {"Content-Type": "application/json"})
-            response2 = conn2.getresponse()
-            # Invalid events should be rejected (400) or silently dropped (200 with no storage)
-            # Contract says "silently dropped" - may return 200 but not store
-            response2.read()
-            conn2.close()
-            
-            # Test 3: Missing required fields should be rejected
-            conn3 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            missing_fields = {
-                "event_type": "segment_started"
-                # Missing timestamp and metadata
-            }
-            conn3.request("POST", "/tower/events/ingest",
-                         json.dumps(missing_fields).encode('utf-8'),
-                         {"Content-Type": "application/json"})
-            response3 = conn3.getresponse()
-            # Missing required fields should be rejected
-            response3.read()
-            conn3.close()
-            
-        finally:
-            service.http_server.stop()
-            server_thread.join(timeout=1.0)
+    # DELETED: test_t_events7_event_validation
+    # REASON: This test validated "now_playing" as a valid event type.
+    # Per NEW_TOWER_RUNTIME_CONTRACT.md T-EVENTS7, Tower MUST reject now_playing with validation error.
+    # New tests for event validation are in test_tower_event_rejection.py
     
-    def test_t_events_station_shutdown_events(self, service):
-        """
-        Test that Tower accepts station_shutting_down and station_starting_up events
-        and tracks shutdown state per contract T-EVENTS5 exception.
-        """
-        # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
-        service.http_server.port = test_port
-        
-        server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
-        server_thread.start()
-        time.sleep(0.2)
-        
-        try:
-            # Test 1: Send station_shutting_down event
-            conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            shutdown_event = {
-                "event_type": "station_shutting_down",
-                "timestamp": time.monotonic(),
-                "metadata": {}
-            }
-            conn.request("POST", "/tower/events/ingest",
-                        json.dumps(shutdown_event).encode('utf-8'),
-                        {"Content-Type": "application/json"})
-            response1 = conn.getresponse()
-            assert response1.status != 400, \
-                f"Contract violation: station_shutting_down event should be accepted. Got {response1.status}"
-            response1.read()
-            conn.close()
-            
-            # Verify: Event buffer tracks shutdown state
-            assert service.http_server.event_buffer.is_station_shutting_down(), \
-                "Event buffer should track station_shutting_down state"
-            
-            # Test 2: Send station_starting_up event
-            conn2 = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
-            startup_event = {
-                "event_type": "station_starting_up",
-                "timestamp": time.monotonic(),
-                "metadata": {}
-            }
-            conn2.request("POST", "/tower/events/ingest",
-                         json.dumps(startup_event).encode('utf-8'),
-                         {"Content-Type": "application/json"})
-            response2 = conn2.getresponse()
-            assert response2.status != 400, \
-                f"Contract violation: station_starting_up event should be accepted. Got {response2.status}"
-            response2.read()
-            conn2.close()
-            
-            # Verify: Event buffer no longer tracks shutdown state
-            assert not service.http_server.event_buffer.is_station_shutting_down(), \
-                "Event buffer should clear shutdown state after station_starting_up"
-            
-        finally:
-            service.http_server.stop()
-            server_thread.join(timeout=1.0)
-
+    # DELETED: test_t_events_station_shutdown_events
+    # REASON: This test accepted deprecated "station_shutting_down" and "station_starting_up" events.
+    # Per NEW_TOWER_RUNTIME_CONTRACT.md T-EVENTS1, Tower MUST reject these deprecated events.
+    # New event types are "station_startup" and "station_shutdown" (without "_ing").
+    # New tests for event rejection are in test_tower_event_rejection.py
+    
 
 # ============================================================================
 # SECTION 11: T-EXPOSE - Event Exposure Endpoints

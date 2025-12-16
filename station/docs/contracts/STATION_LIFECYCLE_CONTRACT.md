@@ -220,10 +220,29 @@ See `tests/contracts/LOGGING_TEST_REQUIREMENTS.md` for test specifications.
 
 ---
 
+## Lifecycle Event Alignment
+
+This contract aligns with the edge-triggered event model defined in `MASTER_SYSTEM_CONTRACT.md` (E0.9):
+
+- **`station_startup` event**: MUST be emitted when `Station.start()` completes and playout begins, synchronously before first segment starts (see E0.9.1)
+- **`station_shutdown` event**: MUST be emitted when terminal playout completes (or timeout), synchronously after last segment finishes, before SHUTTING_DOWN state (see E0.9.4)
+
+**Event Emission Rules:**
+- Events are edge-triggered transitions only; there are NO "clear" or "end" events
+- Events fire ONCE per lifecycle transition
+- Events are idempotent-safe on restart
+- Current state MUST be queried via Station State Contract; events do NOT represent current state
+
+**Deprecated Events:**
+- `station_starting_up` event is DEPRECATED; use `station_startup` instead
+- `station_shutting_down` event is DEPRECATED; use `station_shutdown` instead
+
+---
+
 ## Implementation Notes
 
-- Startup sequence: Load state → Discover assets → Select first song → Start playout
-- Shutdown sequence (PHASE 1): Enter DRAINING → Complete current segment → Allow terminal THINK/DO → Transition to SHUTTING_DOWN
+- Startup sequence: Load state → Discover assets → Select first song → Start playout → Emit `station_startup` event
+- Shutdown sequence (PHASE 1): Enter DRAINING → Complete current segment → Allow terminal THINK/DO → Transition to SHUTTING_DOWN → Emit `station_shutdown` event
 - Shutdown sequence (PHASE 2): Persist state atomically → Close audio components → Exit process
 - State persistence must be atomic (write to temp file, then rename)
 - State persistence occurs only during PHASE 2 (SHUTTING_DOWN), not during PHASE 1 (DRAINING)

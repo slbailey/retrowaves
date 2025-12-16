@@ -173,34 +173,45 @@ elapsed = time.monotonic() - segment_start
 
 PlayoutEngine **MUST** emit control-channel events for observability. These events are purely observational and **MUST NOT** influence playout behavior or timing decisions.
 
-### PE4.1 — New Song Event (DEPRECATED)
+### PE4.1 — Song Playing Event
 
-**DEPRECATED:** The `new_song` event has been superseded by `now_playing` events (see `NEW_NOW_PLAYING_STATE_CONTRACT.md`).
+**MUST** emit `song_playing` event when a song segment starts playing.
 
-**AUTHORITY:** `now_playing` is the sole authoritative signal for segment state. Consumers **MUST** use `now_playing` events and filter by `segment_type == "song"` to detect new songs.
-
-**Legacy behavior (removed):**
-- ~~Event **MUST** be emitted when a song segment starts playing~~
-- ~~Event **MUST** include metadata: file_path, title, artist, album, duration~~
-
-**Migration:** All consumers should migrate to `now_playing` events, which provide:
-- Complete segment state for all segment types (not just songs)
-- Clear events when segments finish
-- Additional metadata (segment_type, started_at, year)
-- Authoritative state snapshot
-
-### PE4.2 — DJ Talking Event
-
-**MUST** emit `dj_talking` event when DJ starts talking between songs.
-
-- Event **MUST** be emitted synchronously before audio begins
+- Event **MUST** be emitted synchronously when song segment starts (on_segment_started with segment_type="song")
 - Event **MUST NOT** block playout thread
-- Event **MUST** include empty metadata: `{}`
+- Event **MUST** include metadata:
+  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
+  - `segment_type`: `"song"` (required)
+  - `started_at`: Wall-clock timestamp when segment started (required)
+  - `title`: Song title from MP3 metadata (optional)
+  - `artist`: Artist name from MP3 metadata (optional)
+  - `album`: Album name from MP3 metadata (optional)
+  - `year`: Release year from MP3 metadata (optional)
+  - `duration_sec`: Segment duration in seconds (optional)
+  - `file_path`: Absolute path to MP3 file (optional)
+- Event **MUST** include full AudioEvent metadata when available
 - Event **MUST** be emitted from the playout thread
 - Event **MUST NOT** modify queue or state
 - Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be emitted only once when talking starts, even if multiple talking MP3 files are strung together consecutively
-- Event **MUST NOT** be emitted again until a non-talk segment (e.g., song) starts, at which point the talking sequence flag is reset
+- Event **MUST** be edge-triggered (fires ONCE per song start, no "end" event)
+
+**DEPRECATED:** The `now_playing` event pattern (start + clear semantics) is deprecated. Use `song_playing` for edge-triggered transitions and stateful querying via Station State Contract for current state.
+
+### PE4.2 — Segment Playing Event
+
+**MUST** emit `segment_playing` event when a non-song segment starts playing.
+
+- Event **MUST** be emitted synchronously when a non-song segment starts (on_segment_started with segment_type not equal to "song"), before audio begins
+- Event **MUST NOT** block playout thread
+- Event **MUST** include required metadata: `segment_class`, `segment_role`, `production_type` (see EVENT_INVENTORY.md for metadata schema)
+- Event **MUST** be emitted from the playout thread
+- Event **MUST NOT** modify queue or state
+- Event **MUST NOT** rely on Tower timing or state
+- Event **MUST** be emitted exactly once per non-song segment start
+- Event **MUST** be edge-triggered (fires ONCE per segment start, no "end" event)
+- **PlayoutEngine emits exactly one segment_playing event when a non-song segment begins.**
+
+**DEPRECATED:** The `dj_talking` event is deprecated. Use `segment_playing` with appropriate metadata instead.
 
 ### PE4.3 — Event Emission Rules
 
@@ -213,11 +224,8 @@ All heartbeat events **MUST** follow these behavioral rules:
 - **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state (except internal talking sequence tracking)
 - **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (when segments start)
 - **Metadata completeness**: Events **MUST** include all required metadata fields
-  - `compensation_applied`: Boolean indicating whether compensation was applied
-- Event **MUST** be emitted from Clock A pacing layer (if decode pacing is used)
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be purely observational
+- **Edge-triggered only**: Events **MUST** fire ONCE per transition; no "end" or "clear" events
+- **No state inference**: Events do NOT represent current state; state must be queried via Station State Contract
 
 ### PE4.4 — Shutdown Observability Events
 

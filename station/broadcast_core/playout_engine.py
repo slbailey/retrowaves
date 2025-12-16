@@ -152,6 +152,82 @@ def _get_mp3_metadata(file_path: str) -> dict:
     return metadata
 
 
+def _get_segment_metadata(segment: AudioEvent) -> Dict[str, str]:
+    """
+    Get required segment metadata (segment_class, segment_role, production_type) for non-song segments.
+    
+    Per EVENT_INVENTORY.md: segment_playing events MUST include these three required fields.
+    
+    This function extracts metadata from AudioEvent.metadata if present, otherwise infers from segment type.
+    Per contract: Metadata MUST be explicit and intentional, never inferred silently.
+    However, for backward compatibility during transition, we infer from segment type if not explicitly set.
+    
+    Args:
+        segment: AudioEvent to get metadata for
+        
+    Returns:
+        Dictionary with segment_class, segment_role, production_type
+        
+    Raises:
+        ValueError: If required metadata cannot be determined
+    """
+    # First, check if metadata is explicitly set in AudioEvent.metadata
+    metadata = segment.metadata or {}
+    
+    segment_class = metadata.get('segment_class')
+    segment_role = metadata.get('segment_role')
+    production_type = metadata.get('production_type')
+    
+    # If all three are present, return them
+    if segment_class and segment_role and production_type:
+        return {
+            "segment_class": segment_class,
+            "segment_role": segment_role,
+            "production_type": production_type
+        }
+    
+    # Otherwise, infer from segment type (for backward compatibility during transition)
+    # Per contract: This should eventually be removed once all segments have explicit metadata
+    if segment.type == "intro":
+        return {
+            "segment_class": "dj_talk",
+            "segment_role": "intro",
+            "production_type": "live_dj"
+        }
+    elif segment.type == "outro":
+        return {
+            "segment_class": "dj_talk",
+            "segment_role": "outro",
+            "production_type": "live_dj"
+        }
+    elif segment.type == "talk":
+        return {
+            "segment_class": "dj_talk",
+            "segment_role": "interstitial",
+            "production_type": "live_dj"
+        }
+    elif segment.type == "id":
+        return {
+            "segment_class": "station_id",
+            "segment_role": "top_of_hour",
+            "production_type": "produced"
+        }
+    elif segment.type == "announcement":
+        # Announcements can be startup or shutdown
+        # Default to system-produced standalone announcement
+        return {
+            "segment_class": "dj_talk",
+            "segment_role": "standalone",
+            "production_type": "system"
+        }
+    else:
+        # Unknown segment type - fail loudly per contract
+        raise ValueError(
+            f"Cannot determine segment metadata for segment type '{segment.type}'. "
+            f"Required metadata (segment_class, segment_role, production_type) must be explicitly set in AudioEvent.metadata."
+        )
+
+
 class DJCallback(Protocol):
     """
     Protocol for DJ callback object.
@@ -235,8 +311,7 @@ class PlayoutEngine:
         self._playout_stopped_event = threading.Event()  # Signal when playout loop has finished
         self._current_segment_is_terminal = False  # Track if currently playing segment is the terminal shutdown announcement
         
-        # Track talking state to avoid multiple dj_talking events for consecutive talk files
-        self._is_in_talking_sequence = False
+        # Removed: _is_in_talking_sequence tracking (dj_talking is deprecated)
         
         # Track segment active state to prevent pre-fill during active playback
         # Per contract C8: Pre-fill MUST NOT affect segment timing or active content
@@ -381,31 +456,61 @@ class PlayoutEngine:
             self._segment_active = True
         
         # Emit appropriate event based on segment type
-        # Removed: superseded by now_playing authoritative state
-        # See NEW_NOW_PLAYING_STATE_CONTRACT.md for authoritative segment state
+        # Per contract: Events are edge-triggered transitions only
+        # Per EVENT_INVENTORY.md: segment_playing is the only non-song content event
         if self._tower_control and not self._shutdown_requested:
             try:
                 if segment.type == "song":
-                    # Reset talking sequence flag when a song starts
-                    # Segment state is now emitted via now_playing event (authoritative)
-                    self._is_in_talking_sequence = False
-                elif segment.type in ("intro", "outro", "talk"):
-                    # Emit dj_talking event when DJ talking segments start
-                    # DJ talking encompasses: intro, outro, and talk segment types
-                    # Only emit once even if multiple talking files are strung together
-                    if not self._is_in_talking_sequence:
-                        self._tower_control.send_event(
-                            event_type="dj_talking",
-                            timestamp=time.monotonic(),
-                            metadata={}
-                        )
-                        self._is_in_talking_sequence = True
+                    # Emit song_playing event (edge-triggered transition)
+                    metadata = segment.metadata or {}
+                    self._tower_control.send_event(
+                        event_type="song_playing",
+                        timestamp=time.monotonic(),
+                        metadata={
+                            "segment_type": segment.type,
+                            "file_path": segment.path,
+                            "started_at": time.time(),
+                            "title": metadata.get('title'),
+                            "artist": metadata.get('artist'),
+                            "album": metadata.get('album'),
+                            "year": metadata.get('year'),
+                            "duration_sec": metadata.get('duration'),
+                        }
+                    )
                 else:
-                    # Reset talking sequence flag when any non-talking, non-song segment starts
-                    # (e.g., id) so that if talking segments come after, we emit dj_talking again
-                    self._is_in_talking_sequence = False
+                    # Emit segment_playing event for all non-song segments
+                    # Per EVENT_INVENTORY.md: segment_playing MUST include required metadata
+                    try:
+                        segment_metadata = _get_segment_metadata(segment)
+                        
+                        # Build metadata dict with required fields
+                        event_metadata = {
+                            "segment_class": segment_metadata["segment_class"],
+                            "segment_role": segment_metadata["segment_role"],
+                            "production_type": segment_metadata["production_type"],
+                        }
+                        
+                        # Add optional fields if available
+                        metadata = segment.metadata or {}
+                        if segment.path:
+                            event_metadata["file_path"] = segment.path
+                        if metadata.get('duration') is not None:
+                            event_metadata["duration_sec"] = metadata.get('duration')
+                        
+                        self._tower_control.send_event(
+                            event_type="segment_playing",
+                            timestamp=time.monotonic(),
+                            metadata=event_metadata
+                        )
+                    except ValueError as e:
+                        # Per contract: Fail loudly if metadata is missing
+                        logger.error(
+                            f"Contract violation [EVENT_INVENTORY]: Cannot emit segment_playing for segment {segment.path}: {e}. "
+                            f"Event emission refused."
+                        )
+                        # Do not emit event if metadata is missing
             except Exception as e:
-                logger.debug(f"Error sending event: {e}")
+                logger.error(f"Error sending event: {e}", exc_info=True)
         
         # Emit on_segment_started callback (THINK phase)
         # Per contract SL2.2: No THINK events MAY fire after shutdown begins
@@ -699,7 +804,7 @@ class PlayoutEngine:
         - Decode program audio (segment file)
         - Touch the decoder
         - Advance file position
-        - Segment state emitted via now_playing event (authoritative)
+        - Segment state queryable via /station/state endpoint (authoritative)
         - Make program audio audible
         - Change segment timing logic (elapsed = time.monotonic() - segment_start)
         - Reset or manipulate Clock A's internal next_frame_time

@@ -17,14 +17,14 @@ from station.outputs.http_connection_manager import HTTPConnectionManager
 
 logger = logging.getLogger(__name__)
 
-# Module-level now_playing_manager (set by Station)
-_now_playing_manager = None
+# Module-level station_state_manager (set by Station)
+_station_state_manager = None
 
 
-def set_now_playing_manager(manager):
-    """Set the now_playing_manager for HTTP handlers."""
-    global _now_playing_manager
-    _now_playing_manager = manager
+def set_station_state_manager(manager):
+    """Set the station_state_manager for HTTP handlers."""
+    global _station_state_manager
+    _station_state_manager = manager
 
 
 class HTTPStreamingHandler(BaseHTTPRequestHandler):
@@ -40,42 +40,27 @@ class HTTPStreamingHandler(BaseHTTPRequestHandler):
         """Handle GET requests."""
         if self.path == "/stream":
             self._handle_stream()
-        elif self.path == "/now_playing":
-            self._handle_now_playing()
+        elif self.path == "/station/state":
+            self._handle_station_state()
         else:
             self.send_error(404, "Not Found")
     
-    def _handle_now_playing(self):
+    def _handle_station_state(self):
         """
-        Handle /now_playing GET request (per NEW_NOW_PLAYING_STATE_CONTRACT E.3).
+        Handle /station/state GET request (per STATION_STATE_CONTRACT.md Q.1, Q.2).
         
-        Contract E.3: REST endpoint MUST respond to GET requests with current state.
-        Contract E.3: Endpoint MUST be read-only.
-        Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted.
+        Contract Q.1: Endpoint MUST be accessible via HTTP GET endpoint /station/state.
+        Contract Q.1: MUST return current state synchronously.
+        Contract Q.1: MUST be idempotent and non-blocking.
+        Contract Q.2: Response MUST include station_state, since, current_audio.
         """
-        # Contract E.3: Endpoint MUST respond to GET requests
-        global _now_playing_manager
-        if _now_playing_manager is None:
+        global _station_state_manager
+        if _station_state_manager is None:
             self.send_error(503, "Service Unavailable")
             return
         
-        state = _now_playing_manager.get_state()
-        
-        # Contract E.3: Endpoint MUST return None or empty representation when no segment is playing
-        if state is None:
-            response_data = None
-        else:
-            # Contract E.3: Endpoint MUST return state in a consistent format (JSON recommended)
-            response_data = {
-                "segment_type": state.segment_type,
-                "started_at": state.started_at,
-                "title": state.title,
-                "artist": state.artist,
-                "album": state.album,
-                "year": state.year,
-                "duration_sec": state.duration_sec,
-                "file_path": state.file_path
-            }
+        # Contract Q.1: Return current state synchronously
+        state_dict = _station_state_manager.get_state_dict()
         
         # Send JSON response
         self.send_response(200)
@@ -84,42 +69,26 @@ class HTTPStreamingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         
         try:
-            response_json = json.dumps(response_data)
+            response_json = json.dumps(state_dict)
             self.wfile.write(response_json.encode('utf-8'))
         except Exception as e:
-            logger.debug(f"Error sending now_playing response: {e}")
+            logger.debug(f"Error sending station state response: {e}")
     
     def do_POST(self):
-        """Reject POST requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
-        if self.path == "/now_playing":
-            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
-            self.send_error(405, "Method Not Allowed")
-        else:
-            self.send_error(404, "Not Found")
+        """Reject POST requests."""
+        self.send_error(404, "Not Found")
     
     def do_PUT(self):
-        """Reject PUT requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
-        if self.path == "/now_playing":
-            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
-            self.send_error(405, "Method Not Allowed")
-        else:
-            self.send_error(404, "Not Found")
+        """Reject PUT requests."""
+        self.send_error(404, "Not Found")
     
     def do_PATCH(self):
-        """Reject PATCH requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
-        if self.path == "/now_playing":
-            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
-            self.send_error(405, "Method Not Allowed")
-        else:
-            self.send_error(404, "Not Found")
+        """Reject PATCH requests."""
+        self.send_error(404, "Not Found")
     
     def do_DELETE(self):
-        """Reject DELETE requests (per NEW_NOW_PLAYING_STATE_CONTRACT F.7)."""
-        if self.path == "/now_playing":
-            # Contract F.7: HTTP POST/PUT/PATCH/DELETE MUST NOT be accepted
-            self.send_error(405, "Method Not Allowed")
-        else:
-            self.send_error(404, "Not Found")
+        """Reject DELETE requests."""
+        self.send_error(404, "Not Found")
     
     def _handle_stream(self):
         """Handle /stream streaming request."""

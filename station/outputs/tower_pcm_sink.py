@@ -459,18 +459,8 @@ class TowerPCMSink(BaseSink):
             # Only emit on transition from non-zero to zero, not continuously
             if buffer_depth == 0 and self._last_buffer_depth is not None and self._last_buffer_depth > 0:
                 # Transition detected: buffer went from non-zero to zero
-                # Emit underflow event
-                try:
-                    self._tower_control.send_event(
-                        event_type="station_underflow",
-                        timestamp=time.monotonic(),
-                        metadata={
-                            "buffer_depth": buffer_depth,
-                            "frames_dropped": 0  # Not tracked, set to 0 per contract
-                        }
-                    )
-                except Exception as e:
-                    logger.debug(f"Error sending station_underflow event: {e}")
+                # Emit underflow event (Station-local only)
+                logger.warning(f"[BUFFER] Underflow detected: buffer_depth={buffer_depth} frames_dropped=0")
             
             # OS3.2: Detect transition to overflow (buffer at capacity)
             # Emit when buffer transitions to capacity (overflow condition detected)
@@ -478,18 +468,8 @@ class TowerPCMSink(BaseSink):
             if buffer_at_capacity and not self._last_buffer_at_capacity:
                 # Transition detected: buffer reached capacity (overflow condition)
                 # When buffer is at capacity, frames are being dropped
-                # Emit overflow event with at least 1 frame dropped (overflow just occurred)
-                try:
-                    self._tower_control.send_event(
-                        event_type="station_overflow",
-                        timestamp=time.monotonic(),
-                        metadata={
-                            "buffer_depth": buffer_depth,
-                            "frames_dropped": 1  # At least 1 frame dropped when buffer reaches capacity
-                        }
-                    )
-                except Exception as e:
-                    logger.debug(f"Error sending station_overflow event: {e}")
+                # Emit overflow event (Station-local only)
+                logger.warning(f"[BUFFER] Overflow detected: buffer_depth={buffer_depth} frames_dropped=1")
             
             # Update last known buffer state for transition detection
             self._last_buffer_depth = buffer_depth

@@ -720,8 +720,10 @@ class HTTPServer:
             
             if success:
                 # Update shutdown state for critical events (per contract T-EVENTS5 exception)
-                critical_events = {"station_starting_up", "station_shutting_down"}
+                # Use new event names (station_startup, station_shutdown)
+                critical_events = {"station_startup", "station_shutdown"}
                 if event_type in critical_events:
+                    # EventBroadcaster tracks shutdown state for encoder manager
                     self.event_buffer.update_shutdown_state(event_type)
                 
                 # Broadcast event immediately to connected clients (per contract T-EXPOSE1.7)
@@ -733,11 +735,13 @@ class HTTPServer:
                     "\r\n"
                 )
             else:
-                # Invalid event - silently dropped per contract T-EVENTS7
+                # Invalid event - reject with 400 Bad Request per contract T-EVENTS7
                 response = (
-                    "HTTP/1.1 204 No Content\r\n"
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
                     "Connection: close\r\n"
                     "\r\n"
+                    '{"error": "Invalid event type"}\n'
                 )
             
             client.sendall(response.encode("ascii"))

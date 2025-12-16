@@ -21,6 +21,22 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 - **`intro`**: `AudioEvent?` (optional) — Intro clip for next song (or shutdown announcement for terminal intents)
 - **`has_legal_id`**: `bool` — Whether any ID in `station_ids` is a legal ID
 
+### INT1.2 — Segment Metadata Requirements
+
+**For all non-song AudioEvents (intro, outro, station_ids, talk segments, etc.), the AudioEvent metadata MUST include:**
+
+- **`segment_class`**: `str` (required) — What kind of segment this is
+  - **MUST** be one of: `"station_id"`, `"dj_talk"`, `"promo"`, `"imaging"`, `"radio_drama"`, `"album_segment"`, `"emergency"`, `"special"`
+  - **MUST** be set during THINK phase when AudioEvent is created
+- **`segment_role`**: `str` (required) — Why it exists in the flow
+  - **MUST** be one of: `"intro"`, `"outro"`, `"interstitial"`, `"top_of_hour"`, `"legal"`, `"transition"`, `"standalone"`
+  - **MUST** be set during THINK phase when AudioEvent is created
+- **`production_type`**: `str` (required) — How it was produced
+  - **MUST** be one of: `"live_dj"`, `"voice_tracked"`, `"produced"`, `"system"`
+  - **MUST** be set during THINK phase when AudioEvent is created
+
+**Note:** "DJ talking" is no longer a top-level concept. DJ talk segments are represented as AudioEvents with `segment_class="dj_talk"` and appropriate `segment_role` and `production_type` values. When a non-song segment starts playing, PlayoutEngine emits a `segment_playing` event (not `dj_talking`) with this metadata.
+
 ---
 
 ## INT2 — Validity Rules
@@ -73,10 +89,14 @@ Defines **WHAT** an intent is. This contract specifies the structure and validit
 - DJIntent is a dataclass or similar immutable structure
 - All paths are validated during THINK phase
 - MP3 metadata for `next_song` is extracted during THINK phase and stored in `AudioEvent.metadata`
-- Metadata is retrieved from the intent when `now_playing` events are created during segment start
-  - NOTE: `new_song` event deprecated - `now_playing` is the authoritative signal
+- For non-song segments, `segment_class`, `segment_role`, and `production_type` **MUST** be set during THINK phase and stored in `AudioEvent.metadata`
+- Metadata is retrieved from the intent when state is updated and edge-triggered events are emitted during segment start
+  - `song_playing` events are emitted for song segments
+  - `segment_playing` events are emitted for non-song segments (not `dj_talking`)
+  - NOTE: `now_playing` event deprecated - use stateful querying via Station State Contract and edge-triggered events (`song_playing`, `segment_playing`) instead
 - DO phase trusts that intent is valid and complete
 - Intent may contain empty lists (e.g., no IDs) but must be structurally complete
+- Intent produces `segment_playing` events (not `dj_talking`) for all non-song segments
 
 
 
