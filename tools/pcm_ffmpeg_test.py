@@ -25,9 +25,9 @@ from typing import Optional
 # Tower PCM format constants (duplicated from tower.fallback.generator)
 SAMPLE_RATE = 48000  # Hz
 CHANNELS = 2  # Stereo
-FRAME_SIZE_SAMPLES = 1152  # Samples per frame (MP3 frame size)
+FRAME_SIZE_SAMPLES = 1024  # Samples per PCM frame (Tower canonical cadence)
 BYTES_PER_SAMPLE = 2  # s16le = 2 bytes per sample
-FRAME_SIZE_BYTES = FRAME_SIZE_SAMPLES * CHANNELS * BYTES_PER_SAMPLE  # 4608 bytes
+FRAME_SIZE_BYTES = FRAME_SIZE_SAMPLES * CHANNELS * BYTES_PER_SAMPLE  # 4096 bytes
 
 # Tone generation constants
 TONE_FREQUENCY = 440.0  # Hz (A4 note)
@@ -35,7 +35,7 @@ PHASE_INCREMENT = 2.0 * math.pi * TONE_FREQUENCY / SAMPLE_RATE  # Radians per sa
 AMPLITUDE = int(32767 * 0.8)  # 80% of max amplitude to avoid clipping
 
 # FFmpeg command (duplicated from tower.encoder.ffmpeg_supervisor.DEFAULT_FFMPEG_CMD)
-# Per contract [S26.2], [S26.5]: Use exact same audio pipeline as supervisor, including -frame_size 1152
+# Per contract [S26.2], [S26.5]: Use exact same audio pipeline as supervisor, including -frame_size 1024
 FFMPEG_CMD = [
     "ffmpeg",
     "-hide_banner",
@@ -47,7 +47,7 @@ FFMPEG_CMD = [
     "-i", "pipe:0",
     "-c:a", "libmp3lame",
     "-b:a", "128k",
-    "-frame_size", "1152",  # Per contract [S26.5]: Required for raw PCM encoding
+    "-frame_size", "1024",  # Per contract [S26.5]: Required for raw PCM encoding (PCM cadence)
     "-f", "mp3",
     "-fflags", "+nobuffer",
     "-flush_packets", "1",
@@ -78,7 +78,7 @@ class PCMGenerator:
         Generate one PCM frame.
         
         Returns:
-            bytes: PCM frame (4608 bytes for 1152 samples × 2 channels × 2 bytes)
+            bytes: PCM frame (4096 bytes for 1024 samples × 2 channels × 2 bytes)
         """
         if self.mode == "silence":
             return self._generate_silence_frame()
@@ -277,7 +277,7 @@ class FFmpegValidator:
             if self.process is None or self.process.stdin is None:
                 return
             
-            frame_interval = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # ~0.024s
+            frame_interval = FRAME_SIZE_SAMPLES / SAMPLE_RATE  # ~0.021333s
             next_frame_time = time.monotonic()
             
             while not self.shutdown_event.is_set():
