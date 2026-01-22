@@ -272,14 +272,33 @@ class RotationManager:
             candidate_tracks = regular_tracks
         
         # If no candidates in selected pool, fall back to other pool
+        # BUT: Only fall back to holiday tracks if it's actually holiday season
         if not candidate_tracks:
-            candidate_tracks = holiday_tracks if not use_holiday else regular_tracks
+            if self.is_holiday_season():
+                # During holiday season, fallback to holiday tracks if regular empty
+                candidate_tracks = holiday_tracks if not use_holiday else regular_tracks
+            else:
+                # Outside holiday season, NEVER fall back to holiday tracks
+                # If regular tracks are empty, raise error (shouldn't happen in normal operation)
+                if not regular_tracks:
+                    raise ValueError("No regular tracks available and not holiday season - cannot select holiday tracks")
+                candidate_tracks = regular_tracks
         
-        # Calculate weights for all tracks (including both pools for proper weighting)
-        weights, all_tracks, is_holiday_list = self._calculate_weights(
-            regular_tracks=regular_tracks,
-            holiday_tracks=holiday_tracks
-        )
+        # Calculate weights for candidate tracks only (exclude holiday tracks outside holiday season)
+        # Per contract: Holiday tracks MUST NOT be selected outside holiday season
+        if use_holiday:
+            # Selecting from holiday pool - calculate weights for holiday tracks only
+            weights, all_tracks, is_holiday_list = self._calculate_weights(
+                regular_tracks=[],
+                holiday_tracks=holiday_tracks
+            )
+        else:
+            # Selecting from regular pool - calculate weights for regular tracks only
+            # Outside holiday season, holiday tracks are completely excluded
+            weights, all_tracks, is_holiday_list = self._calculate_weights(
+                regular_tracks=regular_tracks,
+                holiday_tracks=[]
+            )
         
         # Normalize weights to probabilities
         total_weight = sum(weights)
@@ -290,7 +309,9 @@ class RotationManager:
         
         # Select using weighted random
         if not all_tracks:
-            # Fallback: random selection
+            # Fallback: random selection from candidate pool
+            if not candidate_tracks:
+                raise ValueError("No tracks available for selection")
             return random.choice(candidate_tracks)
         
         selected_index = random.choices(range(len(all_tracks)), weights=probabilities)[0]
