@@ -517,7 +517,8 @@ class DJEngine:
         
         # SS4.3: DJ DO MUST NOT run until STARTUP_DO_ENQUEUE state
         # Check startup state if getter is available (Station provides this)
-        if hasattr(self, '_station_startup_state_getter'):
+        # Exception: during DRAINING, terminal DO must always be allowed (even mid-startup)
+        if hasattr(self, '_station_startup_state_getter') and not self._is_draining:
             startup_state = self._station_startup_state_getter()
             if startup_state in ["BOOTSTRAP", "STARTUP_ANNOUNCEMENT_PLAYING", "STARTUP_THINK_COMPLETE"]:
                 logger.error(f"[DJ] DO: CRITICAL - Attempted to execute DO during startup state {startup_state}")

@@ -40,6 +40,7 @@ class TowerControlClient:
         self.tower_port = tower_port
         self.base_url = f"http://{tower_host}:{tower_port}"
         self.timeout = 5.0  # 5 second timeout for API calls
+        self.buffer_timeout = 0.15  # Short timeout for /tower/buffer telemetry
         
         # Suppress httpx INFO level logging (reduce noise from frequent buffer polling)
         httpx_logger = logging.getLogger("httpx")
@@ -105,7 +106,7 @@ class TowerControlClient:
         url = f"{self.base_url}/tower/buffer"
         
         try:
-            response = httpx.get(url, timeout=self.timeout)
+            response = httpx.get(url, timeout=self.buffer_timeout)
             response.raise_for_status()
             buffer_data = response.json()
             

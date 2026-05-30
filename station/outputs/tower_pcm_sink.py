@@ -8,6 +8,7 @@ This replaces the internal HTTP streaming and MP3 encoding in Station.
 import logging
 import os
 import socket
+import threading
 import time
 from typing import Optional
 
@@ -102,8 +103,11 @@ class TowerPCMSink(BaseSink):
         self._buffer_check_interval = 0.1  # Check buffer status every 100ms (non-blocking)
         self._last_buffer_depth: Optional[int] = None  # Track previous depth to detect transitions
         self._last_buffer_at_capacity = False  # Track if buffer was at capacity to detect overflow transitions
+        self._health_stop = threading.Event()
+        self._health_thread: Optional[threading.Thread] = None
         
         logger.info(f"TowerPCMSink initialized (socket={socket_path}, frame_size={frame_size} samples, frame_bytes={self.frame_bytes})")
+        self._start_buffer_health_monitor()
     
     def write_unpaced(self, frame: np.ndarray) -> None:
         """
@@ -138,28 +142,17 @@ class TowerPCMSink(BaseSink):
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
         
-        # OS3.1: Check buffer status periodically for underflow detection
-        self._check_buffer_health()
-        
-        # Send exactly ONE complete frame if available (no pacing - push immediately)
-        if len(self._buffer) >= self.frame_bytes:
-            # Extract exactly one complete frame
+        # Burst mode: no HTTP on this path; flush every complete frame
+        while len(self._buffer) >= self.frame_bytes:
             frame_bytes = bytes(self._buffer[:self.frame_bytes])
             self._buffer = self._buffer[self.frame_bytes:]
-            
-            # Send complete frame to socket immediately (non-blocking)
-            # ARCHITECTURAL INVARIANT: Station must NEVER block Tower.
-            # If socket buffer is full, drop frame silently (drop-oldest semantics).
             try:
                 if self._socket:
-                    # Non-blocking send: if buffer is full, drop frame
                     try:
                         self._socket.sendall(frame_bytes)
                         self._frames_sent += 1
                     except BlockingIOError:
-                        # Socket buffer full - drop frame (Tower is not reading fast enough)
-                        # This is expected behavior: Station never blocks, Tower handles pacing
-                        pass
+                        return
             except BrokenPipeError:
                 if self._connection_start_time:
                     connection_duration = time.time() - self._connection_start_time
@@ -212,6 +205,106 @@ class TowerPCMSink(BaseSink):
                     self._socket = None
                 self._connection_start_time = None
                 return
+    
+    def _send_frame_bytes(self, pcm_bytes: bytes, max_wait_sec: float = 0.5) -> bool:
+        """Send a complete frame over the non-blocking socket; retry until sent or timeout."""
+        if not self._socket:
+            return False
+        deadline = time.monotonic() + max_wait_sec
+        offset = 0
+        while offset < len(pcm_bytes):
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"[PCM] Frame send timeout ({offset}/{len(pcm_bytes)} bytes sent)"
+                )
+                return False
+            try:
+                sent = self._socket.send(pcm_bytes[offset:])
+                if sent == 0:
+                    return False
+                offset += sent
+            except BlockingIOError:
+                time.sleep(0.001)
+            except BrokenPipeError:
+                self._mark_disconnected("broken pipe")
+                return False
+            except OSError as e:
+                logger.warning(f"[PCM] Socket error during send: {e}")
+                self._mark_disconnected(str(e))
+                return False
+        return True
+
+    def _mark_disconnected(self, reason: str) -> None:
+        if self._connection_start_time:
+            connection_duration = time.time() - self._connection_start_time
+            logger.warning(
+                f"[PCM] Socket disconnected ({reason}, "
+                f"connection duration: {connection_duration:.1f}s)"
+            )
+        else:
+            logger.warning(f"[PCM] Socket disconnected ({reason})")
+        self._total_disconnections += 1
+        self._connected = False
+        if self._socket:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+        self._connection_start_time = None
+
+    def write_paced(self, frame: np.ndarray) -> None:
+        """
+        Send exactly one PCM frame on the pump hot path.
+
+        No HTTP buffer checks, no track-transition buffer discard. Retries until
+        the frame is accepted or the send timeout is reached — program audio must
+        not be silently dropped.
+        """
+        if not self._connected:
+            if not self._connect():
+                return
+
+        expected_samples = self.frame_size * self.channels
+        if frame.size != expected_samples:
+            logger.warning(
+                f"[PCM] Invalid frame size: {frame.size} samples, "
+                f"expected {expected_samples} samples. Dropping frame."
+            )
+            return
+
+        try:
+            pcm_bytes = frame.astype(np.int16).tobytes()
+        except Exception as e:
+            logger.error(f"[PCM] Error converting frame to bytes: {e}")
+            return
+
+        if len(pcm_bytes) != self.frame_bytes:
+            return
+
+        if self._send_frame_bytes(pcm_bytes):
+            self._frames_sent += 1
+            self._last_write_time = time.time()
+    
+    def _start_buffer_health_monitor(self) -> None:
+        if not self._tower_control:
+            return
+        if self._health_thread and self._health_thread.is_alive():
+            return
+        self._health_stop.clear()
+        self._health_thread = threading.Thread(
+            target=self._buffer_health_loop,
+            name="tower-buffer-health",
+            daemon=True,
+        )
+        self._health_thread.start()
+
+    def _buffer_health_loop(self) -> None:
+        while not self._health_stop.wait(self._buffer_check_interval):
+            try:
+                self._check_buffer_health()
+            except Exception as e:
+                logger.debug(f"Buffer health monitor error: {e}")
     
     def _connect(self) -> bool:
         """
@@ -344,9 +437,6 @@ class TowerPCMSink(BaseSink):
         except Exception as e:
             logger.error(f"[PCM] Error converting frame to bytes: {e}")
             return
-        
-        # OS3.1: Check buffer status periodically for underflow detection
-        self._check_buffer_health()
         
         # Extract and send complete 4096-byte frames from buffer
         # NEVER send partial frames - if <4096 remain, wait for next decode cycle
@@ -481,6 +571,10 @@ class TowerPCMSink(BaseSink):
     
     def close(self) -> None:
         """Close the socket connection to Tower."""
+        self._health_stop.set()
+        if self._health_thread and self._health_thread.is_alive():
+            self._health_thread.join(timeout=1.0)
+        self._health_thread = None
         # On close, discard remaining buffer (don't flush partial frames)
         if len(self._buffer) > 0:
             logger.debug(f"[PCM] Closing sink, discarding {len(self._buffer)} bytes from buffer")

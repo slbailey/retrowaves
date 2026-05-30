@@ -275,17 +275,19 @@ class Station:
         # Wrap DJ callbacks to track startup state transitions
         original_on_segment_finished = self.dj.on_segment_finished
         def wrapped_on_segment_finished(segment: AudioEvent):
-            # SS2.1: STARTUP_THINK_COMPLETE → STARTUP_DO_ENQUEUE
-            # Transition occurs when startup announcement finishes playing
-            # This MUST happen before DJ DO is allowed to run
-            if (self._startup_state == STARTUP_STATE_THINK_COMPLETE and 
-                segment.type == "announcement" and 
-                segment.intent_id is None):
-                logger.info(f"[STARTUP] Startup announcement finished: {segment.path}")
-                # SS3.1: Queue MUST be empty when startup announcement finishes
-                assert self.engine._queue.empty(), "SS3.1: Queue MUST be empty when startup announcement finishes"
-                logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_DO_ENQUEUE}")
-                self._startup_state = STARTUP_STATE_DO_ENQUEUE
+            # During shutdown, never advance the startup state machine into first-song DO
+            if not self.engine._is_draining:
+                # SS2.1: STARTUP_THINK_COMPLETE → STARTUP_DO_ENQUEUE
+                # Transition occurs when startup announcement finishes playing
+                # This MUST happen before DJ DO is allowed to run
+                if (self._startup_state == STARTUP_STATE_THINK_COMPLETE and 
+                    segment.type == "announcement" and 
+                    segment.intent_id is None):
+                    logger.info(f"[STARTUP] Startup announcement finished: {segment.path}")
+                    # SS3.1: Queue MUST be empty when startup announcement finishes
+                    assert self.engine._queue.empty(), "SS3.1: Queue MUST be empty when startup announcement finishes"
+                    logger.info(f"[STARTUP] State transition: {self._startup_state} → {STARTUP_STATE_DO_ENQUEUE}")
+                    self._startup_state = STARTUP_STATE_DO_ENQUEUE
             # Call original callback (which will handle DO execution)
             original_on_segment_finished(segment)
         self.dj.on_segment_finished = wrapped_on_segment_finished
