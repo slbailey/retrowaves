@@ -5,6 +5,8 @@ Handles HTTP streaming requests for live audio stream.
 """
 
 import json
+import time
+import os
 import logging
 import select
 import socket
@@ -19,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 # Module-level station_state_manager (set by Station)
 _station_state_manager = None
+
+# Process start + last-observed segment, used by /station/health to report whether
+# playout is actually advancing (a wedged Station keeps answering /station/state
+# with the same segment forever).
+_PROCESS_START = time.time()
+_LAST_SEGMENT = {"key": None, "seen_at": _PROCESS_START}
+_LAST_SEGMENT_LOCK = threading.Lock()
 
 
 def set_station_state_manager(manager):
@@ -42,6 +51,8 @@ class HTTPStreamingHandler(BaseHTTPRequestHandler):
             self._handle_stream()
         elif self.path == "/station/state":
             self._handle_station_state()
+        elif self.path == "/station/health":
+            self._handle_station_health()
         else:
             self.send_error(404, "Not Found")
     
@@ -74,6 +85,74 @@ class HTTPStreamingHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.debug(f"Error sending station state response: {e}")
     
+    def _handle_station_health(self):
+        """
+        Handle /station/health GET - machine-readable health for monitoring.
+
+        Reports whether playout is ADVANCING, which /station/state alone cannot tell
+        you: a wedged Station happily keeps returning the same segment forever.
+
+        segment_age_sec  - how long the current segment has been playing
+        stalled_sec      - how long the segment has NOT changed (the stall signal)
+        overrun          - segment has outlived its own duration (with slack)
+
+        Non-blocking and filesystem-free, so it still answers when the media NFS
+        mount is dead.
+        """
+        global _station_state_manager
+        now = time.time()
+
+        state_dict = {}
+        if _station_state_manager is not None:
+            try:
+                state_dict = _station_state_manager.get_state_dict() or {}
+            except Exception as e:
+                logger.debug(f"health: could not read station state: {e}")
+
+        current = state_dict.get("current_audio") or {}
+        started_at = current.get("started_at")
+        duration = current.get("duration_sec")
+
+        # Track segment changes to derive a stall duration.
+        key = f"{current.get('file_path')}|{started_at}"
+        with _LAST_SEGMENT_LOCK:
+            if key != _LAST_SEGMENT["key"]:
+                _LAST_SEGMENT["key"] = key
+                _LAST_SEGMENT["seen_at"] = now
+            stalled_sec = round(now - _LAST_SEGMENT["seen_at"], 1)
+
+        segment_age = round(now - started_at, 1) if isinstance(started_at, (int, float)) else None
+        overrun = bool(
+            segment_age is not None
+            and isinstance(duration, (int, float))
+            and segment_age > duration + 60
+        )
+
+        payload = {
+            "service": "station",
+            "station_state": state_dict.get("station_state"),
+            "segment_type": current.get("segment_type"),
+            "title": current.get("title"),
+            "artist": current.get("artist"),
+            "segment_age_sec": segment_age,
+            "duration_sec": duration,
+            "stalled_sec": stalled_sec,
+            "overrun": overrun,
+            "uptime_sec": round(now - _PROCESS_START, 1),
+            "pid": os.getpid(),
+        }
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            logger.debug(f"Error sending station health response: {e}")
+
     def do_POST(self):
         """Reject POST requests."""
         self.send_error(404, "Not Found")

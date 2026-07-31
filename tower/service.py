@@ -106,7 +106,8 @@ class TowerService:
             host=http_host, 
             port=http_port, 
             frame_source=self.encoder,
-            buffer_stats_provider=self.pcm_buffer  # PCM buffer has .stats() method
+            buffer_stats_provider=self.pcm_buffer,  # PCM buffer has .stats() method
+            health_provider=self.encoder,  # EncoderManager exposes get_audio_state() for /tower/health
         )
         
         # Set station shutdown check callback in encoder_manager per contract T-EVENTS5 exception

@@ -24,6 +24,9 @@ from tower.http.websocket import (
 
 logger = logging.getLogger(__name__)
 
+# Process start time, used to report uptime on /tower/health.
+_PROCESS_START = time.time()
+
 # Setup file handler for contract-compliant logging (LOG1, LOG2, LOG3, LOG4)
 # Per contract: /var/log/retrowaves/tower.log, non-blocking, rotation-tolerant
 # TowerRuntime is implemented in HTTPServer
@@ -109,7 +112,7 @@ class HTTPServer:
     - Maintains thread-safe client registry (T-CLIENTS3)
     - Validates socket send return values (T-CLIENTS4)
     """
-    def __init__(self, host, port, frame_source, buffer_stats_provider=None):
+    def __init__(self, host, port, frame_source, buffer_stats_provider=None, health_provider=None):
         """
         Initialize HTTPServer.
         
@@ -123,6 +126,7 @@ class HTTPServer:
         self.port = port
         self.frame_source = frame_source  # must implement .pop() returning bytes
         self.buffer_stats_provider = buffer_stats_provider  # for /tower/buffer endpoint
+        self.health_provider = health_provider  # EncoderManager, for /tower/health endpoint
         
         # Per contract T-CLIENTS3: Thread-safe client registry
         # Store clients as dict: {client_id: _ClientState}
@@ -214,6 +218,8 @@ class HTTPServer:
                 self._handle_stream_endpoint(client, client_id)
             elif path == "/tower/buffer":
                 self._handle_buffer_endpoint(client)
+            elif path == "/tower/health":
+                self._handle_health_endpoint(client)
             elif path == "/tower/events/ingest":
                 self._handle_events_ingest_endpoint(client, method, request)
             elif path == "/__test__/broadcast" and os.getenv("TOWER_TEST_MODE") == "1":
@@ -312,6 +318,74 @@ class HTTPServer:
                 # Client disconnected
                 break
     
+    def _handle_health_endpoint(self, client):
+        """
+        Handle /tower/health - machine-readable health for monitoring.
+
+        The important field is audio_state: PROGRAM means real programme audio is
+        being encoded; FALLBACK_TONE / SILENCE_GRACE mean the Station is not
+        delivering PCM and listeners are hearing fallback.
+
+        Deliberately does NO filesystem or blocking work so it stays answerable
+        even when the media NFS mount is dead.
+        """
+        try:
+            audio_state = "UNKNOWN"
+            if self.health_provider is not None:
+                try:
+                    audio_state = self.health_provider.get_audio_state()
+                except Exception:
+                    audio_state = "UNKNOWN"
+
+            buf = {}
+            if self.buffer_stats_provider is not None:
+                try:
+                    if hasattr(self.buffer_stats_provider, "get_stats"):
+                        s = self.buffer_stats_provider.get_stats()
+                    else:
+                        s = self.buffer_stats_provider.stats()
+                    cap = s.capacity
+                    cnt = s.count
+                    buf = {
+                        "capacity": cap,
+                        "count": cnt,
+                        "ratio": (cnt / cap) if cap > 0 else 0.0,
+                        "overflow_count": getattr(s, "overflow_count", 0),
+                    }
+                except Exception:
+                    buf = {}
+
+            with self._clients_lock:
+                client_count = len(self._connected_clients)
+
+            payload = {
+                "service": "tower",
+                "audio_state": audio_state,
+                "on_air": audio_state == "PROGRAM",
+                "clients": client_count,
+                "buffer": buf,
+                "uptime_sec": round(time.time() - _PROCESS_START, 1),
+                "pid": os.getpid(),
+            }
+            body = json.dumps(payload)
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "\r\n"
+                f"{body}\n"
+            )
+            client.sendall(response.encode("ascii"))
+        except Exception as e:
+            logger.debug(f"Error serving /tower/health: {e}")
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def _handle_buffer_endpoint(self, client):
         """
         Handle /tower/buffer endpoint - returns JSON buffer stats per contract T-BUF.

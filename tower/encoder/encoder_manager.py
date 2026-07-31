@@ -1500,6 +1500,16 @@ class EncoderManager:
             # Reinitialize fallback grace period (AudioPump will provide fallback frames)
             self._init_fallback_grace_period()
     
+    def get_audio_state(self) -> str:
+        """
+        Return the current audio state for health reporting.
+
+        One of: SILENCE_GRACE, FALLBACK_TONE, PROGRAM, DEGRADED.
+        Thread-safe and non-blocking; safe to call from the HTTP server.
+        """
+        with self._audio_state_lock:
+            return self._audio_state
+
     def _set_audio_state(self, new_state: str, reason: str = "") -> None:
         """
         Set audio state and log transition per contract [BG3], [BG20].
