@@ -19,15 +19,24 @@ Defines discovery, indexing, and safety for all audio assets (songs, IDs, intros
 
 ### ADM1.2 — Directory Categorization
 
-**MUST** categorize assets strictly by directory:
+**MUST** categorize assets strictly by directory. The v2 layout (detected by
+the presence of `between-songs/` under DJ_PATH):
 
-- **`intros/`**: Intro clips for songs
-- **`outros/`**: Outro clips for songs
-- **`ids/`**: Station identification clips
-- **`talk/`**: Talk segments (if applicable)
-- **`music/`** or root: Main music library
-- **`station_starting_up/`**: Startup announcement pool
-- **`station_shutting_down/`**: Shutdown announcement pool
+- **`between-songs/<song key>/`**: per-song clips; the folder name **MUST** equal the
+  song's filename without `.mp3`. Role is the filename's leading word:
+  `Intro - …` or `Outro - …` (`Outtro` accepted per ADM2.2)
+- **`generic/`**: `Intro - …` / `Outro - …` fallback pool for songs with no clips
+- **`station-ids/legal/`**, **`station-ids/generic/`**: one file = one ID
+- **`station-ids/sequences/<name>/`**: one folder = one generic ID whose files
+  **MUST** air together, in filename order
+- **`lifecycle/startup/`**, **`lifecycle/shutdown/`**: lifecycle announcement pools (ADM2.4)
+- **`story/`**, **`archive/`**: **MUST NOT** be scheduled by discovery
+
+Music lives outside DJ_PATH (`REGULAR_MUSIC_PATH`, `HOLIDAY_MUSIC_PATH`).
+
+The pre-v2 flat layout (`<songroot>_intro*.mp3`, `ids/`, `station_starting_up/`,
+`station_shutting_down/`) **MUST** remain supported so that repointing DJ_PATH
+at an old tree is a complete rollback.
 
 ---
 
