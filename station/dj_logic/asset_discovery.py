@@ -1,10 +1,30 @@
 """
 Asset Discovery Manager for Appalachia Radio 3.2.
 
-Scans DJ asset directories to discover intros and outros based on naming conventions.
-Runs hourly scans during THINK windows to maintain an in-memory cache.
+Scans the DJ asset tree and keeps an in-memory cache of intros, outros,
+station IDs and lifecycle announcements. Runs at startup and hourly during
+THINK windows (ADM1.1); DJEngine reads only from this cache (ADM2.1).
 
-Phase 9: Hourly asset discovery system.
+Two layouts are supported. The layout is detected per scan, so pointing
+DJ_PATH back at an old tree is a complete rollback.
+
+v2 layout (directory-categorized, per ADM1.2) — detected by `between-songs/`:
+
+    <DJ_PATH>/
+      between-songs/<song key>/Intro - ....mp3      song key == song filename stem
+      between-songs/<song key>/Outro - ....mp3
+      generic/Intro - ....mp3 | Outro - ....mp3     fallback when a song has none
+      station-ids/legal/*.mp3                       one file == one ID
+      station-ids/generic/*.mp3
+      station-ids/sequences/<name>/*.mp3            one folder == one ID, played in filename order
+      lifecycle/startup/*.mp3
+      lifecycle/shutdown/*.mp3
+      story/, archive/                              never scheduled
+
+Legacy flat layout (pre-v2):
+    <songroot>_intro*.mp3, <songroot>_outt?ro*.mp3, generic_intro*.mp3,
+    generic_outt?ro*.mp3, ids/{legal,generic}/*.mp3,
+    station_starting_up/*.mp3, station_shutting_down/*.mp3
 
 Architecture 3.2 Reference:
 - Section 3.2: on_segment_started (THINK) - scanning happens here
@@ -20,24 +40,49 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# v2: role is the leading word of the filename ("Intro - ...", "Outro - ...").
+# "Outtro" is accepted for parity with the legacy typo (ADM2.2).
+_V2_INTRO = re.compile(r"^intro\b", re.IGNORECASE)
+_V2_OUTRO = re.compile(r"^outt?ro\b", re.IGNORECASE)
+
+# Legacy flat patterns.
+_LEGACY_INTRO = re.compile(r"^(.+?)_intro.*\.mp3$", re.IGNORECASE)
+_LEGACY_OUTRO = re.compile(r"^(.+?)_outt?ro.*\.mp3$", re.IGNORECASE)
+_LEGACY_GENERIC_INTRO = re.compile(r"^generic_intro.*\.mp3$", re.IGNORECASE)
+_LEGACY_GENERIC_OUTRO = re.compile(r"^generic_outt?ro.*\.mp3$", re.IGNORECASE)
+_LEGACY_IGNORE = (
+    re.compile(r"^JulieScene.*", re.IGNORECASE),
+    re.compile(r"^CatherineScene.*", re.IGNORECASE),
+    re.compile(r"^mus_radio_76_general_.*", re.IGNORECASE),
+)
+
+
+def _mp3s(directory: Path) -> List[str]:
+    """Sorted .mp3 files directly inside directory (non-recursive, no hidden files)."""
+    if not directory.is_dir():
+        return []
+    return sorted(
+        str(p) for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() == ".mp3" and not p.name.startswith(".")
+    )
+
 
 class AssetDiscoveryManager:
     """
-    Manages discovery and caching of intro/outro assets.
-    
-    Scans DJ_PATH directory tree to find:
-    - Per-song intros: <songroot>_intro*.mp3
-    - Per-song outros: <songroot>_outtro*.mp3
-    - Generic intros: generic_intro*.mp3
-    
-    Maintains in-memory maps for fast access during THINK phase.
-    Only scans once per hour (configurable).
+    Manages discovery and caching of DJ assets.
+
+    Cached (all replaced atomically at the end of each scan, ADM2.1):
+    - intros_per_song / outtros_per_song: song key -> [paths]
+    - generic_intros / generic_outros: [paths]
+    - legal_ids / generic_ids: [[paths]] — each entry is one ID, which may be a
+      multi-file sequence that must air in order
+    - startup_announcements / shutdown_announcements: [paths]
     """
-    
+
     def __init__(self, dj_path: Path, scan_interval_seconds: int = 3600):
         """
         Initialize asset discovery manager.
-        
+
         Args:
             dj_path: Path to DJ assets directory
             scan_interval_seconds: How often to rescan (default: 3600 = 1 hour)
@@ -45,241 +90,186 @@ class AssetDiscoveryManager:
         self.dj_path = Path(dj_path)
         self.scan_interval_seconds = scan_interval_seconds
         self.last_scan_time: Optional[float] = None
-        
-        # In-memory caches (built during scan)
-        self.intros_per_song: Dict[str, List[str]] = {}  # songroot -> [list of intro paths]
-        self.outtros_per_song: Dict[str, List[str]] = {}  # songroot -> [list of outro paths]
-        self.generic_intros: List[str] = []  # list of generic intro paths
-        self.generic_outros: List[str] = []  # list of generic outro paths
-        
+        self.layout: str = "none"
+
+        self.intros_per_song: Dict[str, List[str]] = {}
+        self.outtros_per_song: Dict[str, List[str]] = {}
+        self.generic_intros: List[str] = []
+        self.generic_outros: List[str] = []
+        self.legal_ids: List[List[str]] = []
+        self.generic_ids: List[List[str]] = []
+
         # Lifecycle announcement pools (per ADM2.4)
-        self.startup_announcements: List[str] = []  # list of startup announcement paths
-        self.shutdown_announcements: List[str] = []  # list of shutdown announcement paths
-        
-        # Perform initial scan
+        self.startup_announcements: List[str] = []
+        self.shutdown_announcements: List[str] = []
+
         self._scan()
-    
+
     def maybe_rescan(self) -> None:
         """
         Rescan directories if enough time has passed.
-        
+
         Should be called during THINK phase (on_segment_started).
         Only scans once per hour to avoid blocking.
         """
         now = time.time()
-        
-        # First scan or enough time has passed
         if self.last_scan_time is None or (now - self.last_scan_time) >= self.scan_interval_seconds:
             self._scan()
-    
+
+    # ------------------------------------------------------------------ scanning
+
+    def _empty(self) -> dict:
+        return {
+            "layout": "none",
+            "intros_per_song": {},
+            "outtros_per_song": {},
+            "generic_intros": [],
+            "generic_outros": [],
+            "legal_ids": [],
+            "generic_ids": [],
+            "startup_announcements": [],
+            "shutdown_announcements": [],
+        }
+
     def _scan(self) -> None:
-        """
-        Scan DJ_PATH directory tree for intro/outro assets.
-        
-        Discovers:
-        - Per-song intros: <songroot>_intro*.mp3
-        - Per-song outros: <songroot>_outt?ro*.mp3 (matches both _outro and _outtro)
-        - Generic intros: generic_intro*.mp3
-        - Generic outros: generic_outt?ro*.mp3 (matches both generic_outro and generic_outtro)
-        
-        Ignores:
-        - JulieScene*.mp3
-        - CatherineScene*.mp3
-        - mus_radio_76_general_*
-        - Anything not matching patterns
-        - Non-.mp3 files
-        """
-        logger.info("[ASSET SCAN] Scanning intros/outtros...")
-        
-        # Clear previous results
-        self.intros_per_song.clear()
-        self.outtros_per_song.clear()
-        self.generic_intros.clear()
-        self.generic_outros.clear()
-        self.startup_announcements.clear()
-        self.shutdown_announcements.clear()
-        
+        """Scan DJ_PATH, build a fresh cache, then swap it in atomically."""
+        logger.info("[ASSET SCAN] Scanning DJ assets...")
         if not self.dj_path.exists():
             logger.warning(f"[ASSET SCAN] DJ path does not exist: {self.dj_path}")
+            self._apply(self._empty())
             self.last_scan_time = time.time()
             return
-        
-        # Patterns to match
-        # Note: Accept both _outro (canonical) and _outtro (historical typo) for compatibility
-        intro_pattern = re.compile(r'^(.+?)_intro.*\.mp3$', re.IGNORECASE)
-        outro_pattern = re.compile(r'^(.+?)_outt?ro.*\.mp3$', re.IGNORECASE)  # Matches both _outro and _outtro
-        generic_intro_pattern = re.compile(r'^generic_intro.*\.mp3$', re.IGNORECASE)
-        generic_outro_pattern = re.compile(r'^generic_outt?ro.*\.mp3$', re.IGNORECASE)  # Matches both generic_outro and generic_outtro
-        
-        # Patterns to ignore
-        ignore_patterns = [
-            re.compile(r'^JulieScene.*', re.IGNORECASE),
-            re.compile(r'^CatherineScene.*', re.IGNORECASE),
-            re.compile(r'^mus_radio_76_general_.*', re.IGNORECASE),
-        ]
-        
-        def should_ignore(filename: str) -> bool:
-            """Check if file should be ignored."""
-            for pattern in ignore_patterns:
-                if pattern.match(filename):
-                    return True
-            return False
-        
-        # Scan lifecycle announcement directories first (per ADM2.4)
-        startup_dir = self.dj_path / "station_starting_up"
-        shutdown_dir = self.dj_path / "station_shutting_down"
-        
-        if startup_dir.exists() and startup_dir.is_dir():
-            for file_path in startup_dir.glob("*.mp3"):
-                if file_path.is_file():
-                    self.startup_announcements.append(str(file_path))
-        
-        if shutdown_dir.exists() and shutdown_dir.is_dir():
-            for file_path in shutdown_dir.glob("*.mp3"):
-                if file_path.is_file():
-                    self.shutdown_announcements.append(str(file_path))
-        
-        # Walk the directory tree
-        for root, dirs, files in os.walk(self.dj_path):
-            # Skip hidden directories
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
-            # Skip lifecycle announcement directories (already scanned above)
-            if Path(root).name in ("station_starting_up", "station_shutting_down"):
-                continue
-            
-            for filename in files:
-                # Only process .mp3 files
-                if not filename.lower().endswith('.mp3'):
-                    continue
-                
-                full_path = os.path.join(root, filename)
-                
-                # Check for generic intros FIRST (before per-song patterns and ignore patterns)
-                if generic_intro_pattern.match(filename):
-                    self.generic_intros.append(full_path)
-                    continue
-                
-                # Check for generic outros (before per-song patterns and ignore patterns)
-                if generic_outro_pattern.match(filename):
-                    self.generic_outros.append(full_path)
-                    continue
-                
-                # Check for per-song intros (before ignore patterns - intros/outros should never be ignored)
-                intro_match = intro_pattern.match(filename)
-                if intro_match:
-                    songroot = intro_match.group(1)
-                    # Skip if it's actually a generic intro (shouldn't happen, but safety check)
-                    if songroot.lower() != "generic":
-                        if songroot not in self.intros_per_song:
-                            self.intros_per_song[songroot] = []
-                        self.intros_per_song[songroot].append(full_path)
-                    continue
-                
-                # Check for per-song outros (before ignore patterns - intros/outros should never be ignored)
-                outro_match = outro_pattern.match(filename)
-                if outro_match:
-                    songroot = outro_match.group(1)
-                    # Skip if it's actually a generic outro (shouldn't happen, but safety check)
-                    if songroot.lower() != "generic":
-                        if songroot not in self.outtros_per_song:
-                            self.outtros_per_song[songroot] = []
-                        self.outtros_per_song[songroot].append(full_path)
-                    continue
-                
-                # Skip ignored files (only after we've checked for intro/outro patterns)
-                if should_ignore(filename):
-                    continue
-        
-        # Update scan time
+
+        if (self.dj_path / "between-songs").is_dir():
+            cache = self._scan_v2()
+        else:
+            cache = self._scan_legacy()
+        self._apply(cache)
         self.last_scan_time = time.time()
-        
-        # Log results
-        total_per_song_intros = sum(len(v) for v in self.intros_per_song.values())
-        total_per_song_outtros = sum(len(v) for v in self.outtros_per_song.values())
-        unique_songs_with_intros = len(self.intros_per_song)
-        unique_songs_with_outtros = len(self.outtros_per_song)
+        self._log_summary()
+
+    def _apply(self, cache: dict) -> None:
+        for key, value in cache.items():
+            setattr(self, key, value)
+
+    def _scan_v2(self) -> dict:
+        root = self.dj_path
+        cache = self._empty()
+        cache["layout"] = "v2"
+
+        songs_dir = root / "between-songs"
+        for song_dir in sorted(p for p in songs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            for path in _mp3s(song_dir):
+                name = Path(path).name
+                if _V2_INTRO.match(name):
+                    cache["intros_per_song"].setdefault(song_dir.name, []).append(path)
+                elif _V2_OUTRO.match(name):
+                    cache["outtros_per_song"].setdefault(song_dir.name, []).append(path)
+                else:
+                    logger.warning(f"[ASSET SCAN] Unrecognized clip (expected 'Intro - ' or 'Outro - '): {path}")
+
+        for path in _mp3s(root / "generic"):
+            name = Path(path).name
+            if _V2_INTRO.match(name):
+                cache["generic_intros"].append(path)
+            elif _V2_OUTRO.match(name):
+                cache["generic_outros"].append(path)
+
+        ids_root = root / "station-ids"
+        cache["legal_ids"] = [[p] for p in _mp3s(ids_root / "legal")]
+        cache["generic_ids"] = [[p] for p in _mp3s(ids_root / "generic")]
+        sequences = ids_root / "sequences"
+        if sequences.is_dir():
+            for seq_dir in sorted(p for p in sequences.iterdir() if p.is_dir() and not p.name.startswith(".")):
+                parts = _mp3s(seq_dir)
+                if parts:
+                    cache["generic_ids"].append(parts)
+
+        cache["startup_announcements"] = _mp3s(root / "lifecycle" / "startup")
+        cache["shutdown_announcements"] = _mp3s(root / "lifecycle" / "shutdown")
+        return cache
+
+    def _scan_legacy(self) -> dict:
+        root = self.dj_path
+        cache = self._empty()
+        cache["layout"] = "legacy"
+
+        cache["startup_announcements"] = _mp3s(root / "station_starting_up")
+        cache["shutdown_announcements"] = _mp3s(root / "station_shutting_down")
+        cache["legal_ids"] = [[p] for p in _mp3s(root / "ids" / "legal")]
+        cache["generic_ids"] = [[p] for p in _mp3s(root / "ids" / "generic")]
+
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            here = Path(dirpath)
+            if here.name in ("station_starting_up", "station_shutting_down") or "ids" in here.relative_to(root).parts:
+                continue
+            for filename in sorted(files):
+                if not filename.lower().endswith(".mp3"):
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                if _LEGACY_GENERIC_INTRO.match(filename):
+                    cache["generic_intros"].append(full_path)
+                    continue
+                if _LEGACY_GENERIC_OUTRO.match(filename):
+                    cache["generic_outros"].append(full_path)
+                    continue
+                m = _LEGACY_INTRO.match(filename)
+                if m and m.group(1).lower() != "generic":
+                    cache["intros_per_song"].setdefault(m.group(1), []).append(full_path)
+                    continue
+                m = _LEGACY_OUTRO.match(filename)
+                if m and m.group(1).lower() != "generic":
+                    cache["outtros_per_song"].setdefault(m.group(1), []).append(full_path)
+                    continue
+                if any(p.match(filename) for p in _LEGACY_IGNORE):
+                    continue
+        return cache
+
+    def _log_summary(self) -> None:
+        intros = sum(len(v) for v in self.intros_per_song.values())
+        outtros = sum(len(v) for v in self.outtros_per_song.values())
+        sequences = sum(1 for entry in self.generic_ids if len(entry) > 1)
         logger.info(
-            f"[ASSET SCAN] Found {total_per_song_intros} per-song intros "
-            f"({unique_songs_with_intros} unique songs), "
-            f"{total_per_song_outtros} per-song outtros "
-            f"({unique_songs_with_outtros} unique songs), "
+            f"[ASSET SCAN] layout={self.layout}: "
+            f"{intros} per-song intros ({len(self.intros_per_song)} songs), "
+            f"{outtros} per-song outtros ({len(self.outtros_per_song)} songs), "
             f"{len(self.generic_intros)} generic intros, "
             f"{len(self.generic_outros)} generic outros, "
+            f"{len(self.legal_ids)} legal IDs, "
+            f"{len(self.generic_ids)} generic IDs ({sequences} sequences), "
             f"{len(self.startup_announcements)} startup announcements, "
             f"{len(self.shutdown_announcements)} shutdown announcements."
         )
-        
-        # Debug: log a few examples if we found any
-        if total_per_song_intros > 0:
-            example_intros = list(self.intros_per_song.items())[:3]
-            logger.debug(f"[ASSET SCAN] Example per-song intros: {example_intros}")
-        if total_per_song_outtros > 0:
-            example_outtros = list(self.outtros_per_song.items())[:3]
-            logger.debug(f"[ASSET SCAN] Example per-song outtros: {example_outtros}")
-    
+
+    # ------------------------------------------------------------------ lookups
+
     def get_intros_for_song(self, song_path: str) -> List[str]:
-        """
-        Get intro paths for a specific song.
-        
-        Args:
-            song_path: Full path to the song file
-            
-        Returns:
-            List of intro file paths (empty if none found)
-        """
-        # Extract songroot from song path
+        """Intro paths for a song (empty if none)."""
         songroot = self._extract_songroot(song_path)
-        if not songroot:
-            return []
-        
-        return self.intros_per_song.get(songroot, [])
-    
+        return self.intros_per_song.get(songroot, []) if songroot else []
+
     def get_outtros_for_song(self, song_path: str) -> List[str]:
-        """
-        Get outro paths for a specific song.
-        
-        Args:
-            song_path: Full path to the song file
-            
-        Returns:
-            List of outro file paths (empty if none found)
-        """
-        # Extract songroot from song path
+        """Outro paths for a song (empty if none)."""
         songroot = self._extract_songroot(song_path)
-        if not songroot:
-            return []
-        
-        return self.outtros_per_song.get(songroot, [])
-    
+        return self.outtros_per_song.get(songroot, []) if songroot else []
+
     def get_generic_outros(self) -> List[str]:
-        """
-        Get generic outro paths.
-        
-        Returns:
-            List of generic outro file paths (empty if none found)
-        """
+        """Generic outro paths."""
         return self.generic_outros
-    
+
+    def get_station_ids(self, legal: bool) -> List[List[str]]:
+        """Cached station IDs; each entry is an ordered list of paths (len > 1 = sequence)."""
+        return self.legal_ids if legal else self.generic_ids
+
     def _extract_songroot(self, song_path: str) -> Optional[str]:
         """
-        Extract songroot from song path.
-        
-        Given: /mnt/.../songs/Foo_Bar.mp3
-        Returns: Foo_Bar
-        
-        Args:
-            song_path: Full path to song file
-            
-        Returns:
-            Songroot (filename without extension) or None
+        Song key = song filename without extension.
+
+        /mnt/.../music/regular/Ink Spots - Maybe.mp3 -> "Ink Spots - Maybe"
         """
         try:
-            path_obj = Path(song_path)
-            # Get filename without extension
-            songroot = path_obj.stem
-            return songroot
+            return Path(song_path).stem
         except Exception as e:
             logger.debug(f"[ASSET SCAN] Could not extract songroot from {song_path}: {e}")
             return None
-

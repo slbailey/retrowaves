@@ -974,10 +974,22 @@ class DJEngine:
             legal: True if legal ID is required
         
         Returns:
-            List of paths to station ID MP3 files
+            List of paths to station ID MP3 files. A multi-part ID (a
+            station-ids/sequences/<name>/ folder) contributes all of its
+            parts, in order, so they are queued back to back.
         """
         id_paths = []
-        
+
+        # Preferred: the AssetDiscoveryManager cache (ADM2.1 — no file I/O in DJEngine).
+        get_ids = getattr(self.asset_manager, "get_station_ids", None)
+        cached = get_ids(legal) if get_ids else None
+        if cached:
+            for _ in range(count):
+                id_paths.extend(random.choice(cached))
+            logger.debug(f"[DJ] Selected {count} {'legal' if legal else 'generic'} ID(s) from cache: {id_paths}")
+            return id_paths
+
+        # Fallback: pre-cache behaviour (legacy ids/ directory scan).
         if legal:
             ids_dir = self.dj_asset_path / "ids" / "legal"
         else:
