@@ -101,41 +101,31 @@ The choice of padding vs. dropping is an implementation decision, but in all cas
 
 ---
 
-## OS3 — Buffer Health Events
+## OS3 — Buffer Health Events (Station-local)
 
-OutputSink **MUST** emit control-channel events for buffer health observability. These events are purely observational and **MUST NOT** influence PCM output, decode pacing, or segment timing.
+OutputSink **MUST** record Tower buffer health transitions for observability. These records are purely observational and **MUST NOT** influence PCM output, decode pacing, or segment timing.
 
-### OS3.1 — Station Underflow Event
+Since Phase 3 (segment_playing architecture), buffer health events are **Station-local**: they are written to the station log at WARNING level and **MUST NOT** be sent to Tower. Tower accepts only the four events in `EVENT_INVENTORY.md`, and it already reports its own buffer state on `GET /tower/health`.
 
-**MUST** emit `station_underflow` event when buffer becomes empty (no frames available for output).
+### OS3.1 — Station Underflow
 
-- Event **MUST** be emitted when buffer condition is detected (buffer depth = 0)
-- Event **MUST NOT** block PCM output thread
-- Event **MUST** include metadata:
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `buffer_depth`: Current buffer depth in frames (0 for underflow)
-  - `frames_dropped`: Number of frames dropped due to underflow (typically 0, but may be non-zero if silence is inserted)
-- Event **MUST** be emitted from the output thread
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** influence decode pacing or segment timing
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be purely observational
+**MUST** log `[BUFFER] Underflow detected: buffer_depth=0 frames_dropped=<n>` when the Tower buffer depth transitions from non-zero to zero.
 
-### OS3.2 — Station Overflow Event
+- **MUST** be logged once per transition, not continuously while the buffer stays empty
+- **MUST NOT** be logged when no non-zero depth has been observed yet
+- **MUST** be detected from the output thread's periodic (rate-limited) buffer checks
+- **MUST NOT** block PCM output, modify queue or state, or influence decode pacing or segment timing
+- **MUST NOT** be sent to Tower
 
-**MUST** emit `station_overflow` event when buffer exceeds capacity (frames dropped due to buffer full condition).
+### OS3.2 — Station Overflow
 
-- Event **MUST** be emitted when buffer overflow condition is detected (frames dropped due to full buffer)
-- Event **MUST NOT** block PCM output thread
-- Event **MUST** include metadata:
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `buffer_depth`: Current buffer depth in frames (at capacity)
-  - `frames_dropped`: Number of frames dropped due to overflow
-- Event **MUST** be emitted from the output thread
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** influence decode pacing or segment timing
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be purely observational
+**MUST** log `[BUFFER] Overflow detected: buffer_depth=<depth> frames_dropped=<n>` when the Tower buffer transitions to capacity.
+
+- **MUST** be logged once per transition, not continuously while the buffer stays full
+- **MUST** be detected from the output thread's periodic (rate-limited) buffer checks
+- **MUST NOT** block PCM output, modify queue or state, or influence decode pacing or segment timing
+- **MUST NOT** be sent to Tower
+- A failed buffer check **MUST** be ignored silently (debug log only)
 
 ### OS3.3 — Event Emission Rules
 

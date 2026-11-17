@@ -70,8 +70,10 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 **Heartbeat events include:**
 - Lifecycle events (`station_startup`, `station_shutdown`) — emitted by Station
 - Content events (`segment_playing`, `song_playing`) — emitted by PlayoutEngine
-- THINK lifecycle events (`dj_think_started`, `dj_think_completed`) — emitted by DJEngine
-- Buffer health events (`station_underflow`, `station_overflow`) — emitted by OutputSink
+
+**Station-local observability (logged, NOT sent to Tower since Phase 3):**
+- THINK lifecycle (`THINK started` / `THINK completed`) — logged by DJEngine (DJ4)
+- Buffer health (`Underflow detected` / `Overflow detected`) — logged by OutputSink (OS3)
 - Clock drift events (`decode_clock_skew`) — emitted by PlayoutEngine (if drift compensation enabled)
 
 **DEPRECATED:** `now_playing` events **MUST NOT** be emitted. This event pattern (start + clear semantics) is completely deprecated. Use stateful querying via Station State Contract and edge-triggered events (`song_playing`, `segment_playing`, `station_startup`, `station_shutdown`) instead.
@@ -86,7 +88,7 @@ The system **MUST** emit control-channel heartbeat events for observability. The
 - Events **MUST NOT** fire "end" or "clear" events
 
 **THINK/DO separation:**
-- THINK events (`dj_think_started`, `dj_think_completed`) are emitted during THINK phase
+- THINK lifecycle records (DJ4, Station-local log) are written during THINK phase
 - Content events (`segment_playing`, `song_playing`) are emitted when segments start playing
 - Events **MUST NOT** cross THINK/DO boundaries (THINK events don't influence DO, DO events don't influence THINK)
 

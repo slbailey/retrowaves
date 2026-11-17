@@ -130,50 +130,31 @@ Selection **MUST** follow pacing rules:
 
 ---
 
-## DJ4 — THINK Lifecycle Events
+## DJ4 — THINK Lifecycle Events (Station-local)
 
-DJEngine **MUST** emit control-channel events for THINK phase observability. These events are purely observational and **MUST NOT** influence THINK execution or decision-making.
+DJEngine **MUST** record THINK phase boundaries for observability. These records are purely observational and **MUST NOT** influence THINK execution or decision-making.
 
-### DJ4.1 — THINK Started Event
+Since Phase 3 (segment_playing architecture), THINK lifecycle events are **Station-local**: they are written to the station log and **MUST NOT** be sent to Tower. Tower accepts only the four events in `EVENT_INVENTORY.md` and rejects anything else with a T-EVENTS1 warning.
 
-**MUST** emit `dj_think_started` event before THINK logic begins.
+### DJ4.1 — THINK Started
 
-- Event **MUST** be emitted synchronously before any THINK operations
-- Event **MUST NOT** block THINK execution
-- Event **MUST** include metadata:
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `current_segment`: The AudioEvent currently playing (that triggered this THINK phase)
-- Event **MUST** be emitted from the THINK thread (typically during `on_segment_started()` callback)
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** rely on Tower timing or state
+**MUST** log `[DJ] THINK started: segment=<type> path=<path>` before THINK logic begins (startup/shutdown THINK use `THINK started (startup)` / `THINK started (shutdown)`).
 
-### DJ4.2 — THINK Completed Event
+- **MUST** be logged exactly once per THINK cycle, synchronously, before any THINK operations
+- **MUST** identify the AudioEvent that triggered THINK (its type and path)
+- **MUST NOT** be logged for segments that do not trigger THINK (intros, outros, IDs, dramas) or during DO
+- **MUST NOT** block THINK, modify queue or state, or rely on Tower timing or state
+- **MUST NOT** be sent to Tower
 
-**MUST** emit `dj_think_completed` event after THINK logic completes (before DO phase begins).
+### DJ4.2 — THINK Completed
 
-- Event **MUST** be emitted synchronously after all THINK operations complete
-- Event **MUST NOT** block DO phase execution
-- Event **MUST** include metadata:
-  - `timestamp`: Wall-clock timestamp (`time.monotonic()`) when event is emitted
-  - `dj_intent`: The DJIntent produced by THINK (read-only reference)
-  - `think_duration_ms`: Duration of THINK phase in milliseconds
-- Event **MUST** be emitted from the THINK thread (typically during `on_segment_started()` callback)
-- Event **MUST NOT** modify queue or state
-- Event **MUST NOT** rely on Tower timing or state
-- Event **MUST** be emitted after DJIntent is complete and immutable
+**MUST** log `[DJ] THINK completed: duration=<ms>ms intent_id=<uuid> is_terminal=<bool>` after THINK logic completes (before DO phase begins).
 
-### DJ4.3 — Event Emission Rules
-
-All THINK lifecycle events **MUST** follow these behavioral rules:
-
-- **Non-blocking**: Events **MUST NOT** block THINK execution or delay decision-making
-- **Observational only**: Events **MUST NOT** influence song selection, ID selection, or any THINK decisions
-- **Station-local**: Events **MUST NOT** rely on Tower timing, Tower state, or PCM write success/failure
-- **Clock A only**: Events **MUST** use Clock A (wall clock) for all timing measurements
-- **No state mutation**: Events **MUST NOT** modify queue, rotation history, or any system state
-- **Lifecycle boundaries**: Events **MUST** be emitted at the correct lifecycle boundaries (before/after THINK logic)
-- **Metadata completeness**: Events **MUST** include all required metadata fields
-- **THINK/DO separation**: Events **MUST** respect THINK/DO boundaries (events emitted during THINK, not DO)
+- **MUST** be logged exactly once per THINK cycle, after the DJIntent is committed and immutable
+- **MUST** include the THINK duration in milliseconds and the committed DJIntent's id (or `None`)
+- **MUST NOT** be logged during DO
+- **MUST NOT** block DO, modify queue or state, or rely on Tower timing or state
+- **MUST NOT** be sent to Tower
 
 ---
 

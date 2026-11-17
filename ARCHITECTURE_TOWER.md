@@ -1231,18 +1231,13 @@ Tower implements a real-time event streaming system that receives heartbeat even
 - Tower validates and stores events in a bounded, thread-safe buffer (1000 event capacity)
 - Events are immediately broadcast to all connected WebSocket clients
 
-**Event Types:**
-- `segment_started` - New audio segment (song/intro/outro/ID) has started
-- `segment_progress` - Segment playback progress updates
-- `segment_finished` - Segment has finished playing
-- `dj_think_started` - DJ has entered THINK phase
-- `dj_think_completed` - DJ has completed THINK phase
-- `station_underflow` - Station buffer underflow detected
-- `station_overflow` - Station buffer overflow detected
-- `station_starting_up` - Station is starting up
-- `station_shutting_down` - Station is shutting down
-- `now_playing` - Authoritative segment state (includes metadata: segment_type, title, artist, duration_sec, etc.)
-- `dj_talking` - DJ has started talking
+**Event Types** (the complete accepted set, `ACCEPTED_EVENT_TYPES` in `tower/http/event_buffer.py`; see `EVENT_INVENTORY.md`):
+- `station_startup` - Station has started and playout has begun
+- `station_shutdown` - Station finished terminal playout and is shutting down
+- `song_playing` - A song segment has started
+- `segment_playing` - A non-song segment (intro, outro, ID, radio drama, ...) has started
+
+Everything else is rejected (T-EVENTS1). That includes the deprecated `now_playing`, `dj_talking`, `station_starting_up` and `station_shutting_down`. THINK lifecycle and buffer health records are Station-local log lines (DJ4, OS3), not Tower events.
 
 **WebSocket Streaming:**
 - Endpoint: `/tower/events` (WebSocket upgrade)
