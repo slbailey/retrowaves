@@ -29,6 +29,16 @@ import socket
 from unittest.mock import Mock
 
 from tower.service import TowerService
+from tower.tests.contracts._tower_harness import find_free_port, wait_for_server
+
+
+def _start_service_in_background(service) -> int:
+    """TowerService.start() blocks in main_loop() forever; run it on a daemon thread
+    and wait until the HTTP endpoint answers. service.stop() ends the loop."""
+    threading.Thread(target=service.start, daemon=True, name="tower-under-test").start()
+    port = service.http_server.port
+    assert wait_for_server("127.0.0.1", port, "/tower/buffer", timeout=10.0),         f"TowerService HTTP server did not come up on port {port}"
+    return port
 
 # Import WebSocket test helpers
 from tower.tests.websocket_client import (
@@ -77,8 +87,7 @@ class TestHTTPStreamEndpoint:
         service.encoder.start()
         
         # Start HTTP server in a separate thread
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         # Start the HTTP server
@@ -227,9 +236,8 @@ class TestPCMBufferStatusEndpoint:
         """T-BUF1: Endpoint path MUST remain /tower/buffer for backward compatibility."""
         import http.client
         
-        # Start HTTP server
-        service.start()
-        test_port = 8005
+        # Start the service (start() runs the blocking main loop, as under systemd)
+        test_port = _start_service_in_background(service)
         
         try:
             conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
@@ -249,9 +257,8 @@ class TestPCMBufferStatusEndpoint:
         import http.client
         import json
         
-        # Start HTTP server
-        service.start()
-        test_port = 8005
+        # Start the service (start() runs the blocking main loop, as under systemd)
+        test_port = _start_service_in_background(service)
         
         try:
             conn = http.client.HTTPConnection("localhost", test_port, timeout=2.0)
@@ -284,9 +291,8 @@ class TestPCMBufferStatusEndpoint:
         import http.client
         import time
         
-        # Start HTTP server
-        service.start()
-        test_port = 8005
+        # Start the service (start() runs the blocking main loop, as under systemd)
+        test_port = _start_service_in_background(service)
         
         try:
             # Measure response time
@@ -312,9 +318,8 @@ class TestPCMBufferStatusEndpoint:
         import threading
         import time
         
-        # Start HTTP server
-        service.start()
-        test_port = 8005
+        # Start the service (start() runs the blocking main loop, as under systemd)
+        test_port = _start_service_in_background(service)
         
         try:
             # Concurrent requests should not block each other
@@ -1091,8 +1096,7 @@ class TestEventExposureEndpoints:
         - Events SHOULD be delivered in arrival order, but TowerRuntime MUST NOT store events for ordering enforcement
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -1150,8 +1154,7 @@ class TestEventExposureEndpoints:
         - Event delivery MUST complete quickly (< 10ms typical, < 100ms maximum)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)

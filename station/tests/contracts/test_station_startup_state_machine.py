@@ -257,6 +257,7 @@ class TestSS5_1_PrefillSuppressedDuringStartup:
             startup_path = station["config"]["asset_manager"].startup_announcements[0]
             startup_event = AudioEvent(path=startup_path, type="announcement")
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             
             # SS5.1: Pre-fill does not inject PCM frames
@@ -319,36 +320,32 @@ class TestSS3_4_StartupDoEnqueuesAtomically:
         engine = station["engine"]
         
         # Setup: Complete startup announcement
-        if station["config"]["asset_manager"].startup_announcements:
-            startup_path = station["config"]["asset_manager"].startup_announcements[0]
-            startup_event = AudioEvent(path=startup_path, type="announcement")
-            engine.queue_audio([startup_event])
-            engine.start_segment(startup_event)
-            
-            # THINK should have prepared first intent
-            # Wait for THINK to complete (in real system, this happens during announcement playback)
-            
-            # Finish announcement to trigger DO
-            engine.finish_segment(startup_event)
-            
-            # SS3.4: After first DJ DO, AudioEvents are enqueued
-            # Get all intent_ids from queue
-            intent_ids = engine._queue.get_all_intent_ids()
-            
-            if len(intent_ids) > 0:
-                # SS3.4: All enqueued AudioEvents share the same intent_id
-                first_intent_id = intent_ids[0]
-                assert all(iid == first_intent_id for iid in intent_ids), \
-                    "SS3.4: All AudioEvents enqueued in STARTUP_DO_ENQUEUE MUST share the same intent_id"
-                
-                # SS3.4: All AudioEvents have non-null intent_id
-                assert first_intent_id is not None, \
-                    "SS3.4: All AudioEvents MUST have non-null intent_id"
-                
-                # SS3.4: Queue head intent_id matches DJIntent
-                if dj.current_intent:
-                    assert engine._queue.peek_intent_id() == dj.current_intent.intent_id, \
-                        "SS3.4: Queue head intent_id MUST match DJIntent"
+        assert station["config"]["asset_manager"].startup_announcements, "fixture must provide a startup announcement"
+        startup_path = station["config"]["asset_manager"].startup_announcements[0]
+        startup_event = AudioEvent(path=startup_path, type="announcement")
+        # Like the real playout loop: the announcement is dequeued before it plays,
+        # so the queue is empty when it finishes (SS3.1).
+        engine.queue_audio([startup_event])
+        assert engine._queue.dequeue() is startup_event
+        engine.start_segment(startup_event)
+
+        # THINK (during the announcement) prepared the first intent
+        intent = dj.current_intent
+        assert intent is not None and intent.next_song is not None, \
+            "THINK during the startup announcement MUST prepare the first DJIntent"
+
+        # Finish announcement to trigger the first DO
+        engine.finish_segment(startup_event)
+
+        # SS3.4: The first DO enqueued exactly that intent, atomically
+        intent_ids = engine._queue.get_all_intent_ids()
+        assert len(intent_ids) >= 1, "SS3.4: First DO MUST enqueue the first DJIntent"
+        assert all(iid == intent.intent_id for iid in intent_ids), \
+            "SS3.4: All AudioEvents enqueued in STARTUP_DO_ENQUEUE MUST share the same intent_id"
+        assert engine._queue.peek_intent_id() == intent.intent_id, \
+            "SS3.4: Queue head intent_id MUST match DJIntent"
+        assert engine._queue.get_tail(1)[0].path == intent.next_song.path, \
+            "SS3.4: The intent's next song MUST be the last item enqueued"
 
 
 class TestSS1_5_TransitionToNormalOperation:
@@ -369,6 +366,7 @@ class TestSS1_5_TransitionToNormalOperation:
             startup_path = station["config"]["asset_manager"].startup_announcements[0]
             startup_event = AudioEvent(path=startup_path, type="announcement")
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             engine.finish_segment(startup_event)
         
@@ -407,6 +405,7 @@ class TestSS6_1_IllegalEarlyEnqueueFails:
             startup_path = station["config"]["asset_manager"].startup_announcements[0]
             startup_event = AudioEvent(path=startup_path, type="announcement")
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             
             # Try to enqueue additional AudioEvent (should fail per contract)
@@ -447,6 +446,7 @@ class TestSS2_1_StateTransitionRules:
             
             # Transition to STARTUP_ANNOUNCEMENT_PLAYING
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             
             # Transition to STARTUP_DO_ENQUEUE when announcement finishes
@@ -491,6 +491,7 @@ class TestSS3_1_QueueEmptyRequirement:
             # SS3.1: Before first DJ DO execution: queue MUST be empty (startup announcement finished)
             # After announcement finishes, queue should be empty before DO runs
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             
             # Simulate announcement finishing (removes from queue)
@@ -512,6 +513,7 @@ class TestSS6_1_AssertionRequirements:
             startup_path = station["config"]["asset_manager"].startup_announcements[0]
             startup_event = AudioEvent(path=startup_path, type="announcement")
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             
             # SS6.1.1: Before DO executes, queue should be empty (announcement finished)
@@ -542,6 +544,7 @@ class TestSS6_1_AssertionRequirements:
             startup_path = station["config"]["asset_manager"].startup_announcements[0]
             startup_event = AudioEvent(path=startup_path, type="announcement")
             engine.queue_audio([startup_event])
+            engine._queue.dequeue()  # the real playout loop dequeues before playing
             engine.start_segment(startup_event)
             engine.finish_segment(startup_event)
             

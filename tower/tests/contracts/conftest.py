@@ -44,3 +44,18 @@ def thread_leak_guard():
         thread_info = '\n'.join(f"  - {t.name} (daemon={t.daemon})" for t in leaked_threads)
         assert False, f"Thread leak detected — shutdown incomplete.\nLeaked threads:\n{thread_info}"
 
+
+
+@pytest.fixture(autouse=True)
+def isolated_tower_endpoints(monkeypatch, tmp_path):
+    """Never let a test TowerService touch the production port or PCM socket.
+
+    TowerService reads TOWER_PORT and TOWER_PCM_SOCKET_PATH at construction.
+    Their defaults (:8005, /run/retrowaves/pcm.sock) are the LIVE tower's on the
+    station VM: a test that bound them would either collide (EADDRINUSE) or,
+    run as the service user, unlink and replace the live ingest socket.
+    """
+    from tower.tests.contracts._tower_harness import find_free_port
+    monkeypatch.setenv("TOWER_HOST", "127.0.0.1")
+    monkeypatch.setenv("TOWER_PORT", str(find_free_port()))
+    monkeypatch.setenv("TOWER_PCM_SOCKET_PATH", str(tmp_path / "pcm.sock"))
