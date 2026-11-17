@@ -19,6 +19,9 @@ v2 layout (directory-categorized, per ADM1.2) — detected by `between-songs/`:
       station-ids/sequences/<name>/*.mp3            one folder == one ID, played in filename order
       lifecycle/startup/*.mp3
       lifecycle/shutdown/*.mp3
+      dramas/<series>/<Story> - Part N.mp3          radio drama episodes (see DramaStory)
+      dramas/<series>/Intro - <Story> - Part N.mp3  optional DJ lead-in for that part
+      dramas/<series>/Outro - <Story> - Part N.mp3  optional DJ lead-out for that part
       story/, archive/                              never scheduled
 
 Legacy flat layout (pre-v2):
@@ -36,6 +39,7 @@ import os
 import re
 import time
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,31 @@ _LEGACY_IGNORE = (
     re.compile(r"^CatherineScene.*", re.IGNORECASE),
     re.compile(r"^mus_radio_76_general_.*", re.IGNORECASE),
 )
+
+
+# Radio drama episode: "<Story> - Part N" (a story with no " - Part N" is a one-part story).
+_DRAMA_EPISODE = re.compile(r"^(?P<story>.+?)(?:\s+-\s+Part\s+(?P<part>\d+))?$", re.IGNORECASE)
+_DRAMA_CLIP = re.compile(r"^(?P<role>intro|outt?ro)\s+-\s+(?P<episode>.+)$", re.IGNORECASE)
+
+
+@dataclass
+class DramaPart:
+    number: int
+    path: str
+    intro: Optional[str] = None
+    outro: Optional[str] = None
+
+
+@dataclass
+class DramaStory:
+    """One story in a radio drama series; parts are numbered 1..N with no gaps."""
+    series: str
+    title: str
+    parts: List[DramaPart] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return f"{self.series}/{self.title}"
 
 
 def _mp3s(directory: Path) -> List[str]:
@@ -103,6 +132,9 @@ class AssetDiscoveryManager:
         self.startup_announcements: List[str] = []
         self.shutdown_announcements: List[str] = []
 
+        # Radio dramas: story key ("<series>/<story>") -> DramaStory
+        self.dramas: Dict[str, DramaStory] = {}
+
         self._scan()
 
     def maybe_rescan(self) -> None:
@@ -129,6 +161,7 @@ class AssetDiscoveryManager:
             "generic_ids": [],
             "startup_announcements": [],
             "shutdown_announcements": [],
+            "dramas": {},
         }
 
     def _scan(self) -> None:
@@ -187,7 +220,46 @@ class AssetDiscoveryManager:
 
         cache["startup_announcements"] = _mp3s(root / "lifecycle" / "startup")
         cache["shutdown_announcements"] = _mp3s(root / "lifecycle" / "shutdown")
+        cache["dramas"] = self._scan_dramas(root / "dramas")
         return cache
+
+    def _scan_dramas(self, dramas_root: Path) -> Dict[str, DramaStory]:
+        stories: Dict[str, DramaStory] = {}
+        if not dramas_root.is_dir():
+            return stories
+        for series_dir in sorted(p for p in dramas_root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            episodes: Dict[str, Dict[int, str]] = {}
+            clips: Dict[tuple, str] = {}
+            for path in _mp3s(series_dir):
+                stem = Path(path).stem
+                clip = _DRAMA_CLIP.match(stem)
+                if clip:
+                    role = "intro" if clip.group("role").lower() == "intro" else "outro"
+                    clips[(role, clip.group("episode").strip().lower())] = path
+                    continue
+                m = _DRAMA_EPISODE.match(stem)
+                story = m.group("story").strip()
+                part = int(m.group("part")) if m.group("part") else 1
+                episodes.setdefault(story, {})[part] = path
+            for title, by_part in sorted(episodes.items()):
+                parts: List[DramaPart] = []
+                n = 1
+                while n in by_part:
+                    episode_key = Path(by_part[n]).stem.strip().lower()
+                    parts.append(DramaPart(n, by_part[n],
+                                           intro=clips.get(("intro", episode_key)),
+                                           outro=clips.get(("outro", episode_key))))
+                    n += 1
+                extra = sorted(k for k in by_part if k >= n)
+                if not parts:
+                    logger.warning(f"[ASSET SCAN] Drama '{series_dir.name}/{title}' has no Part 1; skipping it")
+                    continue
+                if extra:
+                    logger.warning(f"[ASSET SCAN] Drama '{series_dir.name}/{title}' is missing Part {n}; "
+                                   f"Part(s) {extra} will not air")
+                story = DramaStory(series_dir.name, title, parts)
+                stories[story.key] = story
+        return stories
 
     def _scan_legacy(self) -> dict:
         root = self.dj_path
@@ -239,7 +311,8 @@ class AssetDiscoveryManager:
             f"{len(self.legal_ids)} legal IDs, "
             f"{len(self.generic_ids)} generic IDs ({sequences} sequences), "
             f"{len(self.startup_announcements)} startup announcements, "
-            f"{len(self.shutdown_announcements)} shutdown announcements."
+            f"{len(self.shutdown_announcements)} shutdown announcements, "
+            f"{len(self.dramas)} drama stories ({sum(len(d.parts) for d in self.dramas.values())} parts)."
         )
 
     # ------------------------------------------------------------------ lookups
@@ -257,6 +330,10 @@ class AssetDiscoveryManager:
     def get_generic_outros(self) -> List[str]:
         """Generic outro paths."""
         return self.generic_outros
+
+    def get_dramas(self) -> Dict[str, DramaStory]:
+        """Cached radio drama stories keyed by '<series>/<story>'."""
+        return self.dramas
 
     def get_station_ids(self, legal: bool) -> List[List[str]]:
         """Cached station IDs; each entry is an ordered list of paths (len > 1 = sequence)."""
