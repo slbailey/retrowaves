@@ -214,6 +214,12 @@ def _get_segment_metadata(segment: AudioEvent) -> Dict[str, str]:
             "segment_role": "top_of_hour",
             "production_type": "produced"
         }
+    elif segment.type == "drama":
+        return {
+            "segment_class": "radio_drama",
+            "segment_role": "standalone",
+            "production_type": "produced"
+        }
     elif segment.type == "announcement":
         # Announcements can be startup or shutdown
         # Default to system-produced standalone announcement
@@ -339,6 +345,7 @@ class PlayoutEngine:
             "outro": 10.0,      # 10 seconds
             "talk": 30.0,       # 30 seconds
             "id": 5.0,          # 5 seconds
+            "drama": 240.0,     # 4 minutes
         }
         
         # PE6: Optional PID (disabled when PCM output pump owns pacing)
@@ -517,7 +524,11 @@ class PlayoutEngine:
                             event_metadata["file_path"] = segment.path
                         if metadata.get('duration') is not None:
                             event_metadata["duration_sec"] = metadata.get('duration')
-                        
+                        # Optional drama fields (EVENT_INVENTORY.md)
+                        for key in ("series_id", "episode_id", "part_number", "total_parts"):
+                            if metadata.get(key) is not None:
+                                event_metadata[key] = metadata[key]
+
                         self._tower_control.send_event(
                             event_type="segment_playing",
                             timestamp=time.monotonic(),

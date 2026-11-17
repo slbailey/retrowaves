@@ -40,5 +40,6 @@ class DJIntent:
     outro: Optional[AudioEvent] = None        # optional
     station_ids: Optional[List[AudioEvent]] = None  # optional, 0–N IDs
     intro: Optional[AudioEvent] = None        # optional
+    drama: Optional[List[AudioEvent]] = None  # optional radio drama block: [lead-in?], part, [lead-out?]
     has_legal_id: bool = False                # metadata: True if any ID is legal (decided in THINK)
     is_terminal: bool = False                 # metadata: True if this is a terminal intent (per INT2.4)

@@ -9,6 +9,8 @@ from station.music_logic.media_library import MediaLibrary
 from station.music_logic.rotation import RotationManager
 from station.dj_logic.dj_engine import DJEngine
 from station.dj_logic.asset_discovery import AssetDiscoveryManager
+from station.dj_logic.drama_logic import DramaScheduler
+from station.broadcast_core.loudness import LoudnessIndex
 from station.broadcast_core.audio_event import AudioEvent
 from station.broadcast_core.playout_engine import _get_mp3_metadata
 from station.broadcast_core.playout_engine import PlayoutEngine
@@ -197,6 +199,21 @@ class Station:
         # Replace asset_manager with our initialized one (DJEngine creates its own, but we want to use ours)
         self.dj.asset_manager = self.asset_manager
         logger.info("DJEngine initialized")
+
+        # Radio dramas (one part per slot, progress persisted on air)
+        self.dj.drama_scheduler = DramaScheduler.from_env()
+
+        # Loudness leveling: measure everything that can air in the background,
+        # play each file at a gain that brings it to a common target
+        self.loudness = LoudnessIndex.from_env(roots=[
+            os.getenv("REGULAR_MUSIC_PATH", ""),
+            os.getenv("HOLIDAY_MUSIC_PATH", ""),
+            dj_path,
+        ])
+        if self.loudness:
+            self.dj.loudness = self.loudness
+            self.loudness.start()
+            logger.info(f"Loudness leveling enabled (target {self.loudness.target_lufs} LUFS)")
         
         # SL1.1: Load persisted DJ state (warm-start recovery)
         saved = self.state_store.load()

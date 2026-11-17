@@ -132,6 +132,11 @@ class DJEngine:
         # Phase 9: Asset Discovery Manager for intros/outros
         self.asset_manager = AssetDiscoveryManager(self.dj_asset_path)
         
+        # Radio dramas (DramaScheduler) and loudness leveling (LoudnessIndex).
+        # Both are wired in by Station; None disables the feature.
+        self.drama_scheduler = None
+        self.loudness = None
+
         # Lifecycle state (set by Station, observed during THINK)
         self._is_startup = False  # True during initial startup THINK
         self._is_draining = False  # True when Station is in DRAINING state
@@ -202,6 +207,7 @@ class DJEngine:
             segment: The AudioEvent that just started playing
         """
         logger.info(f"[DJ] THINK Phase: Segment started - {segment.type} - {segment.path}")
+        self._note_segment_started(segment)
         
         # Check for shutdown state (per DJ2.5, E1.2)
         if self._is_draining:
@@ -327,9 +333,18 @@ class DJEngine:
         # D. Next: intro logic
         # If next song is upbeat or DJ hasn't used an intro recently
         should_use_intro = self._should_use_intro()
-        
+
+        # E. Radio drama slot. The drama brings its own lead-in/lead-out, so the
+        # break drops song talk, the song intro and generic IDs (a legal ID still airs).
+        drama_pick = self._plan_drama()
+        if drama_pick:
+            should_talk = False
+            needs_generic_id = False
+            should_use_intro = False
+
         logger.info(f"[DJ] THINK: Break plan - talk={should_talk}, legal_id={needs_legal_id}, "
-                   f"generic_id={needs_generic_id}, intro={should_use_intro}")
+                   f"generic_id={needs_generic_id}, intro={should_use_intro}, "
+                   f"drama={drama_pick[0].key + ' part ' + str(drama_pick[1].number) if drama_pick else None}")
         
         # 4. Select concrete MP3 files
         logger.info("[DJ] THINK: Selecting concrete MP3 files...")
@@ -389,14 +404,18 @@ class DJEngine:
             elif intro_path:
                 logger.warning(f"[DJ] THINK: Intro file does not exist, skipping - {intro_path}")
         
+        # Build the drama block: [lead-in?] -> part -> [lead-out?]
+        drama: Optional[list[AudioEvent]] = self._build_drama_events(*drama_pick) if drama_pick else None
+
         # 5. Validate asset availability - file existence checks done above
-        
+
         # 6. Commit intent (all decisions made, all files validated)
         self.current_intent = DJIntent(
             next_song=next_song,
             outro=outro,
             station_ids=station_ids,
             intro=intro,
+            drama=drama,
             has_legal_id=has_legal_id  # Metadata: whether any ID is legal (decided in THINK)
         )
         
@@ -411,9 +430,16 @@ class DJEngine:
                 sid.intent_id = intent_id
         if intro:
             intro.intent_id = intent_id
-        
+        for ev in drama or []:
+            ev.intent_id = intent_id
+
+        # Make sure everything in this break is loudness-measured before it airs
+        if self.loudness:
+            self.loudness.request(ev.path for ev in [outro, *(drama or []), *(station_ids or []), intro, next_song]
+                                  if ev is not None and ev.path)
+
         logger.info(f"[DJ] THINK: DJIntent committed - intent_id={intent_id}, "
-                   f"outro={outro is not None}, ids={len(station_ids) if station_ids else 0}, "
+                   f"outro={outro is not None}, drama={len(drama) if drama else 0}, ids={len(station_ids) if station_ids else 0}, "
                    f"intro={intro is not None}, song={next_song.path if next_song else None}")
         
         # DJ4.2: Emit dj_think_completed event after THINK logic completes (Station-local only)
@@ -572,7 +598,14 @@ class DJEngine:
                     event.intent_id = intent_id
                 queue_order.append(event)
                 logger.info(f"[DJ] DO: Queueing outro - {self.current_intent.outro.path}")
-            
+
+            if self.current_intent.drama:
+                for event in self.current_intent.drama:
+                    if event.intent_id is None:
+                        event.intent_id = intent_id
+                    queue_order.append(event)
+                    logger.info(f"[DJ] DO: Queueing drama {event.type} - {event.path}")
+
             if self.current_intent.station_ids:
                 for sid in self.current_intent.station_ids:
                     if sid.intent_id is None:
@@ -639,6 +672,12 @@ class DJEngine:
                     else:
                         logger.debug(f"[DJ] DO: Queue head matches current intent_id={intent_id} (acceptable)")
         
+        # Loudness leveling: dict lookups only, no filesystem access
+        if self.loudness:
+            for event in queue_order:
+                if event.path:
+                    event.gain = self.loudness.gain_for(event.path)
+
         # Push to playout queue
         if self.playout_engine:
             # SS3.4: All AudioEvents enqueued in STARTUP_DO_ENQUEUE MUST share the same intent_id
@@ -733,6 +772,57 @@ class DJEngine:
         # DJIntent does not need to persist (transient)
         logger.info("[DJ] Station shutdown complete")
     
+    # ------------------------------------------------------------------ radio dramas
+
+    def _note_segment_started(self, segment: AudioEvent) -> None:
+        """Drama bookkeeping happens when audio actually starts, not when it's queued,
+        so a shutdown between queueing and airing can never skip a part."""
+        if not self.drama_scheduler:
+            return
+        try:
+            if segment.type == "song" and segment.path:
+                self.drama_scheduler.record_song()
+            elif segment.type == "drama":
+                md = segment.metadata or {}
+                self.drama_scheduler.mark_aired(md["drama_story_key"], int(md["part_number"]), int(md["total_parts"]))
+        except Exception as e:
+            logger.error(f"[DJ] Drama bookkeeping failed for {segment.path}: {e}", exc_info=True)
+
+    def _plan_drama(self):
+        """(story, part) if this break should be a drama slot, else None."""
+        if not self.drama_scheduler or not self.drama_scheduler.is_due():
+            return None
+        get_dramas = getattr(self.asset_manager, "get_dramas", None)
+        stories = get_dramas() if get_dramas else {}
+        pick = self.drama_scheduler.pick(stories)
+        if pick and not os.path.exists(pick[1].path):
+            logger.warning(f"[DJ] THINK: Drama file does not exist, skipping slot - {pick[1].path}")
+            return None
+        return pick
+
+    def _build_drama_events(self, story, part) -> list[AudioEvent]:
+        info = {
+            "series_id": story.series,
+            "episode_id": story.title,
+            "part_number": part.number,
+            "total_parts": len(story.parts),
+        }
+        events: list[AudioEvent] = []
+        if part.intro and os.path.exists(part.intro):
+            events.append(AudioEvent(path=part.intro, type="intro", metadata={
+                "segment_class": "dj_talk", "segment_role": "intro", "production_type": "voice_tracked",
+                "file_path": part.intro, **info}))
+        events.append(AudioEvent(path=part.path, type="drama", metadata={
+            "segment_class": "radio_drama", "segment_role": "standalone", "production_type": "produced",
+            "file_path": part.path, "drama_story_key": story.key, **info}))
+        if part.outro and os.path.exists(part.outro):
+            events.append(AudioEvent(path=part.outro, type="outro", metadata={
+                "segment_class": "dj_talk", "segment_role": "outro", "production_type": "voice_tracked",
+                "file_path": part.outro, **info}))
+        logger.info(f"[DJ] THINK: Selected drama - {story.key} part {part.number}/{len(story.parts)} "
+                    f"(lead-in={part.intro is not None}, lead-out={part.outro is not None})")
+        return events
+
     def get_current_intent(self) -> Optional[DJIntent]:
         """
         Get the current DJIntent (for debugging/testing).

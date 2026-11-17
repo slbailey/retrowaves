@@ -31,7 +31,7 @@ class AudioEvent:
         intent_id: UUID of the DJIntent that created this AudioEvent (for atomic execution tracking)
     """
     path: str
-    type: Literal["song", "intro", "outro", "talk", "id", "announcement"]
+    type: Literal["song", "intro", "outro", "talk", "id", "announcement", "drama"]
     gain: float = 1.0
     metadata: Optional[Dict[str, Any]] = field(default=None)
     is_terminal: bool = False
