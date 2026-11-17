@@ -137,25 +137,21 @@ The following fields **MAY** be included but are not required:
 
 ---
 
-## THINK/DO Events
+## Station-local Observability (not sent to Tower)
 
-The following events are emitted during THINK/DO lifecycle phases (see `MASTER_SYSTEM_CONTRACT.md`):
+THINK lifecycle and buffer health transitions were Tower events before Phase 3
+(segment_playing architecture). They are now **written to the station log only**.
+Station **MUST NOT** send them to Tower, and Tower rejects them (T-EVENTS1), because
+they are not in the accepted set above.
 
-| Event Name | Authority | Emitter | When It Fires | Metadata | Idempotency |
-|------------|-----------|---------|---------------|----------|-------------|
-| `dj_think_started` | Station | DJEngine | Before THINK logic begins (`on_segment_started` callback) | `{current_segment}` | Idempotent-safe: may be re-emitted on restart |
-| `dj_think_completed` | Station | DJEngine | After THINK logic completes (before DO phase) | `{think_duration_ms, dj_intent?}` | Idempotent-safe: may be re-emitted on restart |
+| Record | Emitter | Log line | Contract |
+|--------|---------|----------|----------|
+| THINK started | DJEngine | `[DJ] THINK started: segment=<type> path=<path>` | DJ4.1 |
+| THINK completed | DJEngine | `[DJ] THINK completed: duration=<ms>ms intent_id=<uuid> is_terminal=<bool>` | DJ4.2 |
+| Station underflow | OutputSink (TowerPCMSink) | `[BUFFER] Underflow detected: buffer_depth=0 frames_dropped=<n>` | OS3.1 |
+| Station overflow | OutputSink (TowerPCMSink) | `[BUFFER] Overflow detected: buffer_depth=<n> frames_dropped=<n>` | OS3.2 |
 
----
-
-## Buffer Health Events
-
-The following events are emitted when buffer conditions are detected (see `OUTPUT_SINK_CONTRACT.md`):
-
-| Event Name | Authority | Emitter | When It Fires | Metadata | Idempotency |
-|------------|-----------|---------|---------------|----------|-------------|
-| `station_underflow` | Station | OutputSink (TowerPCMSink) | When buffer depth transitions from non-zero to zero (checked periodically during frame writes) | `{buffer_depth, frames_dropped}` | Idempotent-safe: may be re-emitted on restart |
-| `station_overflow` | Station | OutputSink (TowerPCMSink) | When buffer depth transitions to capacity/overflow condition (checked periodically during frame writes) | `{buffer_depth, frames_dropped}` | Idempotent-safe: may be re-emitted on restart |
+Tower's own buffer state is available on `GET /tower/health` (see `HEALTH_API.md`).
 
 ---
 
@@ -210,8 +206,7 @@ The following events are emitted when buffer conditions are detected (see `OUTPU
 
 1. **Station Lifecycle Events**: `station_startup` → (playout) → `station_shutdown`
 2. **Content Events**: `song_playing` (when song segments start), `segment_playing` (when non-song segments start)
-3. **THINK/DO Events**: `dj_think_started` → (THINK logic) → `dj_think_completed` → (DO phase)
-4. **Buffer Health Events**: `station_underflow`, `station_overflow` (when buffer conditions detected)
+3. **Station-local only (log, not Tower events)**: THINK started → (THINK logic) → THINK completed → (DO phase); buffer underflow/overflow
 
 **Note:** Events represent edge-triggered transitions only. Current state must be queried via Station State Contract. No event implies absence of state; query state to determine current truth.
 

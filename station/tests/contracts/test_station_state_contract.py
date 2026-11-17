@@ -20,29 +20,86 @@ import os
 from typing import Optional, Dict, Any
 
 
-# Helper to check if Station HTTP server is available for integration tests
-def _station_server_available() -> bool:
-    """Check if Station HTTP server is running or integration tests are enabled via env var."""
-    # Check for explicit integration test flag
-    if os.getenv("STATION_INTEGRATION_TESTS", "").lower() in ("1", "true", "yes"):
-        return True
-    
-    # Try to connect to Station HTTP server
-    try:
-        conn = http.client.HTTPConnection("localhost", 8000, timeout=0.5)
-        conn.request("GET", "/station/state")
-        response = conn.getresponse()
-        conn.close()
-        return response.status in (200, 404)  # Server is running if we get any HTTP response
-    except (ConnectionRefusedError, OSError, TimeoutError):
-        return False
+# These tests exercise the REAL /station/state handler (station.app.http_server)
+# backed by a REAL StationStateManager, served in-process on an ephemeral port.
+# They used to query whatever answered on localhost:8000: on the station VM
+# that is the live, on-air station (which can never be STARTING_UP / SHUTTING_DOWN
+# / ERROR mid-song), and on a dev box nothing, so they could only fail.
+# Each test gets the station state it needs via STATE_FOR_TEST below.
+
+import threading
+from http.server import ThreadingHTTPServer
+
+from station.app import http_server
+from station.broadcast_core.audio_event import AudioEvent
+from station.state.station_state import StationStateManager
+
+_SERVER = {}
 
 
-# Skip integration tests unless Station is running or env flag is set
-skip_if_no_station = pytest.mark.skipif(
-    not _station_server_available(),
-    reason="Station HTTP server not available. Set STATION_INTEGRATION_TESTS=1 to enable or start Station."
-)
+def _song():
+    return AudioEvent(path="/music/regular/Ink Spots - Maybe.mp3", type="song",
+                      metadata={"title": "Maybe", "artist": "Ink Spots", "duration": 185.0})
+
+
+def _intro():
+    return AudioEvent(path="/julie/between-songs/Ink Spots - Maybe/Intro - x.mp3", type="intro",
+                      metadata={"segment_class": "dj_talk", "segment_role": "intro",
+                                "production_type": "voice_tracked"})
+
+
+def _announcement():
+    return AudioEvent(path="/julie/lifecycle/startup/StationOnline1.mp3", type="announcement")
+
+
+# test-name prefix -> how to put the StationStateManager into the needed state
+STATE_FOR_TEST = {
+    "test_a3": lambda m: m.on_startup(_announcement()),
+    "test_a6": lambda m: m.on_shutdown(_announcement()),
+    "test_b3": lambda m: m.on_startup(_announcement()),
+    "test_b4": lambda m: m.on_shutdown(_announcement()),
+    "test_b5": lambda m: m.on_error(),
+    "test_b2_": lambda m: m.on_segment_started(_intro()),
+}
+
+
+def _default_state(m):
+    m.on_startup(_announcement())
+    m.on_segment_started(_song())
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _station_http_server():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), http_server.HTTPStreamingHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    _SERVER["port"] = httpd.server_address[1]
+    previous = http_server._station_state_manager
+    yield
+    http_server.set_station_state_manager(previous)
+    httpd.shutdown()
+    httpd.server_close()
+
+
+@pytest.fixture(autouse=True)
+def station_state_manager(request):
+    manager = StationStateManager()
+    for prefix, setup in STATE_FOR_TEST.items():
+        if request.node.name.startswith(prefix):
+            setup(manager)
+            break
+    else:
+        _default_state(manager)
+    http_server.set_station_state_manager(manager)
+    return manager
+
+
+def _station_conn(timeout=1.0):
+    return http.client.HTTPConnection("127.0.0.1", _SERVER["port"], timeout=timeout)
+
+
+def skip_if_no_station(fn):  # kept so the decorators below stay valid; the server always exists now
+    return fn
 
 
 # ============================================================================
@@ -68,7 +125,7 @@ class TestA_StationStateQuery:
         """
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -102,7 +159,7 @@ class TestA_StationStateQuery:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -135,7 +192,7 @@ class TestA_StationStateQuery:
         
         try:
             # Query state immediately (simulating right after startup)
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -169,7 +226,7 @@ class TestA_StationStateQuery:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -204,7 +261,7 @@ class TestA_StationStateQuery:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -232,7 +289,7 @@ class TestA_StationStateQuery:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -283,7 +340,7 @@ class TestA_StationStateQuery:
         
         try:
             start = time.perf_counter()
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=0.1)
+            conn = _station_conn(timeout=0.1)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             response.read()
@@ -319,7 +376,7 @@ class TestB_ContentPlaneInvariant:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -358,7 +415,7 @@ class TestB_ContentPlaneInvariant:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -392,7 +449,7 @@ class TestB_ContentPlaneInvariant:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -426,7 +483,7 @@ class TestB_ContentPlaneInvariant:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -461,7 +518,7 @@ class TestB_ContentPlaneInvariant:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -516,7 +573,7 @@ class TestB2_NonSongSegmentState:
         # Expected failure: 404 Not Found or segment_type not "segment" for non-song segments
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -560,7 +617,7 @@ class TestB2_NonSongSegmentState:
         # NOTE: This test will FAIL until Phase 3 implementation
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -600,7 +657,7 @@ class TestB2_NonSongSegmentState:
         # NOTE: This test will FAIL until Phase 3 implementation
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -639,7 +696,7 @@ class TestB2_NonSongSegmentState:
         # NOTE: This test will FAIL until Phase 3 implementation
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -681,7 +738,7 @@ class TestB2_NonSongSegmentState:
         # (In a real scenario, we would emit segment_playing and then query state)
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -721,7 +778,7 @@ class TestB2_NonSongSegmentState:
         # NOTE: This test will FAIL until Phase 3 implementation
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -768,7 +825,7 @@ class TestC_MonotonicVsWallClock:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -809,7 +866,7 @@ class TestC_MonotonicVsWallClock:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -850,7 +907,7 @@ class TestC_MonotonicVsWallClock:
         
         try:
             # Query state twice (simulating state transition)
-            conn1 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn1 = _station_conn(timeout=1.0)
             conn1.request("GET", "/station/state")
             response1 = conn1.getresponse()
             data1 = json.loads(response1.read().decode('utf-8'))
@@ -859,7 +916,7 @@ class TestC_MonotonicVsWallClock:
             
             time.sleep(0.1)  # Small delay
             
-            conn2 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn2 = _station_conn(timeout=1.0)
             conn2.request("GET", "/station/state")
             response2 = conn2.getresponse()
             data2 = json.loads(response2.read().decode('utf-8'))
@@ -894,7 +951,7 @@ class TestC_MonotonicVsWallClock:
         # Expected failure: 404 Not Found or connection refused
         
         try:
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             
@@ -949,7 +1006,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state before event emission
-            conn1 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn1 = _station_conn(timeout=1.0)
             conn1.request("GET", "/station/state")
             response1 = conn1.getresponse()
             state_before = json.loads(response1.read().decode('utf-8'))
@@ -961,7 +1018,7 @@ class TestD_EventNonAuthority:
             
             # Query state after event emission
             time.sleep(0.1)
-            conn2 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn2 = _station_conn(timeout=1.0)
             conn2.request("GET", "/station/state")
             response2 = conn2.getresponse()
             state_after = json.loads(response2.read().decode('utf-8'))
@@ -999,7 +1056,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             state = json.loads(response.read().decode('utf-8'))
@@ -1030,7 +1087,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state (simulating missing events scenario)
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             state = json.loads(response.read().decode('utf-8'))
@@ -1060,7 +1117,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state without event history
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             state = json.loads(response.read().decode('utf-8'))
@@ -1093,7 +1150,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state multiple times
-            conn1 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn1 = _station_conn(timeout=1.0)
             conn1.request("GET", "/station/state")
             response1 = conn1.getresponse()
             state1 = json.loads(response1.read().decode('utf-8'))
@@ -1101,7 +1158,7 @@ class TestD_EventNonAuthority:
             
             time.sleep(0.1)
             
-            conn2 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn2 = _station_conn(timeout=1.0)
             conn2.request("GET", "/station/state")
             response2 = conn2.getresponse()
             state2 = json.loads(response2.read().decode('utf-8'))
@@ -1135,7 +1192,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             state = json.loads(response.read().decode('utf-8'))
@@ -1169,7 +1226,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state
-            conn = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn = _station_conn(timeout=1.0)
             conn.request("GET", "/station/state")
             response = conn.getresponse()
             state = json.loads(response.read().decode('utf-8'))
@@ -1201,7 +1258,7 @@ class TestD_EventNonAuthority:
         
         try:
             # Query state before event emission
-            conn1 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn1 = _station_conn(timeout=1.0)
             conn1.request("GET", "/station/state")
             response1 = conn1.getresponse()
             state_before = json.loads(response1.read().decode('utf-8'))
@@ -1212,7 +1269,7 @@ class TestD_EventNonAuthority:
             
             # Query state after event emission
             time.sleep(0.1)
-            conn2 = http.client.HTTPConnection("localhost", 8000, timeout=1.0)
+            conn2 = _station_conn(timeout=1.0)
             conn2.request("GET", "/station/state")
             response2 = conn2.getresponse()
             state_after = json.loads(response2.read().decode('utf-8'))

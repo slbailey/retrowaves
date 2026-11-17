@@ -22,6 +22,7 @@ import json
 import threading
 
 from tower.service import TowerService
+from tower.tests.contracts._tower_harness import find_free_port
 
 
 class TestE_ForbiddenEventRejection:
@@ -52,8 +53,7 @@ class TestE_ForbiddenEventRejection:
         - Tower MUST reject with validation error
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -103,8 +103,7 @@ class TestE_ForbiddenEventRejection:
         - New event type is station_startup (without "_ing")
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -149,8 +148,7 @@ class TestE_ForbiddenEventRejection:
         - New event type is station_shutdown (without "_ing")
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -195,8 +193,7 @@ class TestE_ForbiddenEventRejection:
         - Use segment_playing with segment_class="dj_talk" instead
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -240,8 +237,7 @@ class TestE_ForbiddenEventRejection:
         - Any other event type MUST be rejected
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -284,8 +280,7 @@ class TestE_ForbiddenEventRejection:
         - station_startup is the new accepted event type (replaces station_starting_up)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -329,8 +324,7 @@ class TestE_ForbiddenEventRejection:
         - station_shutdown is the new accepted event type (replaces station_shutting_down)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -373,8 +367,7 @@ class TestE_ForbiddenEventRejection:
         - song_playing is the new accepted event type (replaces now_playing)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -424,8 +417,7 @@ class TestE_ForbiddenEventRejection:
         - segment_playing MUST include required metadata: segment_class, segment_role, production_type
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -480,8 +472,7 @@ class TestE_ForbiddenEventRejection:
         - Missing segment_class MUST be rejected (by Station, not Tower)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -536,8 +527,7 @@ class TestE_ForbiddenEventRejection:
         - Missing segment_role MUST be rejected (by Station, not Tower)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -591,8 +581,7 @@ class TestE_ForbiddenEventRejection:
         - Missing production_type MUST be rejected (by Station, not Tower)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)
@@ -647,8 +636,7 @@ class TestE_ForbiddenEventRejection:
         - However, Tower does not validate metadata content (Station enforces this)
         """
         # Start HTTP server
-        import random
-        test_port = random.randint(8001, 9000)
+        test_port = find_free_port()
         service.http_server.port = test_port
         
         server_thread = threading.Thread(target=service.http_server.serve_forever, daemon=True)

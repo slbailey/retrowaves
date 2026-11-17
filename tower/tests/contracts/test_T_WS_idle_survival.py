@@ -21,8 +21,9 @@ import subprocess
 import sys
 import os
 import socket
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from tests.contracts._tower_harness import start_tower
+# (was: sys.path.insert(<repo>/tower) — that put tower/http ahead of stdlib http
+#  and broke `import http.client` in every module collected afterwards)
+from tower.tests.contracts._tower_harness import start_tower
 from tower.tests.websocket_client import (
     create_websocket_upgrade_request,
     read_websocket_response,

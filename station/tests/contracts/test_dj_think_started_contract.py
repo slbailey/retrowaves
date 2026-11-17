@@ -1,193 +1,121 @@
 """
-Contract tests for DJ4.1 — dj_think_started event emission
+Contract tests for DJ4.1 / DJ4.2 — THINK started / completed events (Station-local)
 
 See docs/contracts/DJ_ENGINE_CONTRACT.md
 
-Tests map directly to contract clause DJ4.1:
-- Test 1: Event is emitted when THINK phase begins
-- Test 2: Event is emitted exactly once per THINK cycle
-- Test 3: Event is emitted before DO phase begins
-- Test 4: Event metadata includes current_segment
-- Test 5: Event does NOT persist state or emit a clear event
+Since Phase 3 (segment_playing architecture) the THINK lifecycle events are
+Station-local observability: they are written to the station log, and are
+NOT sent to Tower (Tower accepts only the four events in EVENT_INVENTORY.md
+and rejects anything else).
+
+Tests:
+- DJ4.1: "THINK started" logged exactly once per THINK cycle, with the
+  current segment's type and path, before THINK logic runs
+- DJ4.2: "THINK completed" logged exactly once per THINK cycle, after
+  "THINK started", with think duration (ms) and the DJIntent id
+- Neither is logged for non-song segments (no THINK runs) or during DO
+- Neither is ever sent to Tower; THINK sends nothing to Tower at all
 """
 
+import logging
+import re
+
 import pytest
-import time
-from unittest.mock import Mock, call
 
 from station.dj_logic.dj_engine import DJEngine
-from station.tests.contracts.test_doubles import (
-    FakeRotationManager,
-    FakeAssetDiscoveryManager,
-    create_fake_audio_event,
-)
+from station.tests.contracts.test_doubles import create_fake_audio_event
+
+DJ_LOGGER = "station.dj_logic.dj_engine"
+STARTED = re.compile(r"\[DJ\] THINK started(?: \(\w+\))?: segment=(\S+) path=(.*)$")
+COMPLETED = re.compile(r"\[DJ\] THINK completed(?: \(\w+\))?: duration=([\d.]+)ms intent_id=(\S+) is_terminal=(\S+)$")
 
 
-class TestDJ4_1_ThinkStartedEvent:
-    """Tests for DJ4.1 — THINK Started Event."""
-    
-    def test_dj4_1_event_emitted_when_think_phase_begins(self, fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
-        """DJ4.1: Event MUST be emitted when THINK phase begins."""
-        engine = DJEngine(
-            playout_engine=None,
-            rotation_manager=fake_rotation_manager,
-            dj_asset_path="/fake/dj_path",
-            tower_control=mock_tower_control
-        )
-        engine.asset_manager = fake_asset_discovery_manager
-        
-        segment = create_fake_audio_event("/fake/current.mp3", "song")
-        
-        # Trigger THINK phase
-        engine.on_segment_started(segment)
-        
-        # Contract DJ4.1: Event MUST be emitted when THINK phase begins
-        assert mock_tower_control.send_event.called, "dj_think_started event must be emitted when THINK phase begins"
-        
-        # Verify event type
-        calls = [c for c in mock_tower_control.send_event.call_args_list 
-                if c[1].get("event_type") == "dj_think_started"]
-        assert len(calls) >= 1, "dj_think_started event must be emitted"
-    
-    def test_dj4_1_event_emitted_exactly_once_per_think_cycle(self, fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
-        """DJ4.1: Event MUST be emitted exactly once per THINK cycle."""
-        engine = DJEngine(
-            playout_engine=None,
-            rotation_manager=fake_rotation_manager,
-            dj_asset_path="/fake/dj_path",
-            tower_control=mock_tower_control
-        )
-        engine.asset_manager = fake_asset_discovery_manager
-        
-        segment1 = create_fake_audio_event("/fake/song1.mp3", "song")
-        segment2 = create_fake_audio_event("/fake/song2.mp3", "song")
-        
-        # First THINK cycle
-        mock_tower_control.reset_mock()
-        engine.on_segment_started(segment1)
-        
-        # Count dj_think_started events
-        think_started_calls = [c for c in mock_tower_control.send_event.call_args_list 
-                              if c[1].get("event_type") == "dj_think_started"]
-        assert len(think_started_calls) == 1, "dj_think_started must be emitted exactly once per THINK cycle"
-        
-        # Second THINK cycle
-        mock_tower_control.reset_mock()
-        engine.on_segment_started(segment2)
-        
-        # Count dj_think_started events in second cycle
-        think_started_calls = [c for c in mock_tower_control.send_event.call_args_list 
-                              if c[1].get("event_type") == "dj_think_started"]
-        assert len(think_started_calls) == 1, "dj_think_started must be emitted exactly once per THINK cycle"
-    
-    def test_dj4_1_event_emitted_before_do_phase_begins(self, fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
-        """DJ4.1: Event MUST be emitted before DO phase begins (i.e., before dj_think_completed)."""
-        engine = DJEngine(
-            playout_engine=None,
-            rotation_manager=fake_rotation_manager,
-            dj_asset_path="/fake/dj_path",
-            tower_control=mock_tower_control
-        )
-        engine.asset_manager = fake_asset_discovery_manager
-        
-        segment = create_fake_audio_event("/fake/current.mp3", "song")
-        
-        # Trigger THINK phase
-        engine.on_segment_started(segment)
-        
-        # Contract DJ4.1: Event MUST be emitted before THINK completes (before DO phase)
-        # Contract DJ4.2: dj_think_completed is emitted after THINK logic completes
-        # Therefore, dj_think_started must come before dj_think_completed
-        
-        all_calls = mock_tower_control.send_event.call_args_list
-        think_started_index = None
-        think_completed_index = None
-        
-        for i, call_args in enumerate(all_calls):
-            event_type = call_args[1].get("event_type")
-            if event_type == "dj_think_started":
-                think_started_index = i
-            elif event_type == "dj_think_completed":
-                think_completed_index = i
-        
-        assert think_started_index is not None, "dj_think_started must be emitted"
-        assert think_completed_index is not None, "dj_think_completed must be emitted (to verify ordering)"
-        assert think_started_index < think_completed_index, "dj_think_started must be emitted before dj_think_completed (i.e., before DO phase)"
-    
-    def test_dj4_1_event_metadata_includes_current_segment(self, fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
-        """DJ4.1: Event metadata MUST include current_segment."""
-        engine = DJEngine(
-            playout_engine=None,
-            rotation_manager=fake_rotation_manager,
-            dj_asset_path="/fake/dj_path",
-            tower_control=mock_tower_control
-        )
-        engine.asset_manager = fake_asset_discovery_manager
-        
-        segment = create_fake_audio_event("/fake/test_song.mp3", "song")
-        
-        # Trigger THINK phase
-        engine.on_segment_started(segment)
-        
-        # Contract DJ4.1: Event metadata MUST include current_segment
-        think_started_calls = [c for c in mock_tower_control.send_event.call_args_list 
-                              if c[1].get("event_type") == "dj_think_started"]
-        assert len(think_started_calls) >= 1, "dj_think_started event must be emitted"
-        
-        call_args = think_started_calls[0]
-        metadata = call_args[1].get("metadata", {})
-        
-        assert "current_segment" in metadata, "Event metadata must include current_segment"
-        current_segment = metadata["current_segment"]
-        assert isinstance(current_segment, dict), "current_segment must be a dictionary"
-        assert "type" in current_segment, "current_segment must include type"
-        assert "path" in current_segment, "current_segment must include path"
-        assert current_segment["type"] == segment.type, "current_segment.type must match segment type"
-        assert current_segment["path"] == segment.path, "current_segment.path must match segment path"
-        
-        # Contract DJ4.1: Event MUST include timestamp
-        assert "timestamp" in call_args[1], "Event must include timestamp"
-        timestamp = call_args[1]["timestamp"]
-        assert isinstance(timestamp, float), "Timestamp must be float (time.monotonic())"
-        assert timestamp > 0, "Timestamp must be valid"
-    
-    def test_dj4_1_event_does_not_persist_state_or_emit_clear_event(self, fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
-        """DJ4.1: Event MUST NOT persist state or emit a clear event."""
-        engine = DJEngine(
-            playout_engine=None,
-            rotation_manager=fake_rotation_manager,
-            dj_asset_path="/fake/dj_path",
-            tower_control=mock_tower_control
-        )
-        engine.asset_manager = fake_asset_discovery_manager
-        
-        segment = create_fake_audio_event("/fake/current.mp3", "song")
-        
-        # Capture initial state
-        initial_intent = engine.current_intent
-        
-        # Trigger THINK phase
-        engine.on_segment_started(segment)
-        
-        # Contract DJ4.1: Event MUST NOT modify queue or state
-        # Event emission should not change engine state beyond normal THINK operations
-        # We verify that only expected events are emitted (no "clear" or state persistence events)
-        
-        all_calls = mock_tower_control.send_event.call_args_list
-        event_types = [c[1].get("event_type") for c in all_calls]
-        
-        # Contract DJ4.1: Event MUST NOT emit clear events or state persistence events
-        # Only lifecycle events (dj_think_started, dj_think_completed) should be emitted
-        allowed_event_types = {"dj_think_started", "dj_think_completed"}
-        for event_type in event_types:
-            assert event_type in allowed_event_types, \
-                f"dj_think_started must not trigger unexpected events like '{event_type}'"
-        
-        # Verify no "clear" events
-        clear_events = [et for et in event_types if "clear" in et.lower()]
-        assert len(clear_events) == 0, "dj_think_started must not emit clear events"
-        
-        # State changes are allowed as part of normal THINK (creating intent), but
-        # the event itself must not trigger additional state persistence events
-        # The intent creation is part of THINK logic, not the event emission
+@pytest.fixture
+def dj_log(caplog):
+    """Capture the DJ logger directly (it may not propagate to root)."""
+    lg = logging.getLogger(DJ_LOGGER)
+    attach = not lg.propagate  # the module drops propagation when its file log opens
+    if attach:
+        lg.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG, logger=DJ_LOGGER)
+    yield caplog
+    if attach:
+        lg.removeHandler(caplog.handler)
 
+
+@pytest.fixture
+def engine(fake_rotation_manager, fake_asset_discovery_manager, mock_tower_control):
+    e = DJEngine(playout_engine=None, rotation_manager=fake_rotation_manager,
+                 dj_asset_path="/fake/dj_path", tower_control=mock_tower_control)
+    e.asset_manager = fake_asset_discovery_manager
+    return e
+
+
+def messages(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def matches(caplog, pattern):
+    return [m for m in (pattern.search(msg) for msg in messages(caplog)) if m]
+
+
+class TestDJ4_1_ThinkStarted:
+    def test_dj4_1_logged_once_per_think_cycle(self, engine, dj_log):
+        for path in ("/fake/song1.mp3", "/fake/song2.mp3"):
+            dj_log.clear()
+            engine.on_segment_started(create_fake_audio_event(path, "song"))
+            found = matches(dj_log, STARTED)
+            assert len(found) == 1
+            assert found[0].group(1) == "song" and found[0].group(2) == path
+
+    def test_dj4_1_logged_before_think_logic(self, engine, dj_log):
+        engine.on_segment_started(create_fake_audio_event("/fake/current.mp3", "song"))
+        msgs = messages(dj_log)
+        started = next(i for i, m in enumerate(msgs) if STARTED.search(m))
+        decide = next(i for i, m in enumerate(msgs) if "Deciding break structure" in m)
+        assert started < decide
+
+
+class TestDJ4_2_ThinkCompleted:
+    def test_dj4_2_logged_once_after_started(self, engine, dj_log):
+        engine.on_segment_started(create_fake_audio_event("/fake/current.mp3", "song"))
+        msgs = messages(dj_log)
+        started = [i for i, m in enumerate(msgs) if STARTED.search(m)]
+        completed = [i for i, m in enumerate(msgs) if COMPLETED.search(m)]
+        assert len(started) == 1 and len(completed) == 1
+        assert started[0] < completed[0]
+
+    def test_dj4_2_includes_duration_and_intent_id(self, engine, dj_log):
+        engine.on_segment_started(create_fake_audio_event("/fake/current.mp3", "song"))
+        (m,) = matches(dj_log, COMPLETED)
+        assert float(m.group(1)) >= 0
+        assert engine.current_intent is not None
+        assert m.group(2) == str(engine.current_intent.intent_id)
+        assert m.group(3) == "False"
+
+    def test_dj4_2_logged_after_intent_committed(self, engine, dj_log):
+        engine.on_segment_started(create_fake_audio_event("/fake/current.mp3", "song"))
+        msgs = messages(dj_log)
+        committed = next(i for i, m in enumerate(msgs) if "DJIntent committed" in m)
+        completed = next(i for i, m in enumerate(msgs) if COMPLETED.search(m))
+        assert committed < completed
+
+
+class TestDJ4_StationLocalOnly:
+    def test_dj4_no_think_for_non_song_segments(self, engine, dj_log):
+        for kind in ("intro", "outro", "id"):
+            engine.on_segment_started(create_fake_audio_event(f"/fake/{kind}.mp3", kind))
+        assert not matches(dj_log, STARTED) and not matches(dj_log, COMPLETED)
+
+    def test_dj4_not_logged_during_do(self, engine, dj_log):
+        segment = create_fake_audio_event("/fake/current.mp3", "song")
+        engine.on_segment_started(segment)
+        dj_log.clear()
+        engine.on_segment_finished(segment)
+        assert not matches(dj_log, STARTED) and not matches(dj_log, COMPLETED)
+
+    def test_dj4_never_sent_to_tower(self, engine, mock_tower_control):
+        engine.on_segment_started(create_fake_audio_event("/fake/current.mp3", "song"))
+        types = [c.kwargs.get("event_type") for c in mock_tower_control.send_event.call_args_list]
+        assert "dj_think_started" not in types and "dj_think_completed" not in types
+        assert types == [], f"THINK must not send events to Tower, sent: {types}"
