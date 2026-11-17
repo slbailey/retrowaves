@@ -49,30 +49,38 @@ class MockDJEngineForInvariantTest:
         self._real.on_segment_started(segment)
     
     def on_segment_finished(self, segment: AudioEvent) -> None:
-        """Track DO phase and verify invariants."""
+        """Track DO phase and verify invariants.
+
+        The real DJ builds the terminal intent inside the first DO that runs
+        during DRAINING (SD2.3 "last chance" path), so the invariant can only be
+        judged after delegating: a DO during DRAINING must leave the terminal
+        intent queued, and must never queue normal audio (the real engine raises
+        if it tries).
+        """
         self.do_call_count += 1
-        
-        # Check if we're draining and if this is terminal DO
         is_draining = getattr(self._real, '_is_draining', False)
-        has_terminal_intent = (
-            self._real.current_intent is not None and
-            getattr(self._real.current_intent, 'is_terminal', False)
-        )
-        
+        already_queued = self._real._terminal_intent_queued
+
+        # Delegate to real engine
+        self._real.on_segment_finished(segment)
+
+        if not is_draining:
+            self.normal_do_call_count += 1
+            return
+        if already_queued:
+            return  # post-terminal DO is a no-op in the real engine (SD3.2)
         # INVARIANT: After draining begins, only terminal DO is allowed
-        if is_draining and not has_terminal_intent:
+        if not self._real._terminal_intent_queued:
             raise AssertionError(
                 f"INVARIANT VIOLATION: Normal DO executed during DRAINING! "
                 f"Segment: {segment.path}, DO call count: {self.do_call_count}"
             )
-        
-        if has_terminal_intent:
-            self.terminal_do_call_count += 1
-        else:
-            self.normal_do_call_count += 1
-        
-        # Delegate to real engine
-        self._real.on_segment_finished(segment)
+        self.terminal_do_call_count += 1
+
+    @property
+    def _terminal_intent_queued(self) -> bool:
+        """PlayoutEngine reads this to detect that terminal DO ran."""
+        return self._real._terminal_intent_queued
     
     def set_lifecycle_state(self, is_startup: bool = False, is_draining: bool = False) -> None:
         """Track draining state transition."""
@@ -90,18 +98,21 @@ class MockDJEngineForInvariantTest:
         return self._real.current_intent
 
 
+@patch('station.broadcast_core.segment_decoder.FFmpegDecoder')
 @patch('station.broadcast_core.playout_engine.FFmpegDecoder')
-def test_shutdown_does_not_exit_before_terminal_do_and_playout_completion(mock_decoder_class):
+def test_shutdown_does_not_exit_before_terminal_do_and_playout_completion(mock_decoder_class, mock_segment_decoder_class):
     """
     INVARIANT TEST: Shutdown semantics during active playback.
-    
+
     Verifies all shutdown invariants are maintained when shutdown
     is triggered DURING active playback of a normal segment.
     """
-    # Mock decoder to return stub decoder (avoids real file I/O)
+    # Mock decoder to return stub decoder (avoids real file I/O). Decoding moved
+    # into SegmentDecoder, so patch both import sites.
     def create_stub_decoder(file_path, frame_size=1024):
         return StubFFmpegDecoder(file_path, frame_size_samples=frame_size)
     mock_decoder_class.side_effect = create_stub_decoder
+    mock_segment_decoder_class.side_effect = create_stub_decoder
     
     # Test setup: Create mocked components
     fake_rotation = FakeRotationManager()
@@ -198,9 +209,10 @@ def test_shutdown_does_not_exit_before_terminal_do_and_playout_completion(mock_d
     if dj_engine._draining_started:
         # After draining started, any DO calls must be terminal
         # The tracking mock will raise AssertionError if normal DO occurs during draining
-        assert dj_engine.terminal_do_call_count >= 1, \
+        assert dj_engine.terminal_do_call_count >= 1, (
             f"ASSERTION B FAILED: After draining began, terminal DO must occur. "
             f"Terminal DO calls: {dj_engine.terminal_do_call_count}"
+        )
     
     # ASSERTION C: Playout must not stop before terminal DO completes
     # The playout loop must continue until terminal DO is executed
@@ -244,8 +256,8 @@ def test_shutdown_does_not_exit_before_terminal_do_and_playout_completion(mock_d
     
     # ASSERTION E: Exactly ONE terminal THINK/DO cycle executed
     assert dj_engine.terminal_do_call_count == 1, \
-        f"ASSERTION E FAILED: Exactly one terminal DO must execute. "
-        f"Got {dj_engine.terminal_do_call_count} terminal DO calls"
+        (f"ASSERTION E FAILED: Exactly one terminal DO must execute. "
+        f"Got {dj_engine.terminal_do_call_count} terminal DO calls")
     
     # Verify that after terminal DO, no further THINK/DO cycles occur
     # The _terminal_do_executed flag should prevent further DO callbacks during DRAINING
@@ -257,11 +269,11 @@ def test_shutdown_does_not_exit_before_terminal_do_and_playout_completion(mock_d
     
     # Verify no additional DO calls occurred
     assert dj_engine.do_call_count == final_do_count, \
-        f"ASSERTION E FAILED: Additional DO calls occurred after terminal DO. "
-        f"Expected {final_do_count}, got {dj_engine.do_call_count}"
+        (f"ASSERTION E FAILED: Additional DO calls occurred after terminal DO. "
+        f"Expected {final_do_count}, got {dj_engine.do_call_count}")
     assert dj_engine.terminal_do_call_count == final_terminal_do_count == 1, \
-        f"ASSERTION E FAILED: Terminal DO count changed after completion. "
-        f"Expected 1, got {dj_engine.terminal_do_call_count}"
+        (f"ASSERTION E FAILED: Terminal DO count changed after completion. "
+        f"Expected 1, got {dj_engine.terminal_do_call_count}")
     
     # Clean up
     stub_sink.close()

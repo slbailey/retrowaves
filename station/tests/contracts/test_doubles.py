@@ -174,7 +174,15 @@ class StubFFmpegDecoder:
         frame = np.zeros((self.frame_size_samples, CANONICAL_CHANNELS), dtype=np.int16)
         self._frame_count += 1
         return frame
-    
+
+    def read_frames(self):
+        """Match FFmpegDecoder.read_frames() (used by SegmentDecoder)."""
+        return iter(self)
+
+    def kill(self, grace_period_seconds: float = 2.0) -> None:
+        """Match FFmpegDecoder.kill() (no-op)."""
+        pass
+
     def close(self) -> None:
         """Fake close (no-op)."""
         pass
